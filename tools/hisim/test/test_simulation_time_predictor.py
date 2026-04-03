@@ -1,3 +1,4 @@
+from hisim.simulation.sglang.utils import resolve_model_info
 from hisim.simulation.types import (
     SchedulerConfig,
 )
@@ -9,9 +10,11 @@ from hisim.time_predictor import (
     ScheduleRequest,
 )
 
+from sglang.srt.configs.model_config import ModelConfig
+
 
 def test_time_predictor():
-    model = ModelInfo(model_path="Qwen/Qwen3-8B")
+    model: ModelInfo = resolve_model_info(ModelConfig(model_path="Qwen/Qwen3-8B"))
     hw = AcceleratorInfo(
         name="a100_sxm",
         vendor="NVIDIA",

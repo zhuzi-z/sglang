@@ -1,6 +1,10 @@
 import torch
 from hisim.hook import BaseHook
 from hisim.simulation.manager import ConfigManager
+from hisim.simulation.sglang.utils import (
+    resolve_model_info,
+    resolve_scheduler_config,
+)
 from hisim.simulation.utils import estimate_kv_cache_pool_capacity
 from hisim.utils import get_logger
 
@@ -29,15 +33,14 @@ class C_ModelRunnerHook(BaseHook):
             if self.server_args.max_total_tokens is not None:
                 self.max_total_num_tokens = self.server_args.max_total_tokens
             else:
-                model = ConfigManager.get_model_info(
-                    model_path=self.model_config.model_path,
-                    hf_config=self.model_config.hf_config.__dict__,
-                )
+                if ConfigManager.get_model_info() is None:
+                    model = resolve_model_info(self.model_config)
+                    ConfigManager.set_model_info(model)
+
+                model = ConfigManager.get_model_info()
                 hw = ConfigManager.get_accelerator_info()
-                config = ConfigManager.get_scheduler_config(
-                    self.server_args.__dict__,
-                    "sglang",
-                    self.model_config.hf_config.__dict__,
+                config = resolve_scheduler_config(
+                    server_args=self.server_args,
                 )
 
                 assert model is not None and hw is not None and config is not None

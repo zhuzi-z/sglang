@@ -7,7 +7,7 @@ from hisim.time_predictor.aiconfigurator import get_perf_model
 
 def calc_kv_cache_cell_elems(model_info: ModelInfo, tp_size: int, pp_size: int) -> int:
     num_layers = model_info.num_hidden_layers // pp_size
-    if model_info.kv_lora_rank != 0:
+    if model_info.is_mla():
         return (model_info.kv_lora_rank + model_info.qk_rope_head_dim) * num_layers
     else:
         num_kv_heads = max(model_info.num_key_value_heads // tp_size, 1)
@@ -17,7 +17,7 @@ def calc_kv_cache_cell_elems(model_info: ModelInfo, tp_size: int, pp_size: int) 
 def calc_kv_cache_per_layer_elems(
     model_info: ModelInfo, tp_size: int, pp_size: int
 ) -> int:
-    if model_info.kv_lora_rank != 0:
+    if model_info.is_mla():
         return model_info.kv_lora_rank + model_info.qk_rope_head_dim
     else:
         num_kv_heads = max(model_info.num_key_value_heads // tp_size, 1)

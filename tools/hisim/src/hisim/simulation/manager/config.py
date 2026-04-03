@@ -43,13 +43,8 @@ class ConfigManager:
         cls._model_info = model
 
     @classmethod
-    def get_model_info(
-        cls, model_path: str | None = None, hf_config: dict | None = None
-    ) -> ModelInfo:
-        return ModelInfo(
-            model_path=model_path,
-            hf_config=hf_config,
-        )
+    def get_model_info(cls) -> ModelInfo | None:
+        return cls._model_info
 
     @classmethod
     def get_accelerator_info(cls) -> AcceleratorInfo:
@@ -101,6 +96,25 @@ class ConfigManager:
 
     @classmethod
     def set_scheduler_config(cls, config: SchedulerConfig):
+        # The configuration from the external config file has higher priority.
+        external_config = cls._get_raw_config().get("scheduler", {})
+        for field_name in [
+            "tp_size",
+            "dp_size",
+            "ep_size",
+            "dp_size",
+            "backend_name",
+            "backend_version",
+        ]:
+            field_value = external_config.get(field_name)
+            if field_value is not None:
+                setattr(config, field_name, field_value)
+
+        for field_name in ["data_type", "kv_cache_data_type"]:
+            field_value = external_config.get(field_name)
+            if field_value is not None:
+                setattr(config, field_name, DataType(field_value))
+
         cls._scheduler_config = config
 
     @classmethod
@@ -126,48 +140,8 @@ class ConfigManager:
         )
 
     @classmethod
-    def get_scheduler_config(cls, server_args: dict, backend: str, hf_config: dict):
-        model = ConfigManager.get_model_info(hf_config=hf_config)
-
-        internal_config = cls._parse_server_args(server_args, backend)
-
-        config = cls._get_raw_config()
-        scheduler_config = config.get("scheduler", {})
-
-        tp_size = scheduler_config.get("tp_size")
-        if tp_size is None:
-            tp_size = internal_config.tp_size
-        ep_size = scheduler_config.get("ep_size")
-        if ep_size is None:
-            ep_size = internal_config.ep_size
-        dp_size = scheduler_config.get("dp_size")
-        if dp_size is None:
-            dp_size = internal_config.dp_size
-        dtype = scheduler_config.get("data_type")
-        if dtype is not None:
-            dtype = DataType(dtype.upper())
-        else:
-            torch_dtype = str(model.torch_dtype).strip("torch.")
-            dtype = DataType.from_torch_dtype(torch_dtype)
-
-        kv_cache_dtype = scheduler_config.get("kv_cache_data_type")
-        if kv_cache_dtype is not None:
-            kv_cache_dtype = DataType(kv_cache_dtype)
-        else:
-            kv_cache_dtype = dtype
-
-        sched_config = SchedulerConfig(
-            mem_fraction_static=internal_config.mem_fraction_static,
-            tp_size=tp_size,
-            ep_size=ep_size,
-            dp_size=dp_size,
-            # TODO: initialize with the runtime data type.
-            data_type=dtype,
-            kv_cache_data_type=kv_cache_dtype,
-            backend_name=backend,
-            backend_version=scheduler_config.get("backend_version"),
-        )
-        return sched_config
+    def get_scheduler_config(cls):
+        return cls._scheduler_config
 
     @classmethod
     def _parse_server_args(cls, server_args: dict, backend: str) -> SchedulerConfig:

@@ -9,6 +9,10 @@ from dataclasses import asdict
 from hisim.hook import BaseHook
 from hisim.hook.utils import get_obj_from_args
 from hisim.simulation.manager import ConfigManager, Envs, StateManager
+from hisim.simulation.sglang.utils import (
+    resolve_model_info,
+    resolve_scheduler_config,
+)
 from hisim.simulation.types import (
     RequestStats,
     SimulationMode,
@@ -16,13 +20,9 @@ from hisim.simulation.types import (
 from hisim.simulation.utils import (
     calc_metrics,
 )
-from hisim.time_predictor import (
-    InferTimePredictor,
-)
+from hisim.time_predictor import InferTimePredictor
 from hisim.time_predictor import ScheduleBatch as HisimScheduleBatch
-from hisim.time_predictor import (
-    ScheduleRequest,
-)
+from hisim.time_predictor import ScheduleRequest
 from hisim.utils import get_logger
 from hisim.utils.json import CustomJsonEncoder
 
@@ -78,18 +78,20 @@ class C_SchedulerHook(BaseHook):
             original_init(self, *args, **kwargs)
 
             try:
-                model = ConfigManager.get_model_info(
-                    model_path=self.model_config.model_path,
-                    hf_config=self.model_config.hf_config.__dict__,
-                )
+                if ConfigManager.get_model_info() is None:
+                    model = resolve_model_info(self.model_config)
+                    ConfigManager.set_model_info(model)
+
+                model = ConfigManager.get_model_info()
+
                 hw = ConfigManager.get_accelerator_info()
-                sched_config = ConfigManager.get_scheduler_config(
-                    self.server_args.__dict__,
-                    "sglang",
-                    self.model_config.hf_config.__dict__,
-                )
-                ConfigManager.set_scheduler_config(sched_config)
-                ConfigManager.set_model_info(model)
+
+                if ConfigManager.get_scheduler_config() is None:
+                    sched_config = resolve_scheduler_config(
+                        server_args=self.server_args,
+                    )
+                    ConfigManager.set_scheduler_config(sched_config)
+                sched_config = ConfigManager.get_scheduler_config()
 
                 C_SchedulerHook.INFERENCE_PREDICTOR = (
                     ConfigManager.get_inference_time_predictor(model, hw, sched_config)

@@ -12,6 +12,8 @@ class SchedulerConfig:
     )
     kv_cache_data_type: Optional[DataType] = None
     mem_fraction_static: Optional[float] = None
+    max_total_tokens: Optional[int] = None
+
     tp_size: int = 1
     ep_size: int = 1
     dp_size: int = 1
