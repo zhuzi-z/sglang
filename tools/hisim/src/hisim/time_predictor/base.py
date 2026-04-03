@@ -1,26 +1,26 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from hisim.simulation.types import SchedulerConfig
-from hisim.spec.model import ModelInfo
-from hisim.spec.accelerator import AcceleratorInfo
-from hisim.utils import get_logger
 
+from hisim.simulation.types import SchedulerConfig
+from hisim.spec.accelerator import AcceleratorInfo
+from hisim.spec.model import ModelInfo
+from hisim.utils import get_logger
 
 logger = get_logger("hisim")
 
 
 @dataclass
-class FakeRequest:
-    input_length: int = 0
+class ScheduleRequest:
+    extend_length: int = 0
     past_kv_length: int = 0
 
 
 @dataclass
 class ScheduleBatch:
-    reqs: list[FakeRequest] = field(default_factory=list)
+    reqs: list[ScheduleRequest] = field(default_factory=list)
 
     def __repr__(self) -> str:
-        return f"batch_size={len(self.reqs)},reqs={[(req.input_length, req.past_kv_length) for req in self.reqs]}"
+        return f"batch_size={len(self.reqs)},reqs={[(req.extend_length, req.past_kv_length) for req in self.reqs]}"
 
     def __eq__(self, batch: "ScheduleBatch"):
         if self.batch_size != batch.batch_size:
@@ -28,19 +28,18 @@ class ScheduleBatch:
 
         req1, req2 = [], []
         for idx in range(self.batch_size):
-            req1.append((self.reqs[idx].input_length, self.reqs[idx].past_kv_length))
-
-            req2.append((batch.reqs[idx].input_length, batch.reqs[idx].past_kv_length))
+            req1.append((self.reqs[idx].extend_length, self.reqs[idx].past_kv_length))
+            req2.append((batch.reqs[idx].extend_length, batch.reqs[idx].past_kv_length))
 
         return sorted(req1) == sorted(req2)
 
     def request_info(self) -> list[list[int, int]]:
         # The request information organized in the format `(input_len, past_kv_len)`
-        return [[req.input_length, req.past_kv_length] for req in self.reqs]
+        return [[req.extend_length, req.past_kv_length] for req in self.reqs]
 
     @property
     def num_context_tokens(self) -> int:
-        return sum(req.input_length for req in self.reqs)
+        return sum(req.extend_length for req in self.reqs)
 
     @property
     def total_past_kv_length(self) -> int:
@@ -58,7 +57,7 @@ class ScheduleBatch:
 
     def is_decode(self) -> bool:
         for req in self.reqs:
-            if req.input_length > 1:
+            if req.extend_length > 1:
                 return False
         return True
 

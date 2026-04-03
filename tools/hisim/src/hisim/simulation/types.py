@@ -1,7 +1,8 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Union
-from hisim.spec import DataType, AcceleratorInfo
+
+from hisim.spec import AcceleratorInfo, DataType
 
 
 @dataclass

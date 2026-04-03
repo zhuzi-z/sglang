@@ -1,13 +1,12 @@
+from hisim.simulation.types import (
+    SchedulerConfig,
+)
 from hisim.spec.accelerator import AcceleratorInfo
 from hisim.spec.model import ModelInfo
-
 from hisim.time_predictor import (
     AIConfiguratorTimePredictor,
     ScheduleBatch,
-    FakeRequest,
-)
-from hisim.simulation.types import (
-    SchedulerConfig,
+    ScheduleRequest,
 )
 
 
@@ -29,9 +28,9 @@ def test_time_predictor():
 
         # Prefill
         reqs = [
-            FakeRequest(512, 512),
-            FakeRequest(1024, 0),
-            FakeRequest(512, 0),
+            ScheduleRequest(512, 512),
+            ScheduleRequest(1024, 0),
+            ScheduleRequest(512, 0),
         ]
 
         latency = predictor.predict_infer_time(ScheduleBatch(reqs))
@@ -39,9 +38,9 @@ def test_time_predictor():
 
         # Decode
         reqs = [
-            FakeRequest(1, 1024),
-            FakeRequest(1, 1024),
-            FakeRequest(1, 1024),
+            ScheduleRequest(1, 1024),
+            ScheduleRequest(1, 1024),
+            ScheduleRequest(1, 1024),
         ]
 
         latency = predictor.predict_infer_time(ScheduleBatch(reqs))

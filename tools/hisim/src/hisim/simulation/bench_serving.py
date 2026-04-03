@@ -1,16 +1,32 @@
-import time
-import numpy as np
-from typing import List, AsyncGenerator, Optional
-import re
-import aiohttp
-import os
-import json
-from dataclasses import fields
 import argparse
+import json
+import os
+import re
+import time
+from dataclasses import fields
+from typing import AsyncGenerator, List, Optional
+
+import aiohttp
+import numpy as np
 
 from sglang import bench_serving
 from sglang.bench_serving import DatasetRow
 
+# Hijack aiohttp request sending to rewrite simulation metadata into a server-visible path.
+#
+# The benchmark attaches simulation data into the request payload, but the server-side
+# parser does not read arbitrary top-level fields such as `simulation`.
+# To make the metadata available to the backend, this hook intercepts
+# `aiohttp.ClientSession._request` and moves:
+#
+#     payload["simulation"]
+#
+# into:
+#
+#     payload["sampling_params"]["custom_params"]["simulation"]
+#
+# so the simulation parameters are preserved during request serialization and can be
+# consumed by the server through its existing sampling/custom-parameter pipeline.
 _ORIG_AIOHTTP_REQUEST = None
 
 
@@ -43,6 +59,18 @@ def install_aiohttp_json_hijack(
     aiohttp.ClientSession._request = _patched_request
 
 
+# Override request generation for simulation mode.
+#
+# Instead of enforcing real-time pacing on the benchmark client, the delay implied
+# by `request_rate` is translated into `simulation.created_time` and injected into
+# each request. In other words, the benchmark encodes the logical arrival time of
+# every request, and the simulator is responsible for replaying the traffic pattern
+# based on that timestamp.
+#
+# When `use_trace_timestamps` is enabled, the original trace timestamp is normalized
+# relative to the first request and written into `created_time`.
+# Otherwise, inter-arrival intervals sampled from the request rate are accumulated
+# and stored as `created_time` without actually sleeping on the client side.
 async def override_get_request(
     input_requests: List[DatasetRow],
     request_rate: float,
@@ -94,6 +122,17 @@ async def override_get_request(
             start_time += interval
 
 
+# Replace benchmark-side metrics with backend-generated simulation metrics.
+#
+# In simulation mode, metrics computed by the benchmark client are not trustworthy,
+# because they describe the local execution path of the benchmark tool rather than
+# the actual simulated execution on the backend.
+# Therefore, after the benchmark finishes, this wrapper loads the metrics file
+# produced by the simulator backend and uses it as the final benchmark result.
+#
+# If the backend metrics file is missing, the wrapper falls back to the original
+# benchmark-side metrics.
+
 original_calculate_metrics = bench_serving.calculate_metrics
 
 
@@ -120,7 +159,7 @@ original_run_benchmark = bench_serving.run_benchmark
 
 
 def wrapped_run_benchmark(args_: argparse.Namespace):
-    # The profile api has been hooked, which used as a trigger of simulation's start / stop.
+    # The profile API has been hooked and is used as a trigger to start or stop the simulation.
     args.profile = True
     return original_run_benchmark(args_)
 

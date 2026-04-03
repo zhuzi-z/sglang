@@ -2,7 +2,7 @@
 ## Background
 As large language models (LLMs) are rapidly deployed at scale for inference services, inference performance directly impacts user experience, service cost, and resource efficiency. Key metrics such as Time to First Token (TTFT), Time Per Output Token (TPOT), and system throughput are highly dependent on the complex interplay among model architecture, hardware platforms (e.g., A100/H100), inference engines (e.g., SGLang, vLLM, TensorRT-LLM), and runtime configurations (e.g., quantization, batching, and parallelism strategies).
 
-Traditional end-to-end stress testing on real GPU clusters is expensive and time-consuming, making it impractical to efficiently explore the vast space of configuration combinations. To address this, we propose **Hisim**, a high-performance CPU-based simulation system. Hisim enables fast, low-cost, and high-fidelity prediction of key performance metrics across different models, target hardware, inference engines, and configurations by replaying real-world inference workload traces collected from production or representative scenarios, thereby accelerating the design and optimization of inference systems.
+Traditional end-to-end stress testing on real GPU clusters is expensive and time-consuming, making it impractical to efficiently explore the vast space of configuration combinations. To address this, we propose **Hisim**, a high-fidelity CPU-based simulation system. Hisim enables fast, low-cost, and high-fidelity prediction of key performance metrics across different models, target hardware, inference engines, and configurations by replaying real-world inference workload traces collected from production or representative scenarios, thereby accelerating the design and optimization of inference systems.
 
 ---
 ## Introduction
@@ -55,41 +55,41 @@ You have now completed an inference simulation using framework interception.
 #### Example Output
 ```bash
 ============ Serving Benchmark Result ============
-Backend:                                 sglang    
-Traffic request rate:                    inf       
-Max request concurrency:                 not set   
-Successful requests:                     10        
-Benchmark duration (s):                  1.15      
-Total input tokens:                      1997      
-Total input text tokens:                 -1        
-Total generated tokens:                  2798      
-Total generated tokens (retokenized):    -1        
-Request throughput (req/s):              1.58      
-Input token throughput (tok/s):          316.20    
-Output token throughput (tok/s):         443.04    
-Peak output token throughput (tok/s):    -1.00     
-Peak concurrent requests:                -1        
-Total token throughput (tok/s):          759.24    
-Concurrency:                             -1.00     
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 not set
+Successful requests:                     10
+Benchmark duration (s):                  1.15
+Total input tokens:                      1997
+Total input text tokens:                 -1
+Total generated tokens:                  2798
+Total generated tokens (retokenized):    -1
+Request throughput (req/s):              1.58
+Input token throughput (tok/s):          316.20
+Output token throughput (tok/s):         443.04
+Peak output token throughput (tok/s):    -1.00
+Peak concurrent requests:                -1
+Total token throughput (tok/s):          759.24
+Concurrency:                             -1.00
 ----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   3431.84   
-Median E2E Latency (ms):                 3809.48   
-P90 E2E Latency (ms):                    5309.93   
-P99 E2E Latency (ms):                    6214.97   
+Mean E2E Latency (ms):                   3431.84
+Median E2E Latency (ms):                 3809.48
+P90 E2E Latency (ms):                    5309.93
+P99 E2E Latency (ms):                    6214.97
 ---------------Time to First Token----------------
-Mean TTFT (ms):                          128.59    
-Median TTFT (ms):                        128.59    
-P99 TTFT (ms):                           128.59    
+Mean TTFT (ms):                          128.59
+Median TTFT (ms):                        128.59
+P99 TTFT (ms):                           128.59
 -----Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          12.14     
-Median TPOT (ms):                        12.44     
-P99 TPOT (ms):                           12.89     
+Mean TPOT (ms):                          12.14
+Median TPOT (ms):                        12.44
+P99 TPOT (ms):                           12.89
 ---------------Inter-Token Latency----------------
-Mean ITL (ms):                           11.85     
-Median ITL (ms):                         11.95     
-P95 ITL (ms):                            12.05     
-P99 ITL (ms):                            12.07     
-Max ITL (ms):                            12.08     
+Mean ITL (ms):                           11.85
+Median ITL (ms):                         11.95
+P95 ITL (ms):                            12.05
+P99 ITL (ms):                            12.07
+Max ITL (ms):                            12.08
 ==================================================
 ```
 
@@ -118,7 +118,7 @@ The config file is a JSON file with three main sections:
   - `name`: predictor type (`"aiconfigurator"`)
   - See the **TimePredictor** section below for details
 
-- **`scheduler`**: Parallelism and backend metadata  
+- **`scheduler`**: Parallelism and backend metadata
   > ⚠️ **Note**: Multi-GPU parallelism (TP/EP) should not be configured at the framework level during server launch. Instead, specify `tp_size` and `ep_size` here; the predictor will simulate parallel execution overhead accordingly.
   - When `predictor.name = "aiconfigurator"`, `backend_version` must be provided.
 

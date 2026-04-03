@@ -1,6 +1,7 @@
 import json
-from enum import Enum
 from dataclasses import asdict, is_dataclass
+from enum import Enum
+
 import numpy as np
 
 

@@ -1,17 +1,17 @@
+import argparse
+import dataclasses
 import os
 import sys
-import argparse
-import torch
-import dataclasses
 from typing import Optional
+
 import hisim.hook as hisim_hook
+import torch
 from hisim.simulation.sglang import (
+    model_runner,
     scheduler,
     sgl_kernel_hook,
-    model_runner,
 )
 from hisim.utils import get_logger
-
 
 # hook the sglang implementation
 if not torch.cuda.is_available():
@@ -21,10 +21,6 @@ hisim_hook.install_class_hooks(
     [
         scheduler.C_SchedulerHook,
         model_runner.C_ModelRunnerHook,
-        # hicache_storage.C_StorageBackendFactory,
-        # cache_controller.C_HiCacheController,
-        # hiradix_cache.C_HiRadixCacheHook,
-        # tokenizer_manager.C_TokenizerManagerHook,
     ]
 )
 

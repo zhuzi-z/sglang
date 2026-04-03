@@ -1,4 +1,5 @@
 import os
+
 from hisim.utils.logger import get_logger
 
 logger = get_logger("hisim")

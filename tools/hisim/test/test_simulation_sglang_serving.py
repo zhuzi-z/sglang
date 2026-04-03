@@ -1,11 +1,11 @@
+import json
 import os
 import signal
 import subprocess
 import sys
-import requests
-import json
 import time
 
+import requests
 
 os.environ["HISIM_CONFIG_PATH"] = os.path.dirname(__file__) + "/assets/config.json"
 os.environ["CUDA_VISIBLE_DEVICES"] = ""

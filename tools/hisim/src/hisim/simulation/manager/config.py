@@ -1,18 +1,17 @@
 import json
 
-from hisim.spec import ModelInfo, AcceleratorInfo, DataType
+from hisim.simulation.manager.env import Envs
 from hisim.simulation.types import PlatformConfig, SchedulerConfig
-from hisim.simulation.manager import Envs
 from hisim.simulation.utils import (
     calc_kv_cache_cell_elems,
     calc_kv_cache_per_layer_elems,
 )
+from hisim.spec import AcceleratorInfo, DataType, ModelInfo
 from hisim.time_predictor import (
-    InferTimePredictor,
     AIConfiguratorTimePredictor,
+    InferTimePredictor,
 )
 from hisim.utils import get_logger
-
 
 logger = get_logger()
 

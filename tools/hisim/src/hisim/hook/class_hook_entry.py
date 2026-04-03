@@ -1,10 +1,9 @@
 import builtins
+import re
 from types import FunctionType
 from typing import List, Union
-import re
 
 from hisim.hook.base_hook import BaseHook, _register_hooks
-
 from hisim.utils import get_logger
 
 logger = get_logger("hisim")

@@ -1,8 +1,8 @@
-from hisim.spec.model import ModelInfo
-from hisim.spec.accelerator import AcceleratorInfo
-from hisim.simulation.types import SchedulerConfig, RequestStats
-from hisim.time_predictor.aiconfigurator import get_perf_model
 import numpy as np
+from hisim.simulation.types import RequestStats, SchedulerConfig
+from hisim.spec.accelerator import AcceleratorInfo
+from hisim.spec.model import ModelInfo
+from hisim.time_predictor.aiconfigurator import get_perf_model
 
 
 def calc_kv_cache_cell_elems(model_info: ModelInfo, tp_size: int, pp_size: int) -> int:
@@ -85,12 +85,12 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         "input_throughput": total_input / total_dur_s,
         "output_throughput": total_output / total_dur_s,
         "total_throughput": (total_input + total_output) / total_dur_s,
-        "prefix_cache_reused_ratio": 0
-        if total_input == 0
-        else total_reused_tokens / total_input,
-        "disk_prefetch_ratio": 0
-        if total_input == 0
-        else total_disk_hit_tokens / total_input,
+        "prefix_cache_reused_ratio": (
+            0 if total_input == 0 else total_reused_tokens / total_input
+        ),
+        "disk_prefetch_ratio": (
+            0 if total_input == 0 else total_disk_hit_tokens / total_input
+        ),
         "mean_ttft_ms": np.mean(ttfts or 0) * 1000,
         "median_ttft_ms": np.median(ttfts or 0) * 1000,
         "std_ttft_ms": np.std(ttfts or 0) * 1000,

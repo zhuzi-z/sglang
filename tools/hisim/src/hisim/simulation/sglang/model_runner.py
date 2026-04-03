@@ -1,10 +1,8 @@
 import torch
-
 from hisim.hook import BaseHook
 from hisim.simulation.manager import ConfigManager
 from hisim.simulation.utils import estimate_kv_cache_pool_capacity
 from hisim.utils import get_logger
-
 
 logger = get_logger()
 

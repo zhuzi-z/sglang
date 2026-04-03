@@ -1,12 +1,11 @@
-import sys
-import re
 import importlib.abc
 import importlib.util
-
-from hisim.utils import get_logger
+import re
+import sys
 from typing import List, Union
-from hisim.hook.base_hook import BaseHook, _register_hooks
 
+from hisim.hook.base_hook import BaseHook, _register_hooks
+from hisim.utils import get_logger
 
 logger = get_logger("hisim")
 

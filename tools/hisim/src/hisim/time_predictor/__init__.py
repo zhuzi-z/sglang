@@ -1,15 +1,14 @@
-from hisim.time_predictor.base import (
-    InferTimePredictor,
-    FakeRequest,
-    ScheduleBatch,
-)
 from hisim.time_predictor.aiconfigurator import (
     AIConfiguratorTimePredictor,
 )
-
+from hisim.time_predictor.base import (
+    InferTimePredictor,
+    ScheduleBatch,
+    ScheduleRequest,
+)
 
 __all__ = (
-    FakeRequest,
+    ScheduleRequest,
     ScheduleBatch,
     InferTimePredictor,
     AIConfiguratorTimePredictor,

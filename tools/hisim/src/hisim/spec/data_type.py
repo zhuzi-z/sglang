@@ -1,7 +1,6 @@
 from enum import Enum, unique
 from typing import Dict, Optional
 
-
 _BYTES_MAP: dict["DataType", float] = {}
 _ALIAS_MAP: Dict[str, str] = {}
 _TORCH_DTYPE_TO_DATA_TYPE: Dict[str, "DataType"] = {}

@@ -1,5 +1,6 @@
+from typing import List, Optional, Union
+
 from hisim.utils import get_logger
-from typing import List, Union, Optional
 
 logger = get_logger("hisim")
 

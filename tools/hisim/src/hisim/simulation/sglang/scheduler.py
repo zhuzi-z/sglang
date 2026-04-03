@@ -1,29 +1,30 @@
-import time
-from dataclasses import asdict
-from collections import defaultdict
-import json
-import os
 import heapq
 import importlib
+import json
+import os
+import time
+from collections import defaultdict
+from dataclasses import asdict
 
-from hisim.utils import get_logger
 from hisim.hook import BaseHook
-from hisim.simulation.types import (
-    SimulationMode,
-    RequestStats,
-)
 from hisim.hook.utils import get_obj_from_args
-from hisim.utils.json import CustomJsonEncoder
-from hisim.simulation.manager import StateManager, ConfigManager, Envs
-from hisim.time_predictor import (
-    InferTimePredictor,
-    FakeRequest,
-    ScheduleBatch as HisimScheduleBatch,
+from hisim.simulation.manager import ConfigManager, Envs, StateManager
+from hisim.simulation.types import (
+    RequestStats,
+    SimulationMode,
 )
 from hisim.simulation.utils import (
     calc_metrics,
 )
-
+from hisim.time_predictor import (
+    InferTimePredictor,
+)
+from hisim.time_predictor import ScheduleBatch as HisimScheduleBatch
+from hisim.time_predictor import (
+    ScheduleRequest,
+)
+from hisim.utils import get_logger
+from hisim.utils.json import CustomJsonEncoder
 
 logger = get_logger("hisim")
 
@@ -44,9 +45,9 @@ class C_SchedulerHook(BaseHook):
 
     SIM_MODE = SimulationMode(Envs.simulation_mode())
     OFFLINE_RECV_ALL_REQUEST: bool = False
-    FUTURE_QUEUE: list[
-        tuple[float, int, RequestStats]
-    ] = []  # tuple(created time, salt, request)
+    FUTURE_QUEUE: list[tuple[float, int, RequestStats]] = (
+        []
+    )  # tuple(created time, salt, request)
 
     @classmethod
     def hook(cls, target):
@@ -266,8 +267,8 @@ class C_SchedulerHook(BaseHook):
                 if batch.forward_mode.is_extend():
                     for req in batch.reqs:
                         hisim_batch.reqs.append(
-                            FakeRequest(
-                                input_length=req.extend_input_len,
+                            ScheduleRequest(
+                                extend_length=req.extend_input_len,
                                 past_kv_length=len(req.prefix_indices)
                                 + len(req.output_ids),
                             )
@@ -275,8 +276,8 @@ class C_SchedulerHook(BaseHook):
                 elif batch.forward_mode.is_decode():
                     for req in batch.reqs:
                         hisim_batch.reqs.append(
-                            FakeRequest(
-                                input_length=1,
+                            ScheduleRequest(
+                                extend_length=1,
                                 past_kv_length=len(req.prefix_indices)
                                 + len(req.output_ids),
                             )

@@ -1,33 +1,31 @@
-from hisim.spec.data_type import DataType
-from hisim.spec.accelerator import AcceleratorInfo
-from hisim.spec.model import ModelInfo
-import numpy as np
 from typing import Optional
 
+import numpy as np
 from aiconfigurator.sdk import models
 from aiconfigurator.sdk.backends.factory import get_backend
 from aiconfigurator.sdk.common import (
     CommQuantMode,
+    DatabaseMode,
     FMHAQuantMode,
     GEMMQuantMode,
     KVCacheQuantMode,
     MoEQuantMode,
-    DatabaseMode,
 )
-from aiconfigurator.sdk.config import RuntimeConfig, ModelConfig
+from aiconfigurator.sdk.config import ModelConfig, RuntimeConfig
 from aiconfigurator.sdk.inference_session import InferenceSession
 from aiconfigurator.sdk.perf_database import get_database, get_systems_paths
-
 from hisim.simulation.types import (
     SchedulerConfig,
 )
-from hisim.time_predictor import (
+from hisim.spec.accelerator import AcceleratorInfo
+from hisim.spec.data_type import DataType
+from hisim.spec.model import ModelInfo
+from hisim.time_predictor.base import (
     InferTimePredictor,
     ScheduleBatch,
-    FakeRequest,
+    ScheduleRequest,
 )
 from hisim.utils import get_logger
-
 
 # Map the common data types to AIConfigurator data types.
 MAP_DTYPE_TO_GEMMQuantMode = {
@@ -133,9 +131,9 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
             system=hw.name,
             backend=config.backend_name,
             version=config.backend_version,
-            systems_paths=[database_path]
-            if database_path is not None
-            else get_systems_paths(),
+            systems_paths=(
+                [database_path] if database_path is not None else get_systems_paths()
+            ),
         )
 
         if database is None:
@@ -172,18 +170,18 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
             "SOL_FULL": DatabaseMode.SOL_FULL,
         }.get(mode.upper(), DatabaseMode.SILICON)
 
-    def ctx_attn_flops_ratio_with_avg(self, reqs: list[FakeRequest]) -> float:
+    def ctx_attn_flops_ratio_with_avg(self, reqs: list[ScheduleRequest]) -> float:
         if len(reqs) == 1:
             return 1.0
         mean_past = np.mean([req.past_kv_length for req in reqs])
-        mean_input = np.mean([req.input_length for req in reqs])
+        mean_input = np.mean([req.extend_length for req in reqs])
         avg_flops = (mean_past + mean_past + mean_input) * mean_input / 2 * len(reqs)
 
         actual_flops = 0
         for req in reqs:
             actual_flops += (
-                (req.past_kv_length + req.past_kv_length + req.input_length)
-                * req.input_length
+                (req.past_kv_length + req.past_kv_length + req.extend_length)
+                * req.extend_length
                 / 2
             )
 
@@ -201,7 +199,7 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         else:
             # Prefill: output sequence length (osl) = 1, input sequence length (isl) = mean(past_kv + input), prefix = mean(past_kv)
             mean_past = np.mean([req.past_kv_length for req in batch.reqs])
-            mean_input = np.mean([req.input_length for req in batch.reqs])
+            mean_input = np.mean([req.extend_length for req in batch.reqs])
             isl = int(mean_past + mean_input)
             prefix = int(mean_past)
             runtime_config = RuntimeConfig(

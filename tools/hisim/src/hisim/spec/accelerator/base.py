@@ -1,10 +1,9 @@
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Union
-from copy import deepcopy
 
 from hisim.spec.data_type import DataType
 from hisim.utils import get_logger
-
 
 _all_accs_: Dict[str, "AcceleratorInfo"] = {}
 _acc_alias: Dict[str, str] = {}

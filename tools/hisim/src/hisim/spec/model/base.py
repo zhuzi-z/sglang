@@ -1,9 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
-
 from hisim.utils import get_logger
-
 
 logger = get_logger("hisim")
 
