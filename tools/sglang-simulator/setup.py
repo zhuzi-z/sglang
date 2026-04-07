@@ -11,7 +11,7 @@ def get_version():
 
 
 setup(
-    name="sgl-simulator",
+    name="sglang-simulator",
     version=get_version(),
     url="https://github.com/sgl-project/sglang.git",
     description="A High-Fidelity LLM inference simulator for SGLang",

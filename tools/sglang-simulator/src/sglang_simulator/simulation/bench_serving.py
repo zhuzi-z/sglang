@@ -139,10 +139,10 @@ original_calculate_metrics = bench_serving.calculate_metrics
 def wrapped_calculate_metrics(*args, **simulation_metrics):
     real_metrics, output_lens = original_calculate_metrics(*args, **simulation_metrics)
 
-    out_dir = os.getenv("SGLANG_SIMULATOR_OUTPUT_DIR", "/tmp/sgl_simulator/output/")
+    out_dir = os.getenv("SGLANG_SIMULATOR_OUTPUT_DIR", "/tmp/sglang_simulator/output/")
     metrics_path = os.path.join(out_dir, "metrics.json")
     if not os.path.exists(metrics_path):
-        print(f"Fail to get simmulation metrics from {out_dir}")
+        print(f"Fail to get simulation metrics from {out_dir}")
         return real_metrics, output_lens
 
     with open(metrics_path) as f:
