@@ -14,7 +14,7 @@ if __name__ == "__main__":
     from sglang.srt.utils import kill_process_tree
 
     parser = argparse.ArgumentParser()
-
+    ServerArgs.add_cli_args(parser)
     server_args = ServerArgs.from_cli_args(parser.parse_args())
 
     try:
