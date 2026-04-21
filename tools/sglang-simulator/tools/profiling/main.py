@@ -102,8 +102,6 @@ def main():
         args.schedule_row_number_filter,
     )
 
-    print(args.schedule_row_number_filter)
-
     sgl_profile.run(
         server_args=server_args,
         batch_list=batch_list,

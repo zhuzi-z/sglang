@@ -25,11 +25,11 @@ class ScheduleBatchRequest:
     output_ids: list[int] | None = None
 
     def full_tokens(self) -> list[int]:
-        len = self.extend_len + self.past_kv_len
+        total_len = self.extend_len + self.past_kv_len
         if self.input_ids is None:
-            self.input_ids = np.random.randint(1000, 100000, size=len).tolist()
+            self.input_ids = np.random.randint(1000, 100000, size=total_len).tolist()
             self.output_ids = []
-        return (self.input_ids + self.output_ids)[:len]
+        return (self.input_ids + self.output_ids)[:total_len]
 
     def prefix_tokens(self) -> list[int]:
         if self.past_kv_len > 0:
@@ -71,6 +71,8 @@ def run(
     num_replay: int = 3,
     max_new_tokens: int = 1,
 ):
+
+    print(f"Replaying a total of {len(batch_list)} batches.")
     llm = Engine(**asdict(server_args))
 
     for idx, batch in enumerate(batch_list):
