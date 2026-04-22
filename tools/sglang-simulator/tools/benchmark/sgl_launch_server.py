@@ -1,10 +1,16 @@
 import argparse
 import os
 
-from sgl_hook import C_SglangSchedulerReqHook, C_TokenizerManagerHook
+import sgl_hook
 from sglang_simulator.hook import install_class_hooks
 
-install_class_hooks([C_SglangSchedulerReqHook, C_TokenizerManagerHook])
+install_class_hooks(
+    [
+        sgl_hook.C_SchedulerReqHook,
+        sgl_hook.C_TokenizerManagerHook,
+        sgl_hook.C_TopKBalancedDispatchHook,
+    ]
+)
 
 
 # Ref: https://github.com/sgl-project/sglang/blob/v0.5.6.post2/python/sglang/launch_server.py

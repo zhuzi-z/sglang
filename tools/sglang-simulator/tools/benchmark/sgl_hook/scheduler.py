@@ -51,7 +51,7 @@ class C_TokenizerManagerHook(BaseHook):
         target._send_one_request = wrapped_send_one_request
 
 
-class C_SglangSchedulerReqHook(BaseHook):
+class C_SchedulerReqHook(BaseHook):
     HOOK_CLASS_NAME = "Scheduler"
     HOOK_MODULE_NAME = "sglang.srt.managers.scheduler"
 
@@ -96,10 +96,10 @@ class C_SglangSchedulerReqHook(BaseHook):
         def wrapped_get_new_batch_prefill(self, *args, **kwargs):
             start = time.time()
             batch = original_get_new_batch_prefill(self, *args, **kwargs)
-            C_SglangSchedulerReqHook.LAST_GET_NEW_BATCH_DUR = (
-                C_SglangSchedulerReqHook.CUR_GET_NEW_BATCH_DUR
+            C_SchedulerReqHook.LAST_GET_NEW_BATCH_DUR = (
+                C_SchedulerReqHook.CUR_GET_NEW_BATCH_DUR
             )
-            C_SglangSchedulerReqHook.CUR_GET_NEW_BATCH_DUR = time.time() - start
+            C_SchedulerReqHook.CUR_GET_NEW_BATCH_DUR = time.time() - start
 
             if batch is not None and not batch.is_empty():
                 prefill_timestamp = time.time()
@@ -114,7 +114,7 @@ class C_SglangSchedulerReqHook(BaseHook):
 
             if not self.last_batch:
                 # Idle
-                C_SglangSchedulerReqHook.LAST_PROCESS_RESULT_END = time.time()
+                C_SchedulerReqHook.LAST_PROCESS_RESULT_END = time.time()
 
             return batch
 
@@ -220,3 +220,6 @@ class C_SglangSchedulerReqHook(BaseHook):
         target_class.process_batch_result = wrapped_process_batch_result
         target_class.profile = wrapped_profile
         return target_class
+
+
+# ==== EP RANK Balanced Dispatch ====#
