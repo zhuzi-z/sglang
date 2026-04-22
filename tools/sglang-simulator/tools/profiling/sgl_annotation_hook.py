@@ -61,7 +61,7 @@ class C_SglangModelForwardAnnotationHook(BaseHook):
     @classmethod
     def hook(cls, target_class):
         if not hasattr(target_class, "forward") or not issubclass(
-            torch.nn.Module, target_class
+            target_class, torch.nn.Module
         ):
             return target_class
 
