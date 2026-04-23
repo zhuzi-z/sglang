@@ -62,6 +62,9 @@ class ScheduleBatch:
             tokens.append(req.full_tokens())
         return tokens
 
+    def total_tokens(self) -> int:
+        return sum([req.extend_len + req.past_kv_len for req in self.reqs])
+
 
 def run(
     server_args: ServerArgs,
@@ -70,13 +73,28 @@ def run(
     profiler: str = "torch",
     num_replay: int = 3,
     max_new_tokens: int = 1,
+    skip_out_of_tokens: bool = True,
+    flush_cache: bool = True,  # When profiling decode cases, keeping the radix cache avoids the prefill stage.
 ):
 
     print(f"Replaying a total of {len(batch_list)} batches.")
     llm = Engine(**asdict(server_args))
 
+    llm.generate(
+        prompt="warmup!",
+    )
+    # `get_server_info` hangs when called immediately after engine initialization
+    server_info = llm.get_server_info()
+    max_total_num_tokens = server_info["max_total_num_tokens"]
+
     for idx, batch in enumerate(batch_list):
         print(f"Profiling: {batch}")
+        if skip_out_of_tokens and batch.total_tokens() > max_total_num_tokens:
+            print(
+                f"The current batch requires {batch.total_tokens()} tokens, "
+                f"which exceeds the maximum total token limit({max_total_num_tokens})."
+            )
+            continue
         sampling_params = {
             "temperature": 0,
             "top_p": 1,
@@ -100,7 +118,8 @@ def run(
                 llm.generate(input_ids=prefix_reqs, sampling_params=sampling_params)
             llm.generate(input_ids=batch.full_reqs(), sampling_params=sampling_params)
             # clear cache
-            llm.flush_cache()
+            if flush_cache:
+                llm.flush_cache()
 
         # Stop profiling
         if profiler == "torch":
@@ -108,6 +127,7 @@ def run(
         else:
             torch.cuda.cudart().cudaProfilerStop()
 
-        llm.flush_cache()
+        if flush_cache:
+            llm.flush_cache()
 
     llm.shutdown()
