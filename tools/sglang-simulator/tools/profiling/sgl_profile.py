@@ -101,6 +101,10 @@ def run(
             "max_new_tokens": max_new_tokens,
         }
 
+        prefix_reqs = batch.prefix_reqs()
+        if len(prefix_reqs) > 0:
+            llm.generate(input_ids=prefix_reqs, sampling_params=sampling_params)
+
         # Start profiling
         if profiler == "torch":
             llm.start_profile(
@@ -113,13 +117,7 @@ def run(
 
         # LLM Inference
         for _ in range(num_replay):
-            prefix_reqs = batch.prefix_reqs()
-            if len(prefix_reqs) > 0:
-                llm.generate(input_ids=prefix_reqs, sampling_params=sampling_params)
             llm.generate(input_ids=batch.full_reqs(), sampling_params=sampling_params)
-            # clear cache
-            if flush_cache:
-                llm.flush_cache()
 
         # Stop profiling
         if profiler == "torch":
