@@ -13,8 +13,16 @@ if TYPE_CHECKING:
 
 LOG_TOPK_STATS = os.getenv("SGL_LOG_TOPK_STATS", "0") == "1"
 
-
 _EP_PERM_CACHE = {}
+
+
+def _next_power_of_2(x: int) -> int:
+    """
+    Return the next power of 2 greater than or equal to x.
+    """
+    if x <= 1:
+        return 1
+    return 1 << (x - 1).bit_length()
 
 
 def get_ep_balanced_perm(
@@ -29,7 +37,9 @@ def get_ep_balanced_perm(
     2. deterministic behavior for debugging,
     3. some randomness in expert selection order.
     """
-    if (M, ep_world_size, device) not in _EP_PERM_CACHE:
+    device_key = (device.type, device.index)
+
+    if (M, ep_world_size, device_key) not in _EP_PERM_CACHE:
         assert (
             M % ep_world_size == 0
         ), f"Experts {M} must be divisible by EP size {ep_world_size}"
@@ -52,11 +62,11 @@ def get_ep_balanced_perm(
             for r in range(ep_world_size):
                 perm.append(groups[r][i])
 
-        _EP_PERM_CACHE[(M, ep_world_size, device)] = torch.tensor(
+        _EP_PERM_CACHE[(M, ep_world_size, device_key)] = torch.tensor(
             perm, dtype=torch.int32, device=device
         )
 
-    return _EP_PERM_CACHE[(M, ep_world_size, device)]
+    return _EP_PERM_CACHE[(M, ep_world_size, device_key)]
 
 
 @triton.jit
@@ -64,15 +74,20 @@ def balanced_topk_kernel(
     topk_ids_ptr,
     topk_weights_ptr,
     perm_ptr,
-    N: tl.constexpr,
+    N,
     M: tl.constexpr,
     K: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     pid = tl.program_id(0)
+
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
     mask_n = offs_n < N
-    offs_k = tl.arange(0, K)
+    mask_k = offs_k < K
+    mask_2d = mask_n[:, None] & mask_k[None, :]
 
     # Global slot index for flattened [N, K].
     idx = offs_n[:, None] * K + offs_k[None, :]
@@ -80,8 +95,6 @@ def balanced_topk_kernel(
     # Position inside one expert cycle, and cycle number.
     idx_mod_M = idx % M
     idx_div_M = idx // M
-
-    mask_2d = mask_n[:, None] & (offs_k[None, :] < K)
 
     # Lookup from permutation table, then shift by cycle id.
     # This keeps dispatch balanced while avoiding a fully fixed pattern.
@@ -125,6 +138,7 @@ def transform_select_experts_indexes(
     )
 
     BLOCK_N = 128
+    BLOCK_K = _next_power_of_2(top_k)
     grid = (triton.cdiv(num_tokens, BLOCK_N),)
 
     balanced_topk_kernel[grid](
@@ -135,6 +149,7 @@ def transform_select_experts_indexes(
         M=num_experts,
         K=top_k,
         BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
     )
 
     return topk_output

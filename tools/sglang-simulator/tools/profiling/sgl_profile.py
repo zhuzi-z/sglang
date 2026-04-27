@@ -1,3 +1,5 @@
+import json
+import os
 from dataclasses import asdict, dataclass
 
 import numpy as np
@@ -29,7 +31,11 @@ class ScheduleBatchRequest:
         if self.input_ids is None:
             self.input_ids = np.random.randint(1000, 100000, size=total_len).tolist()
             self.output_ids = []
-        return (self.input_ids + self.output_ids)[:total_len]
+        tokens = (self.input_ids + self.output_ids)[:total_len]
+        # Reset the first extended token during replay, causing a cache miss.
+        if self.extend_len > 1:
+            tokens[self.past_kv_len] = np.random.randint(1000, 100000)
+        return tokens
 
     def prefix_tokens(self) -> list[int]:
         if self.past_kv_len > 0:
@@ -41,6 +47,7 @@ class ScheduleBatchRequest:
 @dataclass
 class ScheduleBatch:
     reqs: list[ScheduleBatchRequest]
+    name: str | None = None
 
     def __repr__(self) -> str:
         result = []
@@ -87,6 +94,10 @@ def run(
     server_info = llm.get_server_info()
     max_total_num_tokens = server_info["max_total_num_tokens"]
 
+    os.makedirs(output_dir, exist_ok=True)
+    with open(output_dir + "/server_info.json", "w") as f:
+        json.dump(server_info, f, indent=4)
+
     for idx, batch in enumerate(batch_list):
         print(f"Profiling: {batch}")
         if skip_out_of_tokens and batch.total_tokens() > max_total_num_tokens:
@@ -110,7 +121,7 @@ def run(
             llm.start_profile(
                 activities=["GPU", "CPU"],
                 with_stack=False,
-                output_dir=output_dir + f"/{idx}",
+                output_dir=output_dir + f"/{batch.name or idx}",
             )
         else:
             torch.cuda.cudart().cudaProfilerStart()
