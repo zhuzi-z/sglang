@@ -28,6 +28,9 @@ from sglang_simulator.utils.json import CustomJsonEncoder
 
 logger = get_logger("sgl_simulator")
 
+import cProfile
+import pstats
+
 
 class C_SchedulerHook(BaseHook):
     HOOK_CLASS_NAME = "Scheduler"
@@ -64,6 +67,9 @@ class C_SchedulerHook(BaseHook):
             return original_event_loop_normal(self, *args, **kwargs)
 
         def wrapped_init(self, *args, **kwargs):
+
+            C_SchedulerHook.profiler = cProfile.Profile()
+
             # Disable overlap schedule
             server_args = get_obj_from_args(
                 "sglang.srt.server_args.ServerArgs", *args, **kwargs
@@ -163,6 +169,7 @@ class C_SchedulerHook(BaseHook):
                         ]["total_request"]
 
                         if len(C_SchedulerHook.FUTURE_QUEUE) == total_request:
+                            C_SchedulerHook.profiler.enable()
                             C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = True
                             heapq.heapify(C_SchedulerHook.FUTURE_QUEUE)
                             logger.info(
@@ -276,8 +283,7 @@ class C_SchedulerHook(BaseHook):
                         simulation_batch.reqs.append(
                             ScheduleRequest(
                                 extend_length=req.extend_input_len,
-                                past_kv_length=len(req.prefix_indices)
-                                + len(req.output_ids),
+                                past_kv_length=req.cache_protected_len,  # len(req.prefix_indices)
                             )
                         )
                 elif batch.forward_mode.is_decode():
@@ -285,8 +291,7 @@ class C_SchedulerHook(BaseHook):
                         simulation_batch.reqs.append(
                             ScheduleRequest(
                                 extend_length=1,
-                                past_kv_length=len(req.prefix_indices)
-                                + len(req.output_ids),
+                                past_kv_length=req.seqlen,  # len(req.prefix_indices) + len(req.output_ids)
                             )
                         )
 
@@ -423,6 +428,14 @@ class C_SchedulerHook(BaseHook):
 
                 except Exception as e:
                     logger.error(f"Failed to dump results. Error: {e}")
+
+                C_SchedulerHook.profiler.disable()
+                C_SchedulerHook.profiler.dump_stats(f"{output_dir}/prof_stats.prof")
+                prof_stats = pstats.Stats(C_SchedulerHook.profiler).sort_stats(
+                    pstats.SortKey.TIME
+                )
+                prof_stats.print_stats(50)
+
             else:
                 logger.warning("No request statistics available.")
 

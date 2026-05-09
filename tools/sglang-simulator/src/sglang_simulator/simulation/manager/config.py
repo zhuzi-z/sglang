@@ -11,6 +11,7 @@ from sglang_simulator.spec import AcceleratorInfo, DataType, ModelInfo
 from sglang_simulator.time_predictor import (
     AIConfiguratorTimePredictor,
     InferTimePredictor,
+    InterpolatedDecodeTimePredictor,
 )
 from sglang_simulator.utils import get_logger
 
@@ -171,7 +172,7 @@ class ConfigManager:
             )
             enable_oom_check = predictor_config.get("enable_oom_check", False)
 
-            return AIConfiguratorTimePredictor(
+            predictor = AIConfiguratorTimePredictor(
                 model,
                 hw=hw,
                 config=sched_config,
@@ -184,3 +185,15 @@ class ConfigManager:
             )
         else:
             raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")
+
+        sample_decode_steps = predictor_config.get("sample_decode_steps", 1)
+        if sample_decode_steps != 1:
+            return InterpolatedDecodeTimePredictor(
+                model=model,
+                hw=hw,
+                config=sched_config,
+                predictor=predictor,
+                sample_decode_steps=sample_decode_steps,
+            )
+
+        return predictor
