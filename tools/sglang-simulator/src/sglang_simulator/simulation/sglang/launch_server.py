@@ -24,9 +24,6 @@ if not torch.cuda.is_available():
     sglang_simulator_hook.install_module_hooks(
         [sgl_kernel_hook.M_SGLangKernelLoadUtilHook]
     )
-sglang_simulator_hook.install_module_hooks(
-    [sgl_kernel_hook.M_SGLangCommonHook]
-)
 sglang_simulator_hook.install_class_hooks(
     [
         scheduler.C_SchedulerHook,
