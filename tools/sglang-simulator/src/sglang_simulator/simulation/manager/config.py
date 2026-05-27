@@ -171,6 +171,14 @@ class ConfigManager:
                 "workload_distribution", "balanced"
             )
             enable_oom_check = predictor_config.get("enable_oom_check", False)
+            # framework overhead knobs (gated to DeepSeek-V4 inside predictor)
+            prefill_fw_overhead = predictor_config.get(
+                "prefill_framework_overhead_ms", 0.0
+            )
+            decode_fw_overhead = predictor_config.get(
+                "decode_framework_overhead_ms", 0.0
+            )
+            warmup_overhead = predictor_config.get("warmup_overhead_ms", 0.0)
 
             return AIConfiguratorTimePredictor(
                 model,
@@ -183,6 +191,9 @@ class ConfigManager:
                 prefill_min_latency=prefill_min_latency,
                 workload_distribution=workload_distribution,
                 enable_oom_check=enable_oom_check,
+                prefill_framework_overhead_ms=prefill_fw_overhead,
+                decode_framework_overhead_ms=decode_fw_overhead,
+                warmup_overhead_ms=warmup_overhead,
             )
         else:
             raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")

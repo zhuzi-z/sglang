@@ -125,12 +125,41 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         prefill_min_latency: float = 0,
         workload_distribution: str = "balanced",
         enable_oom_check: bool = False,
+        prefill_framework_overhead_ms: float = 0.0,
+        decode_framework_overhead_ms: float = 0.0,
+        warmup_overhead_ms: float = 0.0,
     ):
         super().__init__(model, hw, config)
 
         self.prefill_scale_factor = prefill_scale_factor
         self.decode_scale_factor = decode_scale_factor
         self.prefill_min_latency = prefill_min_latency
+        self._prefill_framework_overhead_ms = prefill_framework_overhead_ms
+        self._decode_framework_overhead_ms = decode_framework_overhead_ms
+        self._warmup_overhead_ms = warmup_overhead_ms
+        self._first_iter_consumed = False
+        # Gate latency overhead compensation to DeepSeek-V4 only.
+        # Other models keep AIC raw output untouched (overhead values, even if
+        # passed via config, are ignored).
+        self._enable_overhead_compensation = False
+        try:
+            from aiconfigurator.sdk.models.helpers import _get_model_info
+            arch = ""
+            if getattr(model, "model_path", None):
+                arch = _get_model_info(model.model_path).get("architecture", "")
+            self._enable_overhead_compensation = (arch == "DeepseekV4ForCausalLM")
+        except Exception as e:
+            logger.warning(
+                f"Failed to detect model architecture for overhead-gating: {e}. "
+                "Overhead compensation will be disabled."
+            )
+        if not self._enable_overhead_compensation and (
+            prefill_framework_overhead_ms or decode_framework_overhead_ms or warmup_overhead_ms
+        ):
+            logger.warning(
+                "Latency overhead compensation is gated to DeepSeek-V4 only; "
+                "non-zero overhead values will be ignored for this model."
+            )
         if isinstance(database_mode, str):
             database_mode = self._get_database_mode(database_mode)
 
@@ -274,4 +303,22 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
                 else infer_time
             )
 
+        # P0: per-iter framework overhead (DeepSeek-V4 only)
+        # Gated to V4 because the calibrated overhead values were derived
+        # from V4 silicon profile vs sglang real iter latency comparison;
+        # applying them to other models would over-compensate.
+        if self._enable_overhead_compensation:
+            if batch.is_decode():
+                infer_time += self._decode_framework_overhead_ms
+            else:
+                infer_time += self._prefill_framework_overhead_ms
+            # cold-start warmup on the first iter of each benchmark
+            if not self._first_iter_consumed:
+                infer_time += self._warmup_overhead_ms
+                self._first_iter_consumed = True
+
         return infer_time / 1e3
+
+    def reset_state(self):
+        """Reset per-benchmark state so warmup overhead fires on the next first iter."""
+        self._first_iter_consumed = False

@@ -468,6 +468,11 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook.LAST_FLUSH_TS = time.time()
             C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST = 0
             C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = False
+            # reset predictor warmup flag so each benchmark gets fresh cold-start
+            if C_SchedulerHook.INFERENCE_PREDICTOR is not None and hasattr(
+                C_SchedulerHook.INFERENCE_PREDICTOR, "reset_state"
+            ):
+                C_SchedulerHook.INFERENCE_PREDICTOR.reset_state()
 
             ProfileReqOutput = getattr(
                 importlib.import_module("sglang.srt.managers.io_struct"),
