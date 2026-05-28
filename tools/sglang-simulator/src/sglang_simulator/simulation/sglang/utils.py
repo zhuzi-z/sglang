@@ -27,6 +27,9 @@ def resolve_scheduler_config(
         ep_size=server_args.ep_size,
         dp_size=server_args.dp_size,
         pp_size=server_args.pp_size,
+        page_size=getattr(server_args, "page_size", None),
+        swa_full_tokens_ratio=getattr(server_args, "swa_full_tokens_ratio", None),
+        kv_bytes_per_token_per_gpu=getattr(server_args, "kv_bytes_per_token_per_gpu", None),
         backend_name="sglang",
         backend_version=__version__,
     )
@@ -49,6 +52,16 @@ def resolve_model_info(model_config: "ModelConfig") -> ModelInfo:
             num_key_value_heads=model_config.num_key_value_heads,
             v_head_dim=model_config.v_head_dim,
             vocab_size=model_config.vocab_size,
+            # DSv4-style models (e.g. DSv4-Pro) report attention_arch=MHA because
+            # sglang routes them through a custom `attention_backend='dsv4'`, not
+            # MLA. But they still carry compress_ratios + indexer + SWA fields on
+            # ModelConfig, and is_dsv4() needs them to take the right calculator
+            # branch. getattr makes this a no-op for true MHA models.
+            compression_ratios=getattr(model_config, "compress_ratios", None),
+            indexer_head_dim=getattr(model_config, "index_head_dim", None),
+            window_size=getattr(model_config, "window_size", None),
+            qk_nope_head_dim=getattr(model_config, "qk_nope_head_dim", None),
+            qk_rope_head_dim=getattr(model_config, "qk_rope_head_dim", None),
             torch_dtype=torch_dtype,
         )
     elif model_config.attention_arch == AttentionArch.MLA:
@@ -67,6 +80,9 @@ def resolve_model_info(model_config: "ModelConfig") -> ModelInfo:
             qk_rope_head_dim=model_config.qk_rope_head_dim,
             qk_nope_head_dim=model_config.qk_nope_head_dim,
             kv_lora_rank=model_config.kv_lora_rank,
+            compression_ratios=getattr(model_config, "compress_ratios", None),
+            indexer_head_dim=getattr(model_config, "index_head_dim", None),
+            window_size=getattr(model_config, "window_size", None),
             torch_dtype=torch_dtype,
         )
     else:

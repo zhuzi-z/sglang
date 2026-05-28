@@ -19,6 +19,18 @@ class SchedulerConfig:
     dp_size: int = 1
     pp_size: int = 1
 
+    # DSv4 KV cache calculator inputs (sourced from server_args)
+    page_size: Optional[int] = None
+    swa_full_tokens_ratio: Optional[float] = None
+
+    # Optional explicit override of per-GPU KV bytes/token, sourced from
+    # sglang server startup log: "KV Cache is allocated. #tokens: N, KV size: G GB"
+    #   kv_bytes_per_token_per_gpu = G * 1024**3 / N
+    # When set, takes priority over the model-derived calculator path.
+    # Useful for models where sglang doesn't expose its KV calculator output
+    # (e.g. GlmMoeDsa) and we want metrics to match the live sglang server.
+    kv_bytes_per_token_per_gpu: Optional[float] = None
+
     # framework backend
     backend_name: str = "sglang"
     backend_version: Optional[str] = None

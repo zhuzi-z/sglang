@@ -1,5 +1,6 @@
 from queue import Empty
 from typing import Optional
+from queue import Queue
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager, StateManager
@@ -30,6 +31,11 @@ class C_HiCacheController(BaseHook):
 
         original_terminate_prefetch = target.terminate_prefetch
         original_storage_hit_query = target._storage_hit_query
+        original_init = target.__init__
+
+        def wrapped_init(self, *args, **kwargs):
+            self.sim_prefetch_buffer = Queue()
+            return original_init(self, *args, **kwargs)
 
         def override_backup_thread_func(self, *args, **kwargs):
             # Async thread: perform no action
@@ -58,6 +64,7 @@ class C_HiCacheController(BaseHook):
                 except Empty:
                     return
 
+
         def handle_prefetch_operation(self):
             if not self.enable_storage:
                 return
@@ -72,6 +79,46 @@ class C_HiCacheController(BaseHook):
             # TODO: Overlap schedule
             remain_dur = StateManager.get_current_inference_dur()
 
+            # Process all operations in the prefetch_queue: place those meeting
+            # the prefetch criteria into the sim_prefetch_buffer, and release the
+            # remaining operations along with any excess memory they have allocated.
+            while not self.prefetch_queue.empty():
+                try:
+                    operation = self.prefetch_queue.get(block=False)
+                    if operation is None:
+                        break
+
+                    # Ignore terminated operation
+                    if operation._terminated_flag:
+                        self.append_host_mem_release(operation.host_indices)
+                        continue
+
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    # not to prefetch if not enough benefits
+                    if (
+                        self.prefetch_threshold is not None
+                        and storage_hit_count < self.prefetch_threshold
+                    ):
+                        operation.mark_terminate()
+                        self.append_host_mem_release(operation.host_indices)
+                        continue
+                    else:
+                        operation.hash_value = hash_value[
+                            : (storage_hit_count // self.page_size)
+                        ]
+                        storage_hit_count = (
+                            storage_hit_count // self.page_size * self.page_size
+                        )
+                        # free the pre-allocated memory for pages that are not hit
+                        self.append_host_mem_release(
+                            operation.host_indices[storage_hit_count:]
+                        )
+                        operation.host_indices = operation.host_indices[:storage_hit_count]
+                        self.sim_prefetch_buffer.put(operation)
+                except Empty:
+                    break
+
+            # handle operation which not yet fully prefetched
             chunked_prefetch_operation = getattr(
                 self, "chunked_prefetch_operation", None
             )
@@ -108,9 +155,10 @@ class C_HiCacheController(BaseHook):
                             operation.host_indices[storage_hit_count:]
                         )
 
+            # handle operation in sim_prefetch_buffer
             while remain_dur > 0:
                 try:
-                    operation = self.prefetch_queue.get(block=False)
+                    operation = self.sim_prefetch_buffer.get(block=False)
                     if operation is None:
                         return
 
@@ -121,23 +169,7 @@ class C_HiCacheController(BaseHook):
                         )
                         continue
 
-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
-                    # not to prefetch if not enough benefits
-                    if (
-                        self.prefetch_threshold is not None
-                        and storage_hit_count < self.prefetch_threshold
-                    ):
-                        operation.mark_terminate()
-                        self.append_host_mem_release(operation.host_indices)
-                        continue
-
-                    operation.hash_value = hash_value[
-                        : (storage_hit_count // self.page_size)
-                    ]
-                    storage_hit_count = (
-                        storage_hit_count // self.page_size * self.page_size
-                    )
-
+                    storage_hit_count = len(operation.host_indices)
                     completed_tokens, prefetch_dur = (
                         C_HiCacheController.calc_prefetch_pages(
                             storage_hit_count,
@@ -165,10 +197,6 @@ class C_HiCacheController(BaseHook):
                         # TODO: Track the prefetch operation according to the global clock
                         operation.mark_terminate()
                         remain_dur -= prefetch_dur
-                        # Release host memory after current operation is finished
-                        self.append_host_mem_release(
-                            operation.host_indices[operation.completed_tokens :]
-                        )
 
                 except Empty:
                     return
@@ -199,6 +227,7 @@ class C_HiCacheController(BaseHook):
             req_stats.recv_storage_hit_len = result[1]
             return result
 
+        target.__init__ = wrapped_init
         target.prefetch_thread_func = override_prefetch_thread_func
         target.backup_thread_func = override_backup_thread_func
         target.handle_backup_operation = handle_backup_operation

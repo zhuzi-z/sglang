@@ -106,6 +106,9 @@ def get_perf_model(
         workload_distribution=workload_distribution,
     )
 
+    # print(f"Model config for AIConfigurator: {model_config}") # mry debug
+    logger.info(f"Model config for AIConfigurator: {model_config}")
+
     return models.get_model(
         model_path=model.model_path,
         model_config=model_config,
@@ -148,6 +151,7 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
             raise ValueError("Failed to initialize the database.")
 
         database.set_default_database_mode(database_mode)
+        logger.info(f"AIC Database mode: {database_mode}")
 
         # --- Replace the original function to support more flexible request input. --- #
 
