@@ -9,6 +9,58 @@ from sglang_simulator.utils import get_logger
 logger = get_logger()
 
 
+# ---------------------------------------------------------------------------
+# HiCache transfer model — calibrated from hicache_h2d_profile.py + d2h_profile.py
+# on DSV4-Flash-FP8, TP=8, H20, hicache_ratio=2.0, page_size=256.
+#
+# Aggregate per-request behavior (matches measurement, R²≥0.998):
+#   total_h2d_time = total_h2d_bytes / 27.4e9    (peak BW from time-vs-bytes fit)
+#   total_d2h_time = total_d2h_bytes / 33.89e9
+# Each pool's per-layer call contributes its own bytes; with a single per-
+# direction BW the per-pool sum collapses to total_bytes / BW. So the simulator
+# can keep its per-pool serial-accumulation accounting and still match measured
+# aggregate latency.
+# ---------------------------------------------------------------------------
+HICACHE_H2D_PEAK_BW_BYTES = 27.4e9   # GB/s effective, includes per-call overhead
+HICACHE_D2H_PEAK_BW_BYTES = 33.89e9  # write direction is faster (asymmetry)
+HICACHE_PER_CALL_OVERHEAD_S = 0.0    # overhead is absorbed into the BW above
+
+# Per-pool per-layer bytes per token. Total across all 7 active pools sums to
+# ~76,734 bytes per loaded token (regression R²=1.0000 on first-chunk data).
+# Within {compute group} and {state group}, individual per-pool bytes are not
+# separately identifiable from the measurement (loaded_n is identical group-wide),
+# so we split the group total evenly by layer count.
+# NB: 'swa' lives in PagedHostPool but its H2D loaded_n caps like a state pool;
+#     the per-token byte size we still treat as state-class (~424).
+_BYTES_PER_TOKEN_PER_LAYER_PAGED = {
+    "deepseek_v4_c128": 65,         # 1300 (group total) / 20 layers
+    "deepseek_v4_c4": 62,           # 1300 / 21
+    "deepseek_v4_c4_indexer": 62,   # 1300 / 21
+    "swa": 424,                     # 18209 / 43
+}
+_BYTES_PER_TOKEN_PER_LAYER_STATE = {
+    "deepseek_v4_c128_state": 911,         # 18209 / 20
+    "deepseek_v4_c4_state": 867,           # 18209 / 21
+    "deepseek_v4_c4_indexer_state": 867,   # 18209 / 21
+}
+
+
+def _hicache_transfer_time(size_bytes_arr: np.ndarray, cat: str) -> np.ndarray:
+    """Compute per-segment transfer time in seconds.
+
+    Model: time = per_call_overhead + bytes / peak_bw
+    Returned as an effective bandwidth array (so callers can keep using
+    time = size / bw): bw(x) = x * peak_bw / (t0 * peak_bw + x).
+    """
+    x = size_bytes_arr.astype(np.float64)
+    bw = HICACHE_H2D_PEAK_BW_BYTES if cat == "H2D" else HICACHE_D2H_PEAK_BW_BYTES
+    t0 = HICACHE_PER_CALL_OVERHEAD_S
+    if t0 == 0:
+        # Avoid divide-by-zero and just return the constant peak bandwidth
+        return np.full_like(x, bw)
+    return x * bw / (t0 * bw + x)
+
+
 class C_MHATokenToKVPoolHostHook(BaseHook):
     HOOK_CLASS_NAME = "MHATokenToKVPoolHost"
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
@@ -169,16 +221,12 @@ class C_DeepSeekV4PagedHostPoolHook(BaseHook):
     HOOK_CLASS_NAME = "DeepSeekV4PagedHostPool"
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
 
-    MEMORY_READ_BANDWIDTH_BYTES: Optional[float] = None
-    MEMORY_WRITE_BANDWIDTH_BYTES: Optional[float] = None
-
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
 
         def wrapped_init(self, *args, **kwargs):
-            # Disable pip memory, which might fail on CPU platforms.
-            print(1)
+            # Disable pin memory, which might fail on CPU platforms.
             if "pin_memory" in kwargs:
                 kwargs["pin_memory"] = False
             elif len(args) > 6:
@@ -188,94 +236,61 @@ class C_DeepSeekV4PagedHostPoolHook(BaseHook):
                 kwargs["pin_memory"] = False
             else:
                 logger.warning(
-                    "Failed to disable pip memory while initializing the DeepSeekV4PagedHostPool."
+                    "Failed to disable pin memory while initializing the DeepSeekV4PagedHostPool."
                 )
             return original_init(self, *args, **kwargs)
-        
-        def est_bandwidth_batch(size_bytes_arr: np.ndarray, cat: str):
-            if cls.MEMORY_READ_BANDWIDTH_BYTES is None:
-                cls.MEMORY_READ_BANDWIDTH_BYTES = (
-                    ConfigManager.get_platform_config().memory_read_bandwidth
-                )
-            if cls.MEMORY_WRITE_BANDWIDTH_BYTES is None:
-                cls.MEMORY_WRITE_BANDWIDTH_BYTES = (
-                    ConfigManager.get_platform_config().memory_write_bandwidth
-                )
-            x = size_bytes_arr.astype(np.float64)
-            if cat == "H2D":
-                eff = 0.85
-                t0 = 6.67e-6
-                bw = cls.MEMORY_READ_BANDWIDTH_BYTES * eff
-            else:
-                eff = 0.85
-                t0 = 4e-6
-                bw = cls.MEMORY_WRITE_BANDWIDTH_BYTES * eff
-            return x * bw / (t0 * bw + x)
-        
+
+        def _segment_lens(host_indices, device_indices):
+            num_indices = len(host_indices)
+            host = np.asarray(host_indices.cpu(), dtype=np.int64)
+            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
+            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
+            cut = np.flatnonzero(~cont) + 1
+            starts = np.r_[0, cut]
+            ends = np.r_[cut, num_indices]
+            return (ends - starts).astype(np.float64)
+
         def backup_from_device_all_layer(
             self, device_pool, host_indices, device_indices, io_backend
         ):
+            # D2H: write_through has been measured to NOT cap at chunked_prefill_size
+            # — backup_n equals full prefill length for all pools (including swa).
+            # The simulator just trusts the indices sglang hands us.
             if host_indices is None or device_indices is None:
                 return
             self._check_io_backend(io_backend)
             host_indices = self._to_page_indices(host_indices)
             device_indices = self._to_page_indices(device_indices)
 
-            num_indices = len(host_indices)
-
-            host = np.asarray(host_indices.cpu(), dtype=np.int64)
-            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
-            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
-            cut = np.flatnonzero(~cont) + 1
-            starts = np.r_[0, cut]
-            ends = np.r_[cut, num_indices]
-            seg_len = (ends - starts).astype(np.float64)
-
-            # print(f"[backup_from_device_all_layer DeepSeekV4PagedHostPool] {seg_len=}")
-
+            seg_len = _segment_lens(host_indices, device_indices)
             size_bytes_arr = seg_len * self.get_size_per_token()
-            bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="D2H")
+            bandwidth_arr = _hicache_transfer_time(size_bytes_arr, cat="D2H")
             total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
-            # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
-            StateManager.inc_hicache_l2_load_dur(total_time_cost)
-            
+            StateManager.inc_hicache_l2_backup_dur(total_time_cost)
 
         def load_to_device_per_layer(
             self, device_pool, host_indices, device_indices, layer_id, io_backend
         ) -> None:
             assert len(host_indices) == len(device_indices)
-            num_indices = len(host_indices)
-
             host_indices = self._to_page_indices(host_indices)
             device_indices = self._to_page_indices(device_indices)
 
-            host = np.asarray(host_indices.cpu(), dtype=np.int64)
-            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
-            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
-            cut = np.flatnonzero(~cont) + 1
-            starts = np.r_[0, cut]
-            ends = np.r_[cut, num_indices]
-            seg_len = (ends - starts).astype(np.float64)
-
+            seg_len = _segment_lens(host_indices, device_indices)
             size_bytes_arr = seg_len * self.get_size_per_token()
-            bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="H2D")
+            bandwidth_arr = _hicache_transfer_time(size_bytes_arr, cat="H2D")
             total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
-            # print(f"[Paged load_to_device_per_layer] {self.pool_name=}, {seg_len=}, {self.get_size_per_token()=}, {total_time_cost=}")
-            # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
             StateManager.inc_hicache_l2_load_dur(total_time_cost)
 
         def get_size_per_token(self):
-            if self.pool_name in ['swa']:
-                return self.size_per_token * 130
-            elif self.pool_name in ['deepseek_v4_c4']:
-                return self.size_per_token * 65
-            elif self.pool_name in ['deepseek_v4_c4_indexer']:
-                return self.size_per_token * 132
-            elif self.pool_name in ['deepseek_v4_c128']:
-                return self.size_per_token * 3
-            else:
-                # return self.size_per_token
-                raise ValueError(f"[DeepSeekV4PagedHostPool] unsupport pool name: {self.pool_name}") 
+            # Per-layer bytes/token × tokens-per-page (seg_len is in pages after
+            # _to_page_indices). Calibrated from hicache_h2d_profile.py.
+            try:
+                bytes_per_token_per_layer = _BYTES_PER_TOKEN_PER_LAYER_PAGED[self.pool_name]
+            except KeyError:
+                raise ValueError(
+                    f"[DeepSeekV4PagedHostPool] unsupported pool name: {self.pool_name}"
+                )
+            return bytes_per_token_per_layer * self.slot_page_size
 
         target.__init__ = wrapped_init
         target.backup_from_device_all_layer = backup_from_device_all_layer
@@ -287,16 +302,12 @@ class C_DeepSeekV4StateHostPoolHook(BaseHook):
     HOOK_CLASS_NAME = "DeepSeekV4StateHostPool"
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
 
-    MEMORY_READ_BANDWIDTH_BYTES: Optional[float] = None
-    MEMORY_WRITE_BANDWIDTH_BYTES: Optional[float] = None
-
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
 
         def wrapped_init(self, *args, **kwargs):
-            # Disable pip memory, which might fail on CPU platforms.
-            print(1)
+            # Disable pin memory, which might fail on CPU platforms.
             if "pin_memory" in kwargs:
                 kwargs["pin_memory"] = False
             elif len(args) > 5:
@@ -306,91 +317,63 @@ class C_DeepSeekV4StateHostPoolHook(BaseHook):
                 kwargs["pin_memory"] = False
             else:
                 logger.warning(
-                    "Failed to disable pip memory while initializing the DeepSeekV4StateHostPool."
+                    "Failed to disable pin memory while initializing the DeepSeekV4StateHostPool."
                 )
             return original_init(self, *args, **kwargs)
-    
-        def est_bandwidth_batch(size_bytes_arr: np.ndarray, cat: str):
-            if cls.MEMORY_READ_BANDWIDTH_BYTES is None:
-                cls.MEMORY_READ_BANDWIDTH_BYTES = (
-                    ConfigManager.get_platform_config().memory_read_bandwidth
-                )
-            if cls.MEMORY_WRITE_BANDWIDTH_BYTES is None:
-                cls.MEMORY_WRITE_BANDWIDTH_BYTES = (
-                    ConfigManager.get_platform_config().memory_write_bandwidth
-                )
-            x = size_bytes_arr.astype(np.float64)
-            if cat == "H2D":
-                eff = 0.85
-                t0 = 6.67e-6
-                bw = cls.MEMORY_READ_BANDWIDTH_BYTES * eff
-            else:
-                eff = 0.85
-                t0 = 4e-6
-                bw = cls.MEMORY_WRITE_BANDWIDTH_BYTES * eff
-            return x * bw / (t0 * bw + x)
-        
+
+        def _segment_lens(host_indices, device_indices):
+            num_indices = len(host_indices)
+            host = np.asarray(host_indices.cpu(), dtype=np.int64)
+            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
+            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
+            cut = np.flatnonzero(~cont) + 1
+            starts = np.r_[0, cut]
+            ends = np.r_[cut, num_indices]
+            return (ends - starts).astype(np.float64)
+
         def backup_from_device_all_layer(
             self, device_pool, host_indices, device_indices, io_backend
         ):
+            # D2H for state pools also does NOT cap — measurement confirms
+            # state backup_n equals full N even when N > chunked_prefill_size.
             if host_indices is None or device_indices is None:
                 return
             self._check_io_backend(io_backend)
             host_indices = self._to_page_indices(host_indices)
             device_indices = self._to_page_indices(device_indices)
 
-            num_indices = len(host_indices)
-
-            host = np.asarray(host_indices.cpu(), dtype=np.int64)
-            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
-            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
-            cut = np.flatnonzero(~cont) + 1
-            starts = np.r_[0, cut]
-            ends = np.r_[cut, num_indices]
-            seg_len = (ends - starts).astype(np.float64)
-
-            # print(f"[backup_from_device_all_layer DeepSeekV4StateHostPool] {seg_len=}")
-
+            seg_len = _segment_lens(host_indices, device_indices)
             size_bytes_arr = seg_len * self.get_size_per_token()
-            bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="D2H")
+            bandwidth_arr = _hicache_transfer_time(size_bytes_arr, cat="D2H")
             total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
-            # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
-            StateManager.inc_hicache_l2_load_dur(total_time_cost)
-            
+            StateManager.inc_hicache_l2_backup_dur(total_time_cost)
 
         def load_to_device_per_layer(
             self, device_pool, host_indices, device_indices, layer_id, io_backend
         ) -> None:
+            # H2D for state pools DOES cap: real sglang code passes only
+            # ((N-1)//page_size*page_size) mod chunked_prefill_size indices.
+            # We trust the indices and just compute bytes.
             assert len(host_indices) == len(device_indices)
             host_indices = self._to_page_indices(host_indices)
             device_indices = self._to_page_indices(device_indices)
 
-            num_indices = len(host_indices)
-
-            host = np.asarray(host_indices.cpu(), dtype=np.int64)
-            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
-            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
-            cut = np.flatnonzero(~cont) + 1
-            starts = np.r_[0, cut]
-            ends = np.r_[cut, num_indices]
-            seg_len = (ends - starts).astype(np.float64)
-
+            seg_len = _segment_lens(host_indices, device_indices)
             size_bytes_arr = seg_len * self.get_size_per_token()
-            bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="H2D")
+            bandwidth_arr = _hicache_transfer_time(size_bytes_arr, cat="H2D")
             total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
-            # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
-            # print(f"[State load_to_device_per_layer] {self.pool_name=}, {seg_len=}, {self.get_size_per_token()=}, {total_time_cost=}")
             StateManager.inc_hicache_l2_load_dur(total_time_cost)
 
         def get_size_per_token(self):
-            if self.pool_name in ['deepseek_v4_c4_state', 'deepseek_v4_c128_state']:
-                return self.size_per_token * 256
-            elif self.pool_name in ['deepseek_v4_indexer_state', 'deepseek_v4_c4_indexer_state']:
-                return self.size_per_token * 128
-            else:
-                # return self.size_per_token
-                raise ValueError(f"[DeepSeekV4StateHostPool] unsupport pool name: {self.pool_name}")
-        
+            # Per-layer bytes/token × tokens-per-page (seg_len is in SWA pages).
+            try:
+                bytes_per_token_per_layer = _BYTES_PER_TOKEN_PER_LAYER_STATE[self.pool_name]
+            except KeyError:
+                raise ValueError(
+                    f"[DeepSeekV4StateHostPool] unsupported pool name: {self.pool_name}"
+                )
+            return bytes_per_token_per_layer * self.swa_page_size
+
         target.__init__ = wrapped_init
         target.backup_from_device_all_layer = backup_from_device_all_layer
         target.load_to_device_per_layer = load_to_device_per_layer
