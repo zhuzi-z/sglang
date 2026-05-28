@@ -376,16 +376,25 @@ class C_SchedulerHook(BaseHook):
                         )
                     )
                     StateManager.step_global_clock(current_inference_dur)
-                    request_response_time = (
-                        StateManager.get_global_clock() + hicache_l2_backup_dur
-                    )
+                    # D2H (write_through backup) runs async on HiCacheController's
+                    # backup_queue / write_stream; stream_output returns the first
+                    # token without synchronizing on it (verified in real sglang's
+                    # scheduler_output_processor_mixin.py:process_batch_result_prefill).
+                    # In overlap mode, backup also runs concurrent with subsequent
+                    # inference on a separate stream, so it doesn't advance the
+                    # wall clock either.
+                    request_response_time = StateManager.get_global_clock()
                 else:
+                    # Serial mode: H2D + forward block the first token return.
+                    # D2H still happens after forward but the token is already returned.
                     StateManager.step_global_clock(
-                        hicache_l2_load_dur
-                        + current_inference_dur
-                        + hicache_l2_backup_dur
+                        hicache_l2_load_dur + current_inference_dur
                     )
                     request_response_time = StateManager.get_global_clock()
+                    # D2H delays the next iteration's start (no overlap to hide it),
+                    # so advance global_clock but DO NOT include it in this request's
+                    # response_time.
+                    StateManager.step_global_clock(hicache_l2_backup_dur)
                 # Request statistics
                 for req in batch.reqs:
                     if req.is_chunked == 0:
