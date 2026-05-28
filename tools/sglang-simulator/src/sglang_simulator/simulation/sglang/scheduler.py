@@ -226,6 +226,7 @@ class C_SchedulerHook(BaseHook):
     HOOK_MODULE_NAME = "sglang.srt.managers.scheduler"
 
     INFERENCE_PREDICTOR: InferTimePredictor = None
+    REQ_DISPATCHER: ReqDispatcher = None
 
     ITERATION_STATS: list[dict] = []
     TOTAL_PREDICTOR_TIME_COST = 0
@@ -268,6 +269,9 @@ class C_SchedulerHook(BaseHook):
             setattr(server_args, "decode_attention_backend", "torch_native")
 
             original_init(self, *args, **kwargs)
+
+            # Initialize the request dispatcher
+            C_SchedulerHook.REQ_DISPATCHER = ReqDispatcher(C_SchedulerHook.SIM_MODE)
 
             try:
                 if ConfigManager.get_model_info() is None:
