@@ -12,24 +12,20 @@ os.environ["SGLANG_SIMULATOR_CONFIG_PATH"] = (
 )
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-from sglang_simulator.simulation.sglang.bench_runner import (
-    SGLangBenchmarkRunner,
-)
+from sglang_simulator.simulation.benchmark import MultiInstanceBenchmarkRunner
+from sglang_simulator.simulation.sglang.worker import SGLangWorker
 
 random.seed(0)
 np.random.seed(0)
 
-
 def run_sgl_benchmark(server_args: dict):
-
     from sglang.srt.server_args import ServerArgs  # noqa
 
-    runner = SGLangBenchmarkRunner(
-        server_args=ServerArgs(
-            **server_args
-        )
+    worker = SGLangWorker(
+        server_args=ServerArgs(**server_args)
     )
-    runner.clear_hicache_storage()
+
+    runner = MultiInstanceBenchmarkRunner(workers=[worker])
 
     # Benchmark settings
     benchmark_config = BenchmarkConfig(request_rate=10, ignore_request_timestamp=True)
