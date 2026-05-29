@@ -9,16 +9,15 @@ os.environ["SGLANG_SIMULATOR_CONFIG_PATH"] = (
 )
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-from sglang_simulator.simulation.sglang.bench_runner import (
-    SGLangBenchmarkRunner,
-)
+from sglang_simulator.simulation.benchmark import MultiInstanceBenchmarkRunner
+from sglang_simulator.simulation.sglang.worker import SGLangWorker
 
 
 def test_benchmark_sglang():
     from sglang.srt.server_args import ServerArgs  # noqa
 
     model_path = "Qwen/Qwen3-8B"
-    runner = SGLangBenchmarkRunner(
+    worker = SGLangWorker(
         server_args=ServerArgs(
             model_path=model_path,
             load_format="dummy",
@@ -31,6 +30,8 @@ def test_benchmark_sglang():
             page_size=2,
         )
     )
+
+    runner = MultiInstanceBenchmarkRunner(workers=[worker])
 
     # Benchmark settings
     benchmark_config = BenchmarkConfig(request_rate=10, ignore_request_timestamp=True)
