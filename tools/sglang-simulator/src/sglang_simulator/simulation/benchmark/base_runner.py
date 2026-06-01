@@ -5,10 +5,26 @@ class BaseWorker:
     def __init__(self, name: str, *args, **kwargs):
         self.name = name
 
+    def pause_generation(self):
+        pass
+
+    def continue_generation(self):
+        pass
+
+    def get_request_stats(self) -> list[dict]:
+        pass
+
+    def get_iteration_stats(self) -> list[dict]:
+        pass
+
+    def shutdown(self):
+        pass
+
+    def flush_cache(self):
+        pass
+
 
 class BaseBenchmarkRunner(ABC):
-    def __init__(self, workers: list[BaseWorker]):
-        self.workers = workers
 
     @abstractmethod
     def benchmark(self) -> dict:

@@ -1,3 +1,4 @@
+from sglang_simulator.simulation.benchmark import load_balance
 from sglang_simulator.simulation.benchmark.base_runner import (
     BaseBenchmarkRunner,
     BaseWorker,
@@ -12,4 +13,5 @@ __all__ = [
     "BenchmarkConfig",
     "BaseWorker",
     "MultiInstanceBenchmarkRunner",
+    "load_balance",
 ]

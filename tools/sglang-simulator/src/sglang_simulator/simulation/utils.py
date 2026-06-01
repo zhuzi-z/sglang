@@ -1,3 +1,5 @@
+from typing import Union
+
 import numpy as np
 from sglang_simulator.simulation.types import RequestStats, SchedulerConfig
 from sglang_simulator.spec.accelerator import AcceleratorInfo
@@ -47,7 +49,11 @@ def estimate_kv_cache_pool_capacity(
     return int(rest_memory / kv_cache_space_per_token)
 
 
-def calc_metrics(requests: list[RequestStats]) -> dict:
+def calc_metrics(requests: list[Union[RequestStats, dict]]) -> dict:
+    for idx, req in enumerate(requests):
+        if isinstance(req, dict):
+            requests[idx] = RequestStats(**req)
+
     ttfts = []
     tpots = []
     itls = []
