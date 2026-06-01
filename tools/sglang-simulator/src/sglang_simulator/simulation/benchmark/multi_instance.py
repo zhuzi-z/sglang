@@ -1,6 +1,4 @@
 import asyncio
-import json
-import os
 from typing import Iterator
 
 import numpy as np
@@ -13,14 +11,22 @@ from sglang_simulator.simulation.benchmark.base_runner import (
     BaseWorker,
 )
 from sglang_simulator.simulation.benchmark.bench_config import BenchmarkConfig
+from sglang_simulator.simulation.benchmark.load_balance import (
+    LoadBalancingPolicy,
+    RoundRobinPolicy,
+)
+from sglang_simulator.simulation.utils import calc_metrics
 from sglang_simulator.utils.logger import get_logger
 
 logger = get_logger("sglang_simulator")
 
 
 class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
-    def __init__(self, workers: list[BaseWorker]):
-        self.workers = workers[0]
+    def __init__(
+        self, workers: list[BaseWorker], lb_proxy: LoadBalancingPolicy | None = None
+    ):
+        self.workers = workers
+        self.lb_proxy = lb_proxy if lb_proxy is not None else RoundRobinPolicy()
         self.loop = asyncio.new_event_loop()
 
     def get_request(
@@ -52,7 +58,9 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
         dataset: BaseDataset,
     ):
 
-        await self.workers.trigger_simulation()
+        for worker in self.workers:
+            await worker.trigger_simulation()
+            await worker.pause_generation()
 
         tasks = []
         logger.info(f"Created {len(dataset)} request tasks.")
@@ -61,22 +69,21 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
             ignore_timestamp=benchmark_config.ignore_request_timestamp,
             request_rate=benchmark_config.request_rate,
         ):
-            task = asyncio.create_task(self.workers.async_generate(req))
+            worker = self.lb_proxy.select_worker(self.workers, req)
+            task = asyncio.create_task(worker.async_generate(req))
             tasks.append(task)
+
+        for worker in self.workers:
+            await worker.continue_generation()
 
         _ = await asyncio.gather(*tasks)
 
         # dump result
-        await self.workers.trigger_simulation()
+        for worker in self.workers:
+            await worker.trigger_simulation()
 
-        if os.path.exists(self.workers.output_dir + "/metrics.json"):
-            with open(self.workers.output_dir + "/metrics.json", "r") as f:
-                metrics = json.load(f)
-        else:
-            logger.error(
-                f"Failed to load metrics from serving backend. The metrics file should be loaded from {self.workers.output_dir}."
-            )
-            return None
+        request_stats = self.get_request_stats()
+        metrics = calc_metrics(request_stats)
 
         return metrics
 
@@ -86,14 +93,22 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
             self.async_benchmark(benchmark_config, dataset)
         )
 
-    def get_request_stats(self) -> dict[str, list[dict]]:
-        return self.workers.get_request_stats()
+    def get_request_stats(self) -> list[dict]:
+        result = []
+        for worker in self.workers:
+            result.extend(worker.get_request_stats())
+        return result
 
     def get_iteration_stats(self):
-        return self.workers.get_iteration_stats()
+        result = []
+        for worker in self.workers:
+            result.extend(worker.get_iteration_stats())
+        return result
 
     def shutdown(self):
-        self.workers.shutdown()
+        for worker in self.workers:
+            worker.shutdown()
 
     def flush_cache(self):
-        self.workers.flush_cache()
+        for worker in self.workers:
+            worker.flush_cache()

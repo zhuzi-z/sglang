@@ -74,7 +74,14 @@ class ReqDispatcher:
         self.future_queue: list[tuple[float, int, Any]] = (
             []
         )  # tuple(created time, salt, request)
-        self.offline_recv_all_requests = False
+
+        self._can_dispatch = False
+
+    def disable_dispatch(self):
+        self._can_dispatch = False
+
+    def enable_dispatch(self):
+        self._can_dispatch = True
 
     def has_next(self) -> bool:
         return len(self.future_queue) > 0
@@ -86,7 +93,7 @@ class ReqDispatcher:
         if self.mode == SimulationMode.BLOCKING:
             self.immediate_release_requests.extend(reqs)
         elif self.mode == SimulationMode.OFFLINE:
-            if self.offline_recv_all_requests:
+            if self._can_dispatch:
                 self.immediate_release_requests.extend(reqs)
                 return
 
@@ -125,14 +132,14 @@ class ReqDispatcher:
                     )
                 )
 
-            if len(self.future_queue) != 0:
+            if (not self._can_dispatch) and len(self.future_queue) != 0:
                 _, _, gen_req = self.future_queue[-1]
                 total_request = gen_req.sampling_params.custom_params["simulation"][
                     "total_request"
                 ]
 
                 if len(self.future_queue) == total_request:
-                    self.offline_recv_all_requests = True
+                    self._can_dispatch = True
                     heapq.heapify(self.future_queue)
                     logger.info("All requests received. Starting simulation now.")
                 else:
@@ -146,7 +153,7 @@ class ReqDispatcher:
         recv_reqs.extend(self.immediate_release_requests)
         self.immediate_release_requests.clear()
 
-        if self.mode == SimulationMode.OFFLINE and self.offline_recv_all_requests:
+        if self._can_dispatch:
             # Process the arrived requests only after all requests have been added to the future queue
             current_timestamp = StateManager.get_global_clock()
             while len(self.future_queue) > 0:
@@ -551,6 +558,12 @@ class C_SchedulerHook(BaseHook):
                         _request_dispatcher._mapping[ty] = override_profile
             return ret
 
+        def override_pause_generation(self, *args, **kwargs):
+            C_SchedulerHook.REQ_DISPATCHER.disable_dispatch()
+
+        def override_continue_generation(self, *args, **kwargs):
+            C_SchedulerHook.REQ_DISPATCHER.enable_dispatch()
+
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
         target.get_new_batch_prefill = wrapped_get_new_batch_prefill
@@ -558,6 +571,8 @@ class C_SchedulerHook(BaseHook):
         target.process_batch_result = wrapped_process_batch_result
         target._prefetch_kvcache = wrapped_prefetch_kvcache
         target.init_request_dispatcher = wrapped_init_request_dispatcher
+        target.pause_generation = override_pause_generation
+        target.continue_generation = override_continue_generation
 
         if original_recv_requests:
             # version <= 0.5.12.post1
