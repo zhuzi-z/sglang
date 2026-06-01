@@ -49,8 +49,6 @@ sglang_simulator_hook.install_class_hooks(
 if os.getenv("HISIM_SIMULATION_MODE") is None:
     os.environ["HISIM_SIMULATION_MODE"] = "OFFLINE"
 
-from transformers import AutoTokenizer  # noqa
-
 # The sglang must be imported after the hook installer
 from sglang.srt.entrypoints.engine import Engine  # noqa
 from sglang.srt.server_args import ServerArgs  # noqa
@@ -59,9 +57,15 @@ logger = get_logger("sglang_simulator")
 
 
 class SGLangWorker(BaseWorker):
-    def __init__(self, server_args: ServerArgs, name="sglang"):
+    def __init__(self, server_args: ServerArgs, name="worker0"):
         super().__init__(name)
         # disable some features which is not necessary for simulation.
+
+        os.environ["SGLANG_SIMULATOR_OUTPUT_DIR"] = f"/tmp/sglang_simulator/{name}"
+        os.environ["SGLANG_SIMULATOR_HICACHE_STORAGE_KEYS_PATH"] = (
+            f"/tmp/sglang_simulator/{name}/hicache_storage_keys.txt"
+        )
+
         server_args.disable_cuda_graph = True
         self._engine = Engine(server_args=server_args)
         self.output_dir: str = None
@@ -96,10 +100,9 @@ class SGLangWorker(BaseWorker):
     def generate(self, req: GenericRequest):
         self._engine.loop.run_until_complete(self.async_generate(req))
 
-    async def trigger_simulation(
-        self, output_dir: str = "/tmp/sglang_simulator/output"
-    ):
-        self.output_dir = output_dir
+    async def trigger_simulation(self, output_dir: str | None = None):
+        if output_dir is None:
+            self.output_dir = f"/tmp/sglang_simulator/{self.name}"
         await self._engine.tokenizer_manager.start_profile(output_dir=output_dir)
 
     def get_iteration_stats(self) -> list[dict]:
@@ -127,6 +130,20 @@ class SGLangWorker(BaseWorker):
         else:
             logger.error(f"The request statistics data({file_path}) does not exist.")
         return data
+
+    async def pause_generation(self):
+        from sglang.srt.managers.io_struct import PauseGenerationReqInput
+
+        await self._engine.tokenizer_manager.pause_generation(
+            PauseGenerationReqInput(mode="in_place")
+        )
+
+    async def continue_generation(self):
+        from sglang.srt.managers.io_struct import ContinueGenerationReqInput
+
+        await self._engine.tokenizer_manager.continue_generation(
+            ContinueGenerationReqInput()
+        )
 
     def shutdown(self):
         logger.info("Attempting to shut down the SGLang backend engine.")
