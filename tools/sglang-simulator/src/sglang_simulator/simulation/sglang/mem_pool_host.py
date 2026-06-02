@@ -281,7 +281,7 @@ class C_DeepSeekV4PagedHostPoolHook(BaseHook):
             bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="D2H")
             total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
             # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
-            StateManager.inc_hicache_l2_load_dur(total_time_cost)
+            StateManager.inc_hicache_l2_backup_dur(total_time_cost)
             _record_d2h(
                 pool_class="DeepSeekV4PagedHostPool",
                 pool_name=getattr(self, "pool_name", "kv"),
@@ -407,7 +407,7 @@ class C_DeepSeekV4StateHostPoolHook(BaseHook):
             bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="D2H")
             total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
             # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
-            StateManager.inc_hicache_l2_load_dur(total_time_cost)
+            StateManager.inc_hicache_l2_backup_dur(total_time_cost)
             _record_d2h(
                 pool_class="DeepSeekV4StateHostPool",
                 pool_name=getattr(self, "pool_name", "state"),
