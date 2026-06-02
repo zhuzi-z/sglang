@@ -518,12 +518,10 @@ class C_SchedulerHook(BaseHook):
                             f.write(json.dumps(asdict(item)) + "\n")
 
                     # D2H (L1->L2 backup) IO log — one record per
-                    # backup_from_device_all_layer call. Only rank 0 writes to
-                    # disk to avoid races when tp_size > 1.
-                    if getattr(self, "tp_rank", 0) == 0:
-                        with open(f"{output_dir}/d2h.jsonl", "w") as f:
-                            for item in D2HLog.drain():
-                                f.write(json.dumps(item) + "\n")
+                    # backup_from_device_all_layer call.
+                    with open(f"{output_dir}/d2h.jsonl", "w") as f:
+                        for item in D2HLog.drain():
+                            f.write(json.dumps(item) + "\n")
 
                     logger.info(f"Simulation results saved to {output_dir}.")
 
