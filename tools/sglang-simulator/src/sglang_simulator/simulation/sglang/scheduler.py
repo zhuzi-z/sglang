@@ -9,6 +9,7 @@ from typing import Any
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
+from sglang_simulator.simulation.manager.d2h_log import D2HLog
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
@@ -516,6 +517,14 @@ class C_SchedulerHook(BaseHook):
                         for item in stats:
                             f.write(json.dumps(asdict(item)) + "\n")
 
+                    # D2H (L1->L2 backup) IO log — one record per
+                    # backup_from_device_all_layer call. Only rank 0 writes to
+                    # disk to avoid races when tp_size > 1.
+                    if getattr(self, "tp_rank", 0) == 0:
+                        with open(f"{output_dir}/d2h.jsonl", "w") as f:
+                            for item in D2HLog.drain():
+                                f.write(json.dumps(item) + "\n")
+
                     logger.info(f"Simulation results saved to {output_dir}.")
 
                 except Exception as e:
@@ -527,6 +536,7 @@ class C_SchedulerHook(BaseHook):
             StateManager.set_last_flush_time_ts(time.time())
             request_stats_manager.reset()
             C_SchedulerHook.ITERATION_STATS.clear()
+            D2HLog.reset()
             C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST = 0
 
             ProfileReqOutput = getattr(

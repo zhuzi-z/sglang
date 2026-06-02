@@ -4,9 +4,45 @@ import numpy as np
 import torch
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager, StateManager
+from sglang_simulator.simulation.manager.d2h_log import D2HLog
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
+
+
+def _record_d2h(
+    *,
+    pool_class: str,
+    pool_name: str,
+    seg_len: np.ndarray,
+    size_bytes_arr: np.ndarray,
+    total_time_cost: float,
+    io_backend,
+    page_size: int = 256,
+) -> None:
+    """Append one D2HLog record per backup_from_device_all_layer call.
+
+    op_ids / op_node_ids come from StateManager.get_current_backup_ctx(),
+    which C_HiCacheController.wrapped_start_writing sets right before the
+    real start_writing dispatches the merged op to backup_from_device.
+    """
+    n_pages = int(seg_len.sum())
+    ctx = StateManager.get_current_backup_ctx() or {}
+    D2HLog.append({
+        "ts": StateManager.get_global_clock(),
+        "iteration": StateManager.get_iteration(),
+        "pool_class": pool_class,
+        "pool_name": pool_name,
+        "io_backend": str(io_backend),
+        "n_pages": n_pages,
+        "n_tokens": n_pages * int(page_size),  # nominal; state pools may interpret differently
+        "bytes": float(size_bytes_arr.sum()),
+        "transfer_time_s": float(total_time_cost),
+        "n_segments": int(len(seg_len)),
+        "seg_lens": seg_len.astype(int).tolist(),
+        "op_ids": ctx.get("op_ids", []),
+        "op_node_ids": ctx.get("node_ids", []),
+    })
 
 
 class C_MHATokenToKVPoolHostHook(BaseHook):
@@ -95,6 +131,14 @@ class C_MHATokenToKVPoolHostHook(BaseHook):
             # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
 
             StateManager.inc_hicache_l2_backup_dur(total_time_cost)
+            _record_d2h(
+                pool_class="MHATokenToKVPoolHost",
+                pool_name=getattr(self, "pool_name", "kv"),
+                seg_len=seg_len,
+                size_bytes_arr=size_bytes_arr,
+                total_time_cost=total_time_cost,
+                io_backend=io_backend,
+            )
 
         def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
             """
@@ -238,7 +282,15 @@ class C_DeepSeekV4PagedHostPoolHook(BaseHook):
             total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
             # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
             StateManager.inc_hicache_l2_load_dur(total_time_cost)
-            
+            _record_d2h(
+                pool_class="DeepSeekV4PagedHostPool",
+                pool_name=getattr(self, "pool_name", "kv"),
+                seg_len=seg_len,
+                size_bytes_arr=size_bytes_arr,
+                total_time_cost=total_time_cost,
+                io_backend=io_backend,
+            )
+
 
         def load_to_device_per_layer(
             self, device_pool, host_indices, device_indices, layer_id, io_backend
@@ -356,7 +408,15 @@ class C_DeepSeekV4StateHostPoolHook(BaseHook):
             total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
             # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
             StateManager.inc_hicache_l2_load_dur(total_time_cost)
-            
+            _record_d2h(
+                pool_class="DeepSeekV4StateHostPool",
+                pool_name=getattr(self, "pool_name", "state"),
+                seg_len=seg_len,
+                size_bytes_arr=size_bytes_arr,
+                total_time_cost=total_time_cost,
+                io_backend=io_backend,
+            )
+
 
         def load_to_device_per_layer(
             self, device_pool, host_indices, device_indices, layer_id, io_backend

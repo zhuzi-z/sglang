@@ -227,6 +227,28 @@ class C_HiCacheController(BaseHook):
             req_stats.recv_storage_hit_len = result[1]
             return result
 
+        # D2H statistics plumbing: snapshot pending CacheOperations' ids and
+        # node_ids before sglang merges + dispatches to backup_from_device_all_layer.
+        # mem_pool_host's _record_d2h reads this context off StateManager and
+        # attaches it to each d2h.jsonl record.
+        original_start_writing = target.start_writing
+
+        def wrapped_start_writing(self):
+            ctx = None
+            wq = getattr(self, "write_queue", None)
+            if wq:
+                op_ids = []
+                node_ids = []
+                for op in wq:
+                    op_ids.append(getattr(op, "id", -1))
+                    node_ids.extend(getattr(op, "node_ids", []) or [])
+                ctx = {"op_ids": op_ids, "node_ids": node_ids}
+            StateManager.set_current_backup_ctx(ctx)
+            try:
+                return original_start_writing(self)
+            finally:
+                StateManager.clear_current_backup_ctx()
+
         target.__init__ = wrapped_init
         target.prefetch_thread_func = override_prefetch_thread_func
         target.backup_thread_func = override_backup_thread_func
@@ -235,3 +257,4 @@ class C_HiCacheController(BaseHook):
         target._generic_page_set = override_generic_page_set
         target.terminate_prefetch = wrapped_terminate_prefetch
         target.storage_hit_query = wrapped_storage_hit_query
+        target.start_writing = wrapped_start_writing
