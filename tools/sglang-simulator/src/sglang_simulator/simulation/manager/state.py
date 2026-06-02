@@ -7,6 +7,10 @@ class StateManager:
     _hicache_l2_backup_dur: float = 0
     _last_real_time_ts: float = 0
     _last_flush_time_ts: float = 0
+    # Per-D2H-call context set by C_HiCacheController.start_writing wrapper
+    # so mem_pool_host's backup_from_device_all_layer can attach op-level
+    # metadata (op_ids, node_ids) to its d2h.jsonl record.
+    _current_backup_ctx: dict | None = None
 
     @classmethod
     def reset(cls):
@@ -17,6 +21,7 @@ class StateManager:
         cls._hicache_l2_backup_dur = 0
         cls._hicache_l2_load_dur = 0
         cls._last_real_time_ts = 0
+        cls._current_backup_ctx = None
 
     @classmethod
     def inc_iteration(cls) -> None:
@@ -86,3 +91,15 @@ class StateManager:
     @classmethod
     def get_last_flush_time_ts(cls) -> float:
         return cls._last_flush_time_ts
+
+    @classmethod
+    def set_current_backup_ctx(cls, ctx: dict | None) -> None:
+        cls._current_backup_ctx = ctx
+
+    @classmethod
+    def get_current_backup_ctx(cls) -> dict | None:
+        return cls._current_backup_ctx
+
+    @classmethod
+    def clear_current_backup_ctx(cls) -> None:
+        cls._current_backup_ctx = None
