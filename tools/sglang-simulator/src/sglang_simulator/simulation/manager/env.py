@@ -13,7 +13,7 @@ class Envs:
             SGLANG_SIMULATOR_CONFIG_PATH
         ):
             raise RuntimeError(
-                f"The mock configuration path is not set or does not exist({SGLANG_SIMULATOR_CONFIG_PATH}). Please set it using the system variable SGLANG_SIMULATOR_CONFIG_PATH"
+                f"The configuration path is not set or does not exist({SGLANG_SIMULATOR_CONFIG_PATH}). Please set it using the system variable SGLANG_SIMULATOR_CONFIG_PATH"
             )
         return SGLANG_SIMULATOR_CONFIG_PATH
 
