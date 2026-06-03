@@ -19,6 +19,14 @@ class SchedulerConfig:
     dp_size: int = 1
     pp_size: int = 1
 
+    # Hybrid-SSM memory split: mamba_state / full_kv_cache. Default matches
+    # sglang server_args.mamba_full_memory_ratio = 0.9 → mamba gets ~47% of
+    # post-weights HBM, KV gets ~53%. Only used by hybrid-SSM models.
+    mamba_full_memory_ratio: float = 0.9
+    # Resolved by estimate_kv_cache_pool_capacity for hybrid-SSM models.
+    # None means "not computed yet" / "not applicable".
+    max_mamba_cache_size: Optional[int] = None
+
     # framework backend
     backend_name: str = "sglang"
     backend_version: Optional[str] = None

@@ -10,6 +10,7 @@ from sglang_simulator.simulation.utils import (
 from sglang_simulator.spec import AcceleratorInfo, DataType, ModelInfo
 from sglang_simulator.time_predictor import (
     AIConfiguratorTimePredictor,
+    FixedTimePredictor,
     InferTimePredictor,
 )
 from sglang_simulator.utils import get_logger
@@ -183,6 +184,27 @@ class ConfigManager:
                 prefill_min_latency=prefill_min_latency,
                 workload_distribution=workload_distribution,
                 enable_oom_check=enable_oom_check,
+            )
+        elif predictor_config.get("name") == "fixed":
+            # Constant-time predictor — useful for end-to-end simulator validation
+            # when the aiconfigurator perf database is unavailable / not yet
+            # calibrated for the model architecture (e.g. Qwen3.5 mamba ops).
+            return FixedTimePredictor(
+                model,
+                hw=hw,
+                config=sched_config,
+                prefill_ms_per_token=predictor_config.get(
+                    "prefill_ms_per_token", 0.05
+                ),
+                prefill_overhead_ms=predictor_config.get(
+                    "prefill_overhead_ms", 5.0
+                ),
+                decode_ms_per_request=predictor_config.get(
+                    "decode_ms_per_request", 8.0
+                ),
+                decode_overhead_ms=predictor_config.get(
+                    "decode_overhead_ms", 0.0
+                ),
             )
         else:
             raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")

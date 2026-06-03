@@ -6,12 +6,14 @@ from sglang_simulator.time_predictor.aiconfigurator import get_perf_model
 
 
 def calc_kv_cache_cell_elems(model_info: ModelInfo, tp_size: int, pp_size: int) -> int:
-    num_layers = model_info.num_hidden_layers // pp_size
+    """Per-token KV cache element count across ALL full-KV layers (this PP rank).
+    Hybrid-SSM models count only `full_attention` layers (mamba layers carry a
+    fixed per-request state, not per-token)."""
+    num_kv_layers = model_info.num_kv_layers(pp_size)
     if model_info.is_mla():
-        return (model_info.kv_lora_rank + model_info.qk_rope_head_dim) * num_layers
-    else:
-        num_kv_heads = max(model_info.num_key_value_heads // tp_size, 1)
-        return num_kv_heads * model_info.head_dim * num_layers * 2
+        return (model_info.kv_lora_rank + model_info.qk_rope_head_dim) * num_kv_layers
+    num_kv_heads = max(model_info.num_key_value_heads // tp_size, 1)
+    return num_kv_heads * model_info.head_dim * num_kv_layers * 2
 
 
 def calc_kv_cache_per_layer_elems(
@@ -19,14 +21,25 @@ def calc_kv_cache_per_layer_elems(
 ) -> int:
     if model_info.is_mla():
         return model_info.kv_lora_rank + model_info.qk_rope_head_dim
-    else:
-        num_kv_heads = max(model_info.num_key_value_heads // tp_size, 1)
-        return num_kv_heads * model_info.head_dim * 2
+    num_kv_heads = max(model_info.num_key_value_heads // tp_size, 1)
+    return num_kv_heads * model_info.head_dim * 2
 
 
 def estimate_kv_cache_pool_capacity(
     model: ModelInfo, device: AcceleratorInfo, scheduler_config: SchedulerConfig
 ) -> int:
+    """Available token slots in the GPU KV cache pool.
+
+    Memory split for the 3 model families:
+      * Dense MHA / MLA: full post-weights HBM goes to KV.
+      * Hybrid SSM (Qwen3.5 / Qwen3-Next): post-weights HBM is split between
+        mamba state and full KV per `mamba_full_memory_ratio`
+        (mamba = R/(1+R), KV = 1/(1+R)). The chosen mamba pool size is also
+        written back to `scheduler_config.max_mamba_cache_size` so
+        HybridReqToTokenPool can pick it up downstream.
+      * DSv4 / hybrid-SWA: not handled here — that path bypasses this function
+        and uses `_resolve_memory_pool_config` directly from sglang.
+    """
     perf_model = get_perf_model(scheduler_config, model)
     weights = 0
     for op in perf_model.context_ops:
@@ -38,6 +51,20 @@ def estimate_kv_cache_pool_capacity(
         scheduler_config.mem_fraction_static * device.hbm_capacity_gb
         - framework_reserved_mem_gb
     ) * (1 << 30) - weights
+
+    # Reserve mamba state pool for hybrid-SSM models BEFORE computing KV slots.
+    if (
+        getattr(model, "is_hybrid_ssm", False)
+        and getattr(model, "mamba_bytes_per_req", 0)
+    ):
+        ratio = float(getattr(scheduler_config, "mamba_full_memory_ratio", 0.9))
+        mamba_state_mem = rest_memory * ratio / (1.0 + ratio)
+        rest_memory -= mamba_state_mem
+        # Expose the chosen mamba pool size so HybridReqToTokenPool can use it.
+        scheduler_config.max_mamba_cache_size = max(
+            int(mamba_state_mem // model.mamba_bytes_per_req), 1
+        )
+
     kv_cache_space_per_token = (
         calc_kv_cache_cell_elems(
             model, scheduler_config.tp_size, scheduler_config.pp_size
@@ -75,9 +102,10 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         total_dur_s = max(total_dur_s, req.last_event_time)
         total_input += req.input_length
         total_output += req.output_length
-        total_reused_tokens += req.final_device_hit_len
-        total_device_hit_tokens += req.final_device_hit_len - req.final_host_hit_len
-        total_host_hit_tokens += req.final_host_hit_len - req.final_storage_hit_len
+        total_reused_tokens += req.final_device_hit_len + req.final_storage_hit_len
+        total_device_hit_tokens += max(0, req.final_device_hit_len - max(req.final_host_hit_len, req.final_storage_hit_len))
+        total_host_hit_tokens += max(0, req.final_host_hit_len - req.final_storage_hit_len)
+
         total_storage_hit_tokens += req.final_storage_hit_len
     return {
         "num_requests": len(requests),

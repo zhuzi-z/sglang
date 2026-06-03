@@ -32,6 +32,10 @@ class C_ModelRunnerHook(BaseHook):
                 model = resolve_model_info(self.model_config)
                 ConfigManager.set_model_info(model)
 
+            # Cached on `self` so the hybrid-SSM branch below can read the
+            # chosen `max_mamba_cache_size` that estimate_kv_cache_pool_capacity
+            # writes back into the SchedulerConfig.
+            self._sim_scheduler_config = None
             if self.server_args.max_total_tokens is not None:
                 self.max_total_num_tokens = self.server_args.max_total_tokens
             else:
@@ -45,11 +49,17 @@ class C_ModelRunnerHook(BaseHook):
                 self.max_total_num_tokens = estimate_kv_cache_pool_capacity(
                     model, hw, config
                 )
+                self._sim_scheduler_config = config
 
             if hasattr(self, "page_size") and self.page_size > 1:
                 self.max_total_num_tokens = (
                     self.max_total_num_tokens // self.page_size * self.page_size
                 )
+
+            # Hybrid-SSM models (Qwen3.5 / Qwen3-Next / GraniteMoeHybrid / Kimi-Linear / ...)
+            # need HybridLinearKVPool + HybridReqToTokenPool — HiMambaRadixCache / MambaRadixCache
+            # assert on this at runtime. Detect via the model_runner property.
+            mambaish_config = getattr(self, "mambaish_config", None)
 
             if self.is_hybrid_swa:
                 self.sliding_window_size = self.model_config.sliding_window_size
@@ -58,9 +68,9 @@ class C_ModelRunnerHook(BaseHook):
                 # else:
                 #     self.set_num_tokens_hybrid_swa()
 
-                # The method names for setting parameters such as num_token vary significantly 
-                # across different versions. Here, we directly assign values to these parameters. 
-                # In the future, we may attempt to decouple or adapt to different versions 
+                # The method names for setting parameters such as num_token vary significantly
+                # across different versions. Here, we directly assign values to these parameters.
+                # In the future, we may attempt to decouple or adapt to different versions
                 # to ensure consistent behavior.
                 self.memory_pool_config = self._resolve_memory_pool_config(
                     10
@@ -104,15 +114,63 @@ class C_ModelRunnerHook(BaseHook):
             self.end_layer = getattr(self.model, "end_layer", model_num_layers)
             self.num_effective_layers = self.end_layer - self.start_layer
 
-            from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+            # ---------------- req_to_token_pool ----------------
+            if mambaish_config is not None:
+                # Hybrid-SSM path: HiMambaRadixCache / MambaRadixCache require this.
+                from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
-            self.req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=self.model_config.context_len,
-                device=self.device,
-                enable_memory_saver=False,
-            )
+                mamba_layer_ids = [
+                    i for i in mambaish_config.mamba2_cache_params.layers
+                    if self.start_layer <= i < self.end_layer
+                ]
+                if hasattr(self.server_args, "enable_mamba_extra_buffer"):
+                    enable_mamba_extra_buffer = self.server_args.enable_mamba_extra_buffer()
+                else:
+                    enable_mamba_extra_buffer = False
+                # Pick mamba_size in priority order:
+                #   1) explicit user override on server_args
+                #   2) value chosen by estimate_kv_cache_pool_capacity (proper
+                #      memory budgeting via mamba_full_memory_ratio)
+                #   3) max_num_reqs fallback (when max_total_tokens was forced)
+                resolved_mamba_size = (
+                    self.server_args.max_mamba_cache_size
+                    or (
+                        self._sim_scheduler_config.max_mamba_cache_size
+                        if (self._sim_scheduler_config is not None
+                            and self._sim_scheduler_config.max_mamba_cache_size)
+                        else None
+                    )
+                    or max_num_reqs
+                )
+                logger.info(
+                    f"HybridReqToTokenPool: mamba_size={resolved_mamba_size} "
+                    f"(source={'server_args' if self.server_args.max_mamba_cache_size else ('estimator' if self._sim_scheduler_config and self._sim_scheduler_config.max_mamba_cache_size else 'fallback')})"
+                )
+                self.req_to_token_pool = HybridReqToTokenPool(
+                    size=max_num_reqs,
+                    mamba_size=resolved_mamba_size,
+                    mamba_spec_state_size=max_num_reqs,
+                    max_context_len=self.model_config.context_len,
+                    device=self.device,
+                    enable_memory_saver=False,
+                    cache_params=mambaish_config.mamba2_cache_params,
+                    mamba_layer_ids=mamba_layer_ids,
+                    enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+                    speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+                    start_layer=self.start_layer,
+                )
+            else:
+                from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
+                self.req_to_token_pool = ReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len,
+                    device=self.device,
+                    enable_memory_saver=False,
+                )
+
+            # ---------------- token_to_kv_pool ----------------
             # During simulation, the actual data in kv cache pool is not important since the MHA computation is skipped,
             # so the head_num and head_dim can be set to 1 to reduce the memory usage.
             # And the scheduler only matters about whether the token_to_kv_pool can be allocated enough space for the requests,
@@ -158,6 +216,32 @@ class C_ModelRunnerHook(BaseHook):
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                     enable_hisparse=self.enable_hisparse,
+                )
+            elif mambaish_config is not None:
+                # Hybrid-SSM (Qwen3.5 / Qwen3-Next / ...): wraps an MHA pool over the
+                # full-attention layers plus the MambaPool already created on
+                # self.req_to_token_pool.mamba_pool. Keep head_num=head_dim=1 so the
+                # full-attention pool stays tiny — the scheduler only cares about
+                # whether allocation succeeds.
+                from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+                full_attention_layer_ids = [
+                    i for i in mambaish_config.full_attention_layer_ids
+                    if self.start_layer <= i < self.end_layer
+                ]
+                self.token_to_kv_pool = HybridLinearKVPool(
+                    size=self.max_total_num_tokens,
+                    dtype=self.kv_cache_dtype,
+                    page_size=self.page_size,
+                    head_num=1,  # Overwrite head_num and head_dim to 1.
+                    head_dim=1,
+                    full_attention_layer_ids=full_attention_layer_ids,
+                    enable_kvcache_transpose=False,
+                    device=self.device,
+                    mamba_pool=self.req_to_token_pool.mamba_pool,
+                    enable_memory_saver=False,
+                    use_mla=False,
+                    start_layer=self.start_layer,
                 )
             else:
                 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -264,7 +348,11 @@ class C_ModelRunnerHook(BaseHook):
         def wrapped_compute_logprobs_only(*args, **kwargs):
             return None
 
+        def wrapped_init_attention_backend(self):
+            self.attn_backend = None
+
         target.initialize = override_initialize
+        target.init_attention_backend = wrapped_init_attention_backend
         target.forward = wrapped_forward
         target.sample = wrapped_sample
         target.compute_logprobs_only = wrapped_compute_logprobs_only

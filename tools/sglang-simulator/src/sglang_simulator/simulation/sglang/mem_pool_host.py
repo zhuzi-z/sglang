@@ -395,3 +395,119 @@ class C_DeepSeekV4StateHostPoolHook(BaseHook):
         target.backup_from_device_all_layer = backup_from_device_all_layer
         target.load_to_device_per_layer = load_to_device_per_layer
         target.get_size_per_token = get_size_per_token
+
+class C_MambaPoolHostHook(BaseHook):
+    """Hook for MambaPoolHost (host-side SSM state pool used by hybrid-SSM models
+    such as Qwen3.5 / Qwen3-Next / GraniteMoE when --enable-hierarchical-cache is on).
+
+    Mirrors C_MHATokenToKVPoolHostHook in spirit:
+      * disable pin_memory (CPU sim)
+      * replace data-moving methods with byte-accounting stubs that bill
+        StateManager.inc_hicache_l2_load/backup_dur via the memory bandwidth
+        config from PlatformConfig
+
+    Bytes per (request slot, layer) for mamba state:
+        per_layer = temporal_state_elem_size * temporal_dtype.itemsize
+                  + sum(conv_state_elem_sizes) * conv_dtype.itemsize
+    load_to_device_per_layer transfers ONE layer's worth.
+    backup_from_device_all_layer transfers ALL num_mamba_layers' worth.
+    """
+
+    HOOK_CLASS_NAME = "MambaPoolHost"
+    HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
+
+    MEMORY_READ_BANDWIDTH_BYTES: Optional[float] = None
+    MEMORY_WRITE_BANDWIDTH_BYTES: Optional[float] = None
+
+    @classmethod
+    def hook(cls, target):
+
+        original_init = target.__init__
+
+        def wrapped_init(self, *args, **kwargs):
+            # MambaPoolHost positional order:
+            # (device_pool, host_to_device_ratio, host_size, pin_memory, device, allocator_type, layout)
+            if "pin_memory" in kwargs:
+                kwargs["pin_memory"] = False
+            elif len(args) >= 4:
+                args = list(args)
+                args[3] = False
+            else:
+                kwargs["pin_memory"] = False
+            return original_init(self, *args, **kwargs)
+
+        def _segment_lens(host_indices, device_indices):
+            num_indices = len(host_indices)
+            host = np.asarray(host_indices.cpu(), dtype=np.int64)
+            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
+            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
+            cut = np.flatnonzero(~cont) + 1
+            starts = np.r_[0, cut]
+            ends = np.r_[cut, num_indices]
+            return (ends - starts).astype(np.float64)
+
+        def est_bandwidth_batch(size_bytes_arr: np.ndarray, cat: str):
+            if cls.MEMORY_READ_BANDWIDTH_BYTES is None:
+                cls.MEMORY_READ_BANDWIDTH_BYTES = (
+                    ConfigManager.get_platform_config().memory_read_bandwidth
+                )
+            if cls.MEMORY_WRITE_BANDWIDTH_BYTES is None:
+                cls.MEMORY_WRITE_BANDWIDTH_BYTES = (
+                    ConfigManager.get_platform_config().memory_write_bandwidth
+                )
+            x = size_bytes_arr.astype(np.float64)
+            eff = 0.85
+            if cat == "H2D":
+                t0 = 6.67e-6
+                bw = cls.MEMORY_READ_BANDWIDTH_BYTES * eff
+            else:
+                t0 = 4e-6
+                bw = cls.MEMORY_WRITE_BANDWIDTH_BYTES * eff
+            return x * bw / (t0 * bw + x)
+
+        def _bytes_per_slot_per_layer(self) -> int:
+            t = int(self.temporal_state_elem_size) * int(self.temporal_dtype.itemsize)
+            c = int(sum(self.conv_state_elem_sizes)) * int(self.conv_dtype.itemsize)
+            return t + c
+
+        def load_to_device_per_layer(
+            self, device_pool, host_indices, device_indices, layer_id, io_backend
+        ) -> None:
+            assert len(host_indices) == len(device_indices)
+            if len(host_indices) == 0:
+                return
+            seg_len = _segment_lens(host_indices, device_indices)
+            per_slot = float(_bytes_per_slot_per_layer(self))
+            size_bytes_arr = seg_len * per_slot
+            bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="H2D")
+            total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
+            StateManager.inc_hicache_l2_load_dur(total_time_cost)
+
+        def backup_from_device_all_layer(
+            self, device_pool, host_indices, device_indices, io_backend
+        ) -> None:
+            assert len(host_indices) == len(device_indices)
+            if len(host_indices) == 0:
+                return
+            seg_len = _segment_lens(host_indices, device_indices)
+            # backup_from_device_all_layer iterates ALL mamba layers in the real impl,
+            # so the byte volume is num_mamba_layers * per-layer.
+            per_slot = (
+                float(_bytes_per_slot_per_layer(self)) * int(self.num_mamba_layers)
+            )
+            size_bytes_arr = seg_len * per_slot
+            bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="D2H")
+            total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
+            StateManager.inc_hicache_l2_backup_dur(total_time_cost)
+
+        def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+            return torch.ones(size=(1, 1)) * index
+
+        def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+            pass
+
+        target.__init__ = wrapped_init
+        target.load_to_device_per_layer = load_to_device_per_layer
+        target.backup_from_device_all_layer = backup_from_device_all_layer
+        target.get_data_page = get_data_page
+        target.set_from_flat_data_page = set_from_flat_data_page

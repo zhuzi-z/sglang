@@ -6,10 +6,14 @@ from sglang_simulator.time_predictor.base import (
     ScheduleBatch,
     ScheduleRequest,
 )
+from sglang_simulator.time_predictor.fixed import (
+    FixedTimePredictor,
+)
 
 __all__ = (
     ScheduleRequest,
     ScheduleBatch,
     InferTimePredictor,
     AIConfiguratorTimePredictor,
+    FixedTimePredictor,
 )
