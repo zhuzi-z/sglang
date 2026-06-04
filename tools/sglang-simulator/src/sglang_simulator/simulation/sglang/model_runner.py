@@ -49,7 +49,7 @@ class C_ModelRunnerHook(BaseHook):
 
         
         def wrapped_init_pools(self, *args, **kwargs):
-            model_config_keywords = [
+            kv_cache_attrs = [
                 "qk_nope_head_dim",
                 "qk_rope_head_dim",
                 "index_head_dim",
@@ -59,11 +59,24 @@ class C_ModelRunnerHook(BaseHook):
             ]
             
             # set all model_config keywords about kv cache pool allocation to 1 to reduce memory usage
-            for kw in model_config_keywords:
-                if hasattr(self.model_config, kw):
-                    setattr(self.model_config, kw, 1)
+            modified_model_attrs = {}
+            for attr in kv_cache_attrs:
+                if hasattr(self.model_config, attr):
+                    modified_model_attrs[attr] = getattr(self.model_config, attr)
+                    setattr(self.model_config, attr, 1)
 
-            return original_init_pools(self, *args, **kwargs)
+            ret = original_init_pools(self, *args, **kwargs)
+
+            for attr, v in modified_model_attrs.items():
+                setattr(self.model_config, attr, v)
+
+                # restore the modified model_config keywords, which will be used in the `HostKVCache.get_size_per_token()`
+                if hasattr(self.token_to_kv_pool, attr):
+                    setattr(self.token_to_kv_pool, attr, v)
+                else:
+                    logger.warning(f"{self.token_to_kv_pool} does not have attribute {attr}, which has been modified while init_pools")
+
+            return ret
 
 
         def wrapped_forward(self, *args, **kwargs):

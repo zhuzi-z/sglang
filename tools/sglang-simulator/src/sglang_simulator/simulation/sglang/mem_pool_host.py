@@ -1,6 +1,5 @@
-from typing import Optional
-
-import numpy as np
+from enum import Enum
+import inspect
 import torch
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager, StateManager
@@ -9,64 +8,120 @@ from sglang_simulator.utils import get_logger
 logger = get_logger()
 
 
-class C_MHATokenToKVPoolHostHook(BaseHook):
-    HOOK_CLASS_NAME = "MHATokenToKVPoolHost"
-    HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
+class TansportCat(Enum):
+    H2D = "H2D"
+    D2H = "D2H"
 
-    KV_CACHE_BYTES: Optional[int] = None
-    KV_CACHE_BYTES_PER_LAYER: Optional[int] = None
-    MEMORY_READ_BANDWIDTH_BYTES: Optional[float] = None
-    MEMORY_WRITE_BANDWIDTH_BYTES: Optional[float] = None
+
+class HicacheTransportEstimator:
+    def __init__(
+        self, memory_read_bandwidth_bytes: float, memory_write_bandwidth_bytes: float
+    ):
+        self.memory_read_bandwidth_bytes = memory_read_bandwidth_bytes
+        self.memory_write_bandwidth_bytes = memory_write_bandwidth_bytes
+
+    def est_bandwidth_batch(
+        self, size_bytes_arr: torch.Tensor, cat: TansportCat
+    ) -> torch.Tensor:
+        pass
+
+
+class HicacheTransportOverheadEstimator(HicacheTransportEstimator):
+    """
+    Estimate hicache transport bandwidth with overhead model, which has a static overhead time.
+    """
+    def __init__(self, memory_read_bandwidth_bytes, memory_write_bandwidth_bytes):
+        super().__init__(memory_read_bandwidth_bytes, memory_write_bandwidth_bytes)
+
+    def est_bandwidth_batch(
+        self, size_bytes_arr: torch.tensor, cat: TansportCat
+    ) -> torch.tensor:
+        x = size_bytes_arr.to(torch.float64)
+        if cat == TansportCat.H2D:
+            eff = 0.85
+            t0 = 6.67e-6
+            bw = self.memory_read_bandwidth_bytes * eff
+        else:
+            eff = 0.85
+            t0 = 4e-6
+            bw = self.memory_write_bandwidth_bytes * eff
+        return x * bw / (t0 * bw + x)
+
+
+hicache_transorport_estimator = HicacheTransportOverheadEstimator(
+    memory_read_bandwidth_bytes=ConfigManager.get_platform_config().memory_read_bandwidth,
+    memory_write_bandwidth_bytes=ConfigManager.get_platform_config().memory_write_bandwidth,
+)
+
+
+def compute_contiguous_index_lengths(
+    host_indices: torch.Tensor,
+    device_indices: torch.Tensor,
+) -> torch.Tensor:
+    assert len(host_indices) == len(device_indices)
+
+    host_indices = host_indices.cpu()
+    device_indices = device_indices.cpu()
+
+    n = host_indices.numel()
+    if n == 0:
+        return torch.empty(0, dtype=torch.float64, device="cpu")
+
+    breaks = (
+        (host_indices[1:] != host_indices[:-1] + 1)
+        | (device_indices[1:] != device_indices[:-1] + 1)
+    ).nonzero(as_tuple=False).flatten() + 1
+
+    boundaries = torch.cat(
+        [
+            torch.tensor([0], dtype=torch.int64),
+            breaks.to(torch.int64),
+            torch.tensor([n], dtype=torch.int64),
+        ]
+    )
+
+    return boundaries[1:] - boundaries[:-1]
+
+
+class C_HostKVCacheHook(BaseHook):
+    HOOK_CLASS_NAME = r"MHATokenToKVPoolHost|MLATokenToKVPoolHost|DeepSeekV4PagedHostPool|DeepSeekV4StateHostPool"
+    HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
+    REGEX = True
 
     @classmethod
     def hook(cls, target):
+        original_init = target.__init__
+        original_get_size_per_token = target.get_size_per_token
 
-        def est_bandwidth_batch(size_bytes_arr: np.ndarray, cat: str):
-            if cls.MEMORY_READ_BANDWIDTH_BYTES is None:
-                cls.MEMORY_READ_BANDWIDTH_BYTES = (
-                    ConfigManager.get_platform_config().memory_read_bandwidth
-                )
-            if cls.MEMORY_WRITE_BANDWIDTH_BYTES is None:
-                cls.MEMORY_WRITE_BANDWIDTH_BYTES = (
-                    ConfigManager.get_platform_config().memory_write_bandwidth
-                )
-            x = size_bytes_arr.astype(np.float64)
-            if cat == "H2D":
-                eff = 0.85
-                t0 = 6.67e-6
-                bw = cls.MEMORY_READ_BANDWIDTH_BYTES * eff
-            else:
-                eff = 0.85
-                t0 = 4e-6
-                bw = cls.MEMORY_WRITE_BANDWIDTH_BYTES * eff
-            return x * bw / (t0 * bw + x)
+        def wrapped_init(self, *args, **kwargs):
+            # Disable pin memory, which might fail on CPU platforms.
+            sig = inspect.signature(original_init)
+            bound = sig.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+
+            if "pin_memory" in bound.arguments:
+                bound.arguments["pin_memory"] = False
+            
+            return original_init(*bound.args, **bound.kwargs)
+        
 
         def load_to_device_per_layer(
             self, device_pool, host_indices, device_indices, layer_id, io_backend
         ) -> None:
-            # update global clock
+            if hasattr(self, "_to_page_indices"):
+                host_indices = self._to_page_indices(host_indices)
+                device_indices = self._to_page_indices(device_indices)
+
             # Merge cache indices
             # https://github.com/sgl-project/sglang/blob/v0.5.8/sgl-kernel/csrc/kvcacheio/transfer.cu#L713
-            assert len(host_indices) == len(device_indices)
-            num_indices = len(host_indices)
+            seg_len = compute_contiguous_index_lengths(host_indices, device_indices)
 
-            host = np.asarray(host_indices.cpu(), dtype=np.int64)
-            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
-            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
-            cut = np.flatnonzero(~cont) + 1
-            starts = np.r_[0, cut]
-            ends = np.r_[cut, num_indices]
-            seg_len = (ends - starts).astype(np.float64)
+            size_bytes_arr = seg_len * self.get_size_per_token()  # FIXME: per layer
+            bandwidth_arr = hicache_transorport_estimator.est_bandwidth_batch(
+                size_bytes_arr, cat=TansportCat.H2D
+            )
+            total_time_cost = float(torch.sum(size_bytes_arr / bandwidth_arr))
 
-            if cls.KV_CACHE_BYTES_PER_LAYER is None:
-                cls.KV_CACHE_BYTES_PER_LAYER = (
-                    ConfigManager.get_kv_cache_bytes_per_layer()
-                )
-
-            size_bytes_arr = seg_len * float(cls.KV_CACHE_BYTES_PER_LAYER)
-            bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="H2D")
-            total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
-            # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
             StateManager.inc_hicache_l2_load_dur(total_time_cost)
 
         def backup_from_device_all_layer(
@@ -75,24 +130,17 @@ class C_MHATokenToKVPoolHostHook(BaseHook):
             """
             Backup KV data from the device memory pool to the host memory pool for all layers.
             """
-            # update global clock
-            num_indices = len(host_indices)
+            if hasattr(self, "_to_page_indices"):
+                host_indices = self._to_page_indices(host_indices)
+                device_indices = self._to_page_indices(device_indices)
 
-            host = np.asarray(host_indices.cpu(), dtype=np.int64)
-            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
-            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
-            cut = np.flatnonzero(~cont) + 1
-            starts = np.r_[0, cut]
-            ends = np.r_[cut, num_indices]
-            seg_len = (ends - starts).astype(np.float64)
+            seg_len = compute_contiguous_index_lengths(host_indices, device_indices)
 
-            if cls.KV_CACHE_BYTES is None:
-                cls.KV_CACHE_BYTES = ConfigManager.get_kv_cache_bytes()
-
-            size_bytes_arr = seg_len * float(cls.KV_CACHE_BYTES)
-            bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="D2H")
-            total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
-            # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
+            size_bytes_arr = seg_len * self.get_size_per_token()
+            bandwidth_arr = hicache_transorport_estimator.est_bandwidth_batch(
+                size_bytes_arr, cat=TansportCat.D2H
+            )
+            total_time_cost = float(torch.sum(size_bytes_arr / bandwidth_arr))
 
             StateManager.inc_hicache_l2_backup_dur(total_time_cost)
 
@@ -108,290 +156,36 @@ class C_MHATokenToKVPoolHostHook(BaseHook):
             """
             pass
 
+        def get_size_per_token(self):
+            if self.__class__.__name__ == "DeepSeekV4PagedHostPool":
+                if self.pool_name in ["swa"]:
+                    return self.size_per_token * 130
+                elif self.pool_name in ["deepseek_v4_c4"]:
+                    return self.size_per_token * 65
+                elif self.pool_name in ["deepseek_v4_c4_indexer"]:
+                    return self.size_per_token * 132
+                elif self.pool_name in ["deepseek_v4_c128"]:
+                    return self.size_per_token * 3
+                else:
+                    # return self.size_per_token
+                    raise ValueError(f"[DeepSeekV4PagedHostPool] unsupport pool name: {self.pool_name}")
+            elif self.__class__.__name__ == "DeepSeekV4StateHostPool":
+                if self.pool_name in ["deepseek_v4_c4_state", "deepseek_v4_c128_state"]:
+                    return self.size_per_token * 256
+                elif self.pool_name in [
+                    "deepseek_v4_indexer_state",
+                    "deepseek_v4_c4_indexer_state",
+                ]:
+                    return self.size_per_token * 128
+                else:
+                    # return self.size_per_token
+                    raise ValueError(f"[DeepSeekV4StateHostPool] unsupport pool name: {self.pool_name}")
+            else:
+                return original_get_size_per_token(self)
+
+        target.__init__ = wrapped_init
         target.load_to_device_per_layer = load_to_device_per_layer
         target.backup_from_device_all_layer = backup_from_device_all_layer
         target.get_data_page = get_data_page
         target.set_from_flat_data_page = set_from_flat_data_page
-
-
-class C_HostKVCacheHook(BaseHook):
-    HOOK_CLASS_NAME = "HostKVCache"
-    HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
-
-    @classmethod
-    def hook(cls, target):
-        original_init = target.__init__
-
-        def wrapped_init(self, *args, **kwargs):
-            # Disable pip memory, which might fail on CPU platforms.
-            if "pin_memory" in kwargs:
-                kwargs["pin_memory"] = False
-            elif len(args) > 5:
-                args = list(args)
-                args[5] = False
-            else:
-                logger.warning(
-                    "Failed to disable pip memory while initializing the hoot memory pool."
-                )
-            return original_init(self, *args, **kwargs)
-
-        target.__init__ = wrapped_init
-
-
-class C_DeepSeekV4SingleKVPoolHook(BaseHook):
-    HOOK_CLASS_NAME = "DeepSeekV4SingleKVPool"
-    HOOK_MODULE_NAME = "sglang.srt.mem_cache.deepseek_v4_memory_pool"
-
-    @classmethod
-    def hook(cls, target):
-        def ceil_div(x: int, y: int) -> int:
-            return (x + y - 1) // y
-
-        def override_create_buffer(self, *, num_pages: int):
-            bytes_per_token = self.get_bytes_per_token()
-            self.kv_cache_total_dim = bytes_per_token
-            bytes_per_page_non_padded = self.page_size * bytes_per_token
-            self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
-
-            assert self.store_dtype == torch.uint8
-
-            return torch.zeros(
-                num_pages,
-                self.bytes_per_page_padded,
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-
-        target.create_buffer = override_create_buffer
-
-
-class C_DeepSeekV4PagedHostPoolHook(BaseHook):
-    HOOK_CLASS_NAME = "DeepSeekV4PagedHostPool"
-    HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
-
-    MEMORY_READ_BANDWIDTH_BYTES: Optional[float] = None
-    MEMORY_WRITE_BANDWIDTH_BYTES: Optional[float] = None
-
-    @classmethod
-    def hook(cls, target):
-        original_init = target.__init__
-
-        def wrapped_init(self, *args, **kwargs):
-            # Disable pip memory, which might fail on CPU platforms.
-            print(1)
-            if "pin_memory" in kwargs:
-                kwargs["pin_memory"] = False
-            elif len(args) > 6:
-                args = list(args)
-                args[6] = False
-            elif "pin_memory" not in kwargs:
-                kwargs["pin_memory"] = False
-            else:
-                logger.warning(
-                    "Failed to disable pip memory while initializing the DeepSeekV4PagedHostPool."
-                )
-            return original_init(self, *args, **kwargs)
-        
-        def est_bandwidth_batch(size_bytes_arr: np.ndarray, cat: str):
-            if cls.MEMORY_READ_BANDWIDTH_BYTES is None:
-                cls.MEMORY_READ_BANDWIDTH_BYTES = (
-                    ConfigManager.get_platform_config().memory_read_bandwidth
-                )
-            if cls.MEMORY_WRITE_BANDWIDTH_BYTES is None:
-                cls.MEMORY_WRITE_BANDWIDTH_BYTES = (
-                    ConfigManager.get_platform_config().memory_write_bandwidth
-                )
-            x = size_bytes_arr.astype(np.float64)
-            if cat == "H2D":
-                eff = 0.85
-                t0 = 6.67e-6
-                bw = cls.MEMORY_READ_BANDWIDTH_BYTES * eff
-            else:
-                eff = 0.85
-                t0 = 4e-6
-                bw = cls.MEMORY_WRITE_BANDWIDTH_BYTES * eff
-            return x * bw / (t0 * bw + x)
-        
-        def backup_from_device_all_layer(
-            self, device_pool, host_indices, device_indices, io_backend
-        ):
-            if host_indices is None or device_indices is None:
-                return
-            self._check_io_backend(io_backend)
-            host_indices = self._to_page_indices(host_indices)
-            device_indices = self._to_page_indices(device_indices)
-
-            num_indices = len(host_indices)
-
-            host = np.asarray(host_indices.cpu(), dtype=np.int64)
-            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
-            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
-            cut = np.flatnonzero(~cont) + 1
-            starts = np.r_[0, cut]
-            ends = np.r_[cut, num_indices]
-            seg_len = (ends - starts).astype(np.float64)
-
-            # print(f"[backup_from_device_all_layer DeepSeekV4PagedHostPool] {seg_len=}")
-
-            size_bytes_arr = seg_len * self.get_size_per_token()
-            bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="D2H")
-            total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
-            # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
-            StateManager.inc_hicache_l2_load_dur(total_time_cost)
-            
-
-        def load_to_device_per_layer(
-            self, device_pool, host_indices, device_indices, layer_id, io_backend
-        ) -> None:
-            assert len(host_indices) == len(device_indices)
-            num_indices = len(host_indices)
-
-            host_indices = self._to_page_indices(host_indices)
-            device_indices = self._to_page_indices(device_indices)
-
-            host = np.asarray(host_indices.cpu(), dtype=np.int64)
-            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
-            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
-            cut = np.flatnonzero(~cont) + 1
-            starts = np.r_[0, cut]
-            ends = np.r_[cut, num_indices]
-            seg_len = (ends - starts).astype(np.float64)
-
-            size_bytes_arr = seg_len * self.get_size_per_token()
-            bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="H2D")
-            total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
-            # print(f"[Paged load_to_device_per_layer] {self.pool_name=}, {seg_len=}, {self.get_size_per_token()=}, {total_time_cost=}")
-            # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
-            StateManager.inc_hicache_l2_load_dur(total_time_cost)
-
-        def get_size_per_token(self):
-            if self.pool_name in ['swa']:
-                return self.size_per_token * 130
-            elif self.pool_name in ['deepseek_v4_c4']:
-                return self.size_per_token * 65
-            elif self.pool_name in ['deepseek_v4_c4_indexer']:
-                return self.size_per_token * 132
-            elif self.pool_name in ['deepseek_v4_c128']:
-                return self.size_per_token * 3
-            else:
-                # return self.size_per_token
-                raise ValueError(f"[DeepSeekV4PagedHostPool] unsupport pool name: {self.pool_name}") 
-
-        target.__init__ = wrapped_init
-        target.backup_from_device_all_layer = backup_from_device_all_layer
-        target.load_to_device_per_layer = load_to_device_per_layer
-        target.get_size_per_token = get_size_per_token
-
-
-class C_DeepSeekV4StateHostPoolHook(BaseHook):
-    HOOK_CLASS_NAME = "DeepSeekV4StateHostPool"
-    HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
-
-    MEMORY_READ_BANDWIDTH_BYTES: Optional[float] = None
-    MEMORY_WRITE_BANDWIDTH_BYTES: Optional[float] = None
-
-    @classmethod
-    def hook(cls, target):
-        original_init = target.__init__
-
-        def wrapped_init(self, *args, **kwargs):
-            # Disable pip memory, which might fail on CPU platforms.
-            print(1)
-            if "pin_memory" in kwargs:
-                kwargs["pin_memory"] = False
-            elif len(args) > 5:
-                args = list(args)
-                args[5] = False
-            elif "pin_memory" not in kwargs:
-                kwargs["pin_memory"] = False
-            else:
-                logger.warning(
-                    "Failed to disable pip memory while initializing the DeepSeekV4StateHostPool."
-                )
-            return original_init(self, *args, **kwargs)
-    
-        def est_bandwidth_batch(size_bytes_arr: np.ndarray, cat: str):
-            if cls.MEMORY_READ_BANDWIDTH_BYTES is None:
-                cls.MEMORY_READ_BANDWIDTH_BYTES = (
-                    ConfigManager.get_platform_config().memory_read_bandwidth
-                )
-            if cls.MEMORY_WRITE_BANDWIDTH_BYTES is None:
-                cls.MEMORY_WRITE_BANDWIDTH_BYTES = (
-                    ConfigManager.get_platform_config().memory_write_bandwidth
-                )
-            x = size_bytes_arr.astype(np.float64)
-            if cat == "H2D":
-                eff = 0.85
-                t0 = 6.67e-6
-                bw = cls.MEMORY_READ_BANDWIDTH_BYTES * eff
-            else:
-                eff = 0.85
-                t0 = 4e-6
-                bw = cls.MEMORY_WRITE_BANDWIDTH_BYTES * eff
-            return x * bw / (t0 * bw + x)
-        
-        def backup_from_device_all_layer(
-            self, device_pool, host_indices, device_indices, io_backend
-        ):
-            if host_indices is None or device_indices is None:
-                return
-            self._check_io_backend(io_backend)
-            host_indices = self._to_page_indices(host_indices)
-            device_indices = self._to_page_indices(device_indices)
-
-            num_indices = len(host_indices)
-
-            host = np.asarray(host_indices.cpu(), dtype=np.int64)
-            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
-            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
-            cut = np.flatnonzero(~cont) + 1
-            starts = np.r_[0, cut]
-            ends = np.r_[cut, num_indices]
-            seg_len = (ends - starts).astype(np.float64)
-
-            # print(f"[backup_from_device_all_layer DeepSeekV4StateHostPool] {seg_len=}")
-
-            size_bytes_arr = seg_len * self.get_size_per_token()
-            bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="D2H")
-            total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
-            # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
-            StateManager.inc_hicache_l2_load_dur(total_time_cost)
-            
-
-        def load_to_device_per_layer(
-            self, device_pool, host_indices, device_indices, layer_id, io_backend
-        ) -> None:
-            assert len(host_indices) == len(device_indices)
-            host_indices = self._to_page_indices(host_indices)
-            device_indices = self._to_page_indices(device_indices)
-
-            num_indices = len(host_indices)
-
-            host = np.asarray(host_indices.cpu(), dtype=np.int64)
-            dev = np.asarray(device_indices.cpu(), dtype=np.int64)
-            cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
-            cut = np.flatnonzero(~cont) + 1
-            starts = np.r_[0, cut]
-            ends = np.r_[cut, num_indices]
-            seg_len = (ends - starts).astype(np.float64)
-
-            size_bytes_arr = seg_len * self.get_size_per_token()
-            bandwidth_arr = est_bandwidth_batch(size_bytes_arr, cat="H2D")
-            total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
-            # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead
-            # print(f"[State load_to_device_per_layer] {self.pool_name=}, {seg_len=}, {self.get_size_per_token()=}, {total_time_cost=}")
-            StateManager.inc_hicache_l2_load_dur(total_time_cost)
-
-        def get_size_per_token(self):
-            if self.pool_name in ['deepseek_v4_c4_state', 'deepseek_v4_c128_state']:
-                return self.size_per_token * 256
-            elif self.pool_name in ['deepseek_v4_indexer_state', 'deepseek_v4_c4_indexer_state']:
-                return self.size_per_token * 128
-            else:
-                # return self.size_per_token
-                raise ValueError(f"[DeepSeekV4StateHostPool] unsupport pool name: {self.pool_name}")
-        
-        target.__init__ = wrapped_init
-        target.backup_from_device_all_layer = backup_from_device_all_layer
-        target.load_to_device_per_layer = load_to_device_per_layer
         target.get_size_per_token = get_size_per_token

@@ -1,4 +1,6 @@
 import os
+import random
+import numpy as np
 
 from sglang_simulator.dataset import DatasetArgs, SimpleDataset, get_dataset
 from sglang_simulator.simulation.benchmark import BenchmarkConfig
@@ -12,6 +14,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ""
 from sglang_simulator.simulation.sglang.bench_runner import (
     SGLangBenchmarkRunner,
 )
+
+random.seed(0)
+np.random.seed(0)
 
 
 def test_benchmark_sglang():
@@ -31,6 +36,7 @@ def test_benchmark_sglang():
             page_size=2,
         )
     )
+    runner.clear_hicache_storage()
 
     # Benchmark settings
     benchmark_config = BenchmarkConfig(request_rate=10, ignore_request_timestamp=True)
@@ -77,6 +83,8 @@ def test_benchmark_sglang():
     _ = runner.benchmark(benchmark_config, dataset=evict_l2_ds)
     metrics = runner.benchmark(benchmark_config, dataset=cached_ds)
     assert metrics["kv_cache_storage_hit_ratio"] > 0.95
+
+    print(metrics["mean_ttft_ms"])  # -56.48228185033968
 
     runner.shutdown()
 
