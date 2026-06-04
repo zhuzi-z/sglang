@@ -1,5 +1,4 @@
 from enum import Enum
-import inspect
 import torch
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager, StateManager
@@ -83,6 +82,21 @@ def compute_contiguous_index_lengths(
     return boundaries[1:] - boundaries[:-1]
 
 
+def alloc_with_pin_memory(
+    dims,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: None,
+) -> torch.Tensor:
+    """
+    Allocate tensor using PyTorch's built-in pin_memory flag, 
+    and the device will be "meta" to reduce memory usage.
+    """
+    buffer = torch.empty(dims, dtype=dtype, device="meta", pin_memory=False)
+    return buffer
+
+
 class C_HostKVCacheHook(BaseHook):
     HOOK_CLASS_NAME = r"MHATokenToKVPoolHost|MLATokenToKVPoolHost|DeepSeekV4PagedHostPool|DeepSeekV4StateHostPool"
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
@@ -91,18 +105,14 @@ class C_HostKVCacheHook(BaseHook):
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
-        original_get_size_per_token = target.get_size_per_token
 
         def wrapped_init(self, *args, **kwargs):
-            # Disable pin memory, which might fail on CPU platforms.
-            sig = inspect.signature(original_init)
-            bound = sig.bind(self, *args, **kwargs)
-            bound.apply_defaults()
 
-            if "pin_memory" in bound.arguments:
-                bound.arguments["pin_memory"] = False
-            
-            return original_init(*bound.args, **bound.kwargs)
+            from collections import defaultdict
+            from sglang.srt.mem_cache import memory_pool_host
+            memory_pool_host.ALLOC_MEMORY_FUNCS = defaultdict(lambda: alloc_with_pin_memory, {})
+
+            return original_init(self, *args, **kwargs)
         
 
         def load_to_device_per_layer(
@@ -156,36 +166,8 @@ class C_HostKVCacheHook(BaseHook):
             """
             pass
 
-        def get_size_per_token(self):
-            if self.__class__.__name__ == "DeepSeekV4PagedHostPool":
-                if self.pool_name in ["swa"]:
-                    return self.size_per_token * 130
-                elif self.pool_name in ["deepseek_v4_c4"]:
-                    return self.size_per_token * 65
-                elif self.pool_name in ["deepseek_v4_c4_indexer"]:
-                    return self.size_per_token * 132
-                elif self.pool_name in ["deepseek_v4_c128"]:
-                    return self.size_per_token * 3
-                else:
-                    # return self.size_per_token
-                    raise ValueError(f"[DeepSeekV4PagedHostPool] unsupport pool name: {self.pool_name}")
-            elif self.__class__.__name__ == "DeepSeekV4StateHostPool":
-                if self.pool_name in ["deepseek_v4_c4_state", "deepseek_v4_c128_state"]:
-                    return self.size_per_token * 256
-                elif self.pool_name in [
-                    "deepseek_v4_indexer_state",
-                    "deepseek_v4_c4_indexer_state",
-                ]:
-                    return self.size_per_token * 128
-                else:
-                    # return self.size_per_token
-                    raise ValueError(f"[DeepSeekV4StateHostPool] unsupport pool name: {self.pool_name}")
-            else:
-                return original_get_size_per_token(self)
-
         target.__init__ = wrapped_init
         target.load_to_device_per_layer = load_to_device_per_layer
         target.backup_from_device_all_layer = backup_from_device_all_layer
         target.get_data_page = get_data_page
         target.set_from_flat_data_page = set_from_flat_data_page
-        target.get_size_per_token = get_size_per_token

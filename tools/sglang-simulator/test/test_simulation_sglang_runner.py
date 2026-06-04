@@ -84,8 +84,6 @@ def test_benchmark_sglang():
     metrics = runner.benchmark(benchmark_config, dataset=cached_ds)
     assert metrics["kv_cache_storage_hit_ratio"] > 0.95
 
-    print(metrics["mean_ttft_ms"])  # -56.48228185033968
-
     runner.shutdown()
 
 
