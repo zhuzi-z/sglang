@@ -308,11 +308,36 @@ class C_SchedulerHook(BaseHook):
                 simulation_batch = SimulationScheduleBatch(reqs=[])
                 if batch.forward_mode.is_extend():
                     for req in batch.reqs:
+                        # SIM FIX: sim's tree_cache doesn't insert L3-prefetched
+                        # tokens as host nodes that match_prefix can find. So
+                        # req.prefix_indices misses the L3-cached portion. Compute
+                        # how much of THIS chunk overlaps the L3-cached range
+                        # [0, final_storage_hit_len), then shift that portion from
+                        # extend -> past_kv only for this chunk's window.
+                        _ext = req.extend_input_len
+                        _past = len(req.prefix_indices) + len(req.output_ids)
+                        try:
+                            _rs = request_stats_manager.get_req_stats(req.rid)
+                            _shl = int(getattr(_rs, "final_storage_hit_len", 0) or 0)
+                            if _shl > 0:
+                                # Position of this chunk in input tokens:
+                                # chunk_start = len(req.prefix_indices)
+                                # chunk_end   = chunk_start + extend_input_len
+                                _chunk_start = len(req.prefix_indices)
+                                _chunk_end = _chunk_start + _ext
+                                # L3-cached range covers token positions [0, _shl)
+                                _l3_in_chunk = max(0, min(_chunk_end, _shl) - _chunk_start)
+                                if _l3_in_chunk > 0:
+                                    _shift = min(_l3_in_chunk, _ext - 1)
+                                    if _shift > 0:
+                                        _ext -= _shift
+                                        _past += _shift
+                        except Exception:
+                            pass
                         simulation_batch.reqs.append(
                             ScheduleRequest(
-                                extend_length=req.extend_input_len,
-                                past_kv_length=len(req.prefix_indices)
-                                + len(req.output_ids),
+                                extend_length=_ext,
+                                past_kv_length=_past,
                             )
                         )
                 elif batch.forward_mode.is_decode():

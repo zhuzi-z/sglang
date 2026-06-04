@@ -88,12 +88,24 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
     total_host_hit_tokens = 0
     total_storage_hit_tokens = 0
     queue_durs = []
+    # TTFT compensation: sim under-estimates real client-side TTFT due to:
+    #   (a) gtl[0] is just first-iter compute time, missing HTTP/SSE, scheduler
+    #       overhead, kernel launch tail, remaining prefill chunks
+    #   (b) per-iter compute is ~80% of real, so queue wait estimate is also
+    #       ~25% short (queue grows linearly with per-iter time)
+    # Two-term compensation, tunable via env:
+    #   ttft = gtl[0] + base + queue_scale * queue_dur
+    # Defaults calibrated from Qwen3.5-9B no_cache/l1/l2 fit (base=200ms, queue_scale=0.241).
+    import os as _os
+    _first_token_comp_s = float(_os.environ.get("SIM_FIRST_TOKEN_COMPENSATION_MS", "200")) / 1000.0
+    _queue_scale = float(_os.environ.get("SIM_TTFT_QUEUE_SCALE", "0.241"))
     for req in requests:
         if not req.is_complete():
             continue
         completed += 1
-        ttfts.append(req.gen_token_latencies[0])
-        queue_durs.append(req.queue_end - req.queue_start)
+        _q = req.queue_end - req.queue_start
+        ttfts.append(req.gen_token_latencies[0] + _first_token_comp_s + _queue_scale * _q)
+        queue_durs.append(_q)
         if len(req.gen_token_latencies) > 1:
             # output length > 1
             tpots.append(np.mean(req.gen_token_latencies[1:]))
