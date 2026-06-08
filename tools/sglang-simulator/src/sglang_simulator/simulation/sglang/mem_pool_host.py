@@ -98,7 +98,13 @@ def alloc_with_pin_memory(
 
 
 class C_HostKVCacheHook(BaseHook):
-    HOOK_CLASS_NAME = r"MHATokenToKVPoolHost|MLATokenToKVPoolHost|DeepSeekV4PagedHostPool|DeepSeekV4StateHostPool"
+    HOOK_CLASS_NAME = (
+        r"MHATokenToKVPoolHost|"
+        r"MLATokenToKVPoolHost|"
+        r"DSAIndexerPoolHost|"
+        r"DeepSeekV4PagedHostPool|"
+        r"DeepSeekV4StateHostPool"
+    )
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
     REGEX = True
 
@@ -126,7 +132,8 @@ class C_HostKVCacheHook(BaseHook):
             # https://github.com/sgl-project/sglang/blob/v0.5.8/sgl-kernel/csrc/kvcacheio/transfer.cu#L713
             seg_len = compute_contiguous_index_lengths(host_indices, device_indices)
 
-            size_bytes_arr = seg_len * self.get_size_per_token()  # FIXME: per layer
+            size_per_token = self.get_size_per_token()
+            size_bytes_arr = seg_len * size_per_token  # FIXME: per layer
             bandwidth_arr = hicache_transorport_estimator.est_bandwidth_batch(
                 size_bytes_arr, cat=TansportCat.H2D
             )
@@ -146,7 +153,8 @@ class C_HostKVCacheHook(BaseHook):
 
             seg_len = compute_contiguous_index_lengths(host_indices, device_indices)
 
-            size_bytes_arr = seg_len * self.get_size_per_token()
+            size_per_token = self.get_size_per_token()
+            size_bytes_arr = seg_len * size_per_token
             bandwidth_arr = hicache_transorport_estimator.est_bandwidth_batch(
                 size_bytes_arr, cat=TansportCat.D2H
             )

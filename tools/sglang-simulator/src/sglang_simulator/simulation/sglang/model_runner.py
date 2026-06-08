@@ -34,6 +34,17 @@ class C_ModelRunnerHook(BaseHook):
             self.model = MockModel()
             self.dtype = self.model_config.dtype
 
+            # Parse other args
+            self.sliding_window_size = None
+            if (
+                self.model_config.is_hybrid_swa
+                and self.model_config.sliding_window_size is not None
+            ):
+                # sliding window field in model config may have different meaning for different kinds of models (e.g., dllm), here we only consider the sliding window in SWA model
+                self.sliding_window_size = self.model_config.sliding_window_size
+            elif self.model_config.attention_chunk_size is not None:
+                self.sliding_window_size = self.model_config.attention_chunk_size
+
         def override_profile_available_bytes(self, *args, **kwargs):
             # return the available hbm capacity after model loading
             model = resolve_model_info(self.model_config)
@@ -76,8 +87,12 @@ class C_ModelRunnerHook(BaseHook):
                 else:
                     logger.warning(f"{self.token_to_kv_pool} does not have attribute {attr}, which has been modified while init_pools")
 
-            return ret
+            from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+            if isinstance(self.token_to_kv_pool, MLATokenToKVPool):
+                if getattr(self.token_to_kv_pool, "kv_cache_dim") == 2:
+                    setattr(self.token_to_kv_pool, "kv_cache_dim", self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
 
+            return ret
 
         def wrapped_forward(self, *args, **kwargs):
             batch = args[0]
