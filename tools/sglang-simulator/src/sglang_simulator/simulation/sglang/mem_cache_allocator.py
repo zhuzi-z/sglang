@@ -152,19 +152,23 @@ def alloc_decode_cpu(
 
 class C_PagedTokenToKVPoolAllocatorHook(BaseHook):
     HOOK_CLASS_NAME = "PagedTokenToKVPoolAllocator"
-    HOOK_MODULE_NAME = "sglang.srt.mem_cache.allocator.paged"
+    HOOK_MODULE_NAME = r"^sglang\.srt\.mem_cache\.allocator(?:\.paged)?$"
+    REGEX = True
 
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
 
         def wrapped_init(self, *args, **kwargs):
-
-            from sglang.srt.mem_cache.allocator import paged
+            
+            try:
+                from sglang.srt.mem_cache.allocator import paged as module
+            except ImportError:
+                from sglang.srt.mem_cache import allocator as module
 
             # triton kernels are not compatible with the CPU allocator, so we use python implementation instead.
-            paged.alloc_extend_kernel = IndexableWrapper(alloc_extend_cpu)
-            paged.alloc_decode_kernel = IndexableWrapper(alloc_decode_cpu)
+            module.alloc_extend_kernel = IndexableWrapper(alloc_extend_cpu)
+            module.alloc_decode_kernel = IndexableWrapper(alloc_decode_cpu)
 
             original_init(self, *args, **kwargs)
 

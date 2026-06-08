@@ -47,12 +47,6 @@ class HicacheTransportOverheadEstimator(HicacheTransportEstimator):
         return x * bw / (t0 * bw + x)
 
 
-hicache_transorport_estimator = HicacheTransportOverheadEstimator(
-    memory_read_bandwidth_bytes=ConfigManager.get_platform_config().memory_read_bandwidth,
-    memory_write_bandwidth_bytes=ConfigManager.get_platform_config().memory_write_bandwidth,
-)
-
-
 def compute_contiguous_index_lengths(
     host_indices: torch.Tensor,
     device_indices: torch.Tensor,
@@ -98,25 +92,31 @@ def alloc_with_pin_memory(
 
 
 class C_HostKVCacheHook(BaseHook):
-    HOOK_CLASS_NAME = (
-        r"MHATokenToKVPoolHost|"
-        r"MLATokenToKVPoolHost|"
-        r"DSAIndexerPoolHost|"
-        r"DeepSeekV4PagedHostPool|"
-        r"DeepSeekV4StateHostPool"
-    )
-    HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
+    HOOK_CLASS_NAME = r".*?"
+    HOOK_MODULE_NAME = r"sglang\.srt\.mem_cache\.memory_pool_host$"
     REGEX = True
+
+    hicache_transorport_estimator = None
 
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
+
+        # The subclass of HostKVCache
+        if len(target.__mro__) < 3 or target.__mro__[-3].__name__ != "HostKVCache":
+            # object => ABC => HostKVCache
+            return
 
         def wrapped_init(self, *args, **kwargs):
 
             from collections import defaultdict
             from sglang.srt.mem_cache import memory_pool_host
             memory_pool_host.ALLOC_MEMORY_FUNCS = defaultdict(lambda: alloc_with_pin_memory, {})
+
+            C_HostKVCacheHook.hicache_transorport_estimator = HicacheTransportOverheadEstimator(
+                memory_read_bandwidth_bytes=ConfigManager.get_platform_config().memory_read_bandwidth,
+                memory_write_bandwidth_bytes=ConfigManager.get_platform_config().memory_write_bandwidth,
+            )
 
             return original_init(self, *args, **kwargs)
         
@@ -134,7 +134,7 @@ class C_HostKVCacheHook(BaseHook):
 
             size_per_token = self.get_size_per_token()
             size_bytes_arr = seg_len * size_per_token  # FIXME: per layer
-            bandwidth_arr = hicache_transorport_estimator.est_bandwidth_batch(
+            bandwidth_arr = C_HostKVCacheHook.hicache_transorport_estimator.est_bandwidth_batch(
                 size_bytes_arr, cat=TansportCat.H2D
             )
             total_time_cost = float(torch.sum(size_bytes_arr / bandwidth_arr))
@@ -155,7 +155,7 @@ class C_HostKVCacheHook(BaseHook):
 
             size_per_token = self.get_size_per_token()
             size_bytes_arr = seg_len * size_per_token
-            bandwidth_arr = hicache_transorport_estimator.est_bandwidth_batch(
+            bandwidth_arr = C_HostKVCacheHook.hicache_transorport_estimator.est_bandwidth_batch(
                 size_bytes_arr, cat=TansportCat.D2H
             )
             total_time_cost = float(torch.sum(size_bytes_arr / bandwidth_arr))
