@@ -11,7 +11,6 @@ from sglang_simulator.simulation.sglang import (
     hicache_storage,
     hiradix_cache,
     mem_cache_allocator,
-    mem_pool,
     mem_pool_host,
     model_runner,
     scheduler,
@@ -35,11 +34,7 @@ sglang_simulator_hook.install_class_hooks(
         cache_controller.C_HiCacheController,
         hiradix_cache.C_HiRadixCacheHook,
         mem_cache_allocator.C_PagedTokenToKVPoolAllocatorHook,
-        mem_pool_host.C_MHATokenToKVPoolHostHook,
         mem_pool_host.C_HostKVCacheHook,
-        mem_pool.C_DeepSeekV4SingleKVPoolHook,
-        mem_pool_host.C_DeepSeekV4PagedHostPoolHook,
-        mem_pool_host.C_DeepSeekV4StateHostPoolHook,
     ]
 )
 

@@ -1,5 +1,8 @@
 from enum import Enum
 import torch
+import numpy as np
+from functools import lru_cache
+
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager, StateManager
 from sglang_simulator.utils import get_logger
@@ -20,8 +23,8 @@ class HicacheTransportEstimator:
         self.memory_write_bandwidth_bytes = memory_write_bandwidth_bytes
 
     def est_bandwidth_batch(
-        self, size_bytes_arr: torch.Tensor, cat: TansportCat
-    ) -> torch.Tensor:
+        self, size_bytes_arr: np.ndarray, cat: TansportCat
+    ) -> np.ndarray:
         pass
 
 
@@ -33,9 +36,8 @@ class HicacheTransportOverheadEstimator(HicacheTransportEstimator):
         super().__init__(memory_read_bandwidth_bytes, memory_write_bandwidth_bytes)
 
     def est_bandwidth_batch(
-        self, size_bytes_arr: torch.tensor, cat: TansportCat
-    ) -> torch.tensor:
-        x = size_bytes_arr.to(torch.float64)
+        self, size_bytes_arr: np.ndarray, cat: TansportCat
+    ) -> np.ndarray:
         if cat == TansportCat.H2D:
             eff = 0.85
             t0 = 6.67e-6
@@ -44,36 +46,26 @@ class HicacheTransportOverheadEstimator(HicacheTransportEstimator):
             eff = 0.85
             t0 = 4e-6
             bw = self.memory_write_bandwidth_bytes * eff
-        return x * bw / (t0 * bw + x)
+        return size_bytes_arr * bw / (t0 * bw + size_bytes_arr)
 
 
 def compute_contiguous_index_lengths(
     host_indices: torch.Tensor,
     device_indices: torch.Tensor,
-) -> torch.Tensor:
+) -> np.ndarray:
     assert len(host_indices) == len(device_indices)
 
-    host_indices = host_indices.cpu()
-    device_indices = device_indices.cpu()
+    num_indices = len(host_indices)
 
-    n = host_indices.numel()
-    if n == 0:
-        return torch.empty(0, dtype=torch.float64, device="cpu")
+    host = np.asarray(host_indices.cpu(), dtype=np.int64)
+    dev = np.asarray(device_indices.cpu(), dtype=np.int64)
+    cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
+    cut = np.flatnonzero(~cont) + 1
+    starts = np.r_[0, cut]
+    ends = np.r_[cut, num_indices]
+    seg_len = (ends - starts).astype(np.float64)
 
-    breaks = (
-        (host_indices[1:] != host_indices[:-1] + 1)
-        | (device_indices[1:] != device_indices[:-1] + 1)
-    ).nonzero(as_tuple=False).flatten() + 1
-
-    boundaries = torch.cat(
-        [
-            torch.tensor([0], dtype=torch.int64),
-            breaks.to(torch.int64),
-            torch.tensor([n], dtype=torch.int64),
-        ]
-    )
-
-    return boundaries[1:] - boundaries[:-1]
+    return seg_len
 
 
 def alloc_with_pin_memory(
@@ -89,6 +81,34 @@ def alloc_with_pin_memory(
     """
     buffer = torch.empty(dims, dtype=dtype, device="meta", pin_memory=False)
     return buffer
+
+
+@lru_cache(maxsize=256)
+def get_refined_cache_size_per_token(
+    host_pool
+) -> float:
+    scheduler_config = ConfigManager.get_scheduler_config()
+
+    pool_name = host_pool.__class__.__name__
+    if hasattr(host_pool, "pool_name"):
+        pool_name += f"[{getattr(host_pool, "pool_name")}]"
+    inter_dtype = host_pool.dtype
+    inter_size_per_token = host_pool.get_size_per_token()
+
+    if scheduler_config is None or scheduler_config.kv_cache_data_type is None:
+
+        logger.warning(
+            f"Failed to get the user-customized scheduler configuration. "
+            f"The dtype of host pool[{pool_name}] will use internal dtype [{inter_dtype}]. "
+            f"Please make sure this value is correct, because initialization depends on the actual platform."
+        )
+        return inter_size_per_token
+
+    dtype_factor = scheduler_config.kv_cache_data_type.bytes / inter_dtype.itemsize
+    size_per_token = inter_size_per_token * dtype_factor
+    logger.info(f"Size per token for {pool_name}: {size_per_token}")
+
+    return size_per_token
 
 
 class C_HostKVCacheHook(BaseHook):
@@ -132,12 +152,12 @@ class C_HostKVCacheHook(BaseHook):
             # https://github.com/sgl-project/sglang/blob/v0.5.8/sgl-kernel/csrc/kvcacheio/transfer.cu#L713
             seg_len = compute_contiguous_index_lengths(host_indices, device_indices)
 
-            size_per_token = self.get_size_per_token()
-            size_bytes_arr = seg_len * size_per_token  # FIXME: per layer
+            size_per_token = get_refined_cache_size_per_token(self)
+            size_bytes_arr = seg_len * size_per_token / self.layer_num
             bandwidth_arr = C_HostKVCacheHook.hicache_transorport_estimator.est_bandwidth_batch(
                 size_bytes_arr, cat=TansportCat.H2D
             )
-            total_time_cost = float(torch.sum(size_bytes_arr / bandwidth_arr))
+            total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
 
             StateManager.inc_hicache_l2_load_dur(total_time_cost)
 
@@ -152,13 +172,13 @@ class C_HostKVCacheHook(BaseHook):
                 device_indices = self._to_page_indices(device_indices)
 
             seg_len = compute_contiguous_index_lengths(host_indices, device_indices)
-
-            size_per_token = self.get_size_per_token()
+            
+            size_per_token = get_refined_cache_size_per_token(self)
             size_bytes_arr = seg_len * size_per_token
             bandwidth_arr = C_HostKVCacheHook.hicache_transorport_estimator.est_bandwidth_batch(
                 size_bytes_arr, cat=TansportCat.D2H
             )
-            total_time_cost = float(torch.sum(size_bytes_arr / bandwidth_arr))
+            total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
 
             StateManager.inc_hicache_l2_backup_dur(total_time_cost)
 

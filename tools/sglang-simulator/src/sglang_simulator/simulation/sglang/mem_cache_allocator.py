@@ -13,8 +13,8 @@ class IndexableWrapper:
         return self._fn(*args, **kwargs)
 
 
-def ceil_div(a, b):
-    return (a + b - 1) // b
+def ceil_div(x: torch.Tensor | int, y: int):
+    return (x + y - 1) // y
 
 
 def alloc_extend_cpu(
@@ -22,85 +22,90 @@ def alloc_extend_cpu(
     seq_lens_ptr: torch.Tensor,
     last_loc_ptr: torch.Tensor,
     free_page_ptr: torch.Tensor,
-    out_indices: torch.Tensor,  # Pre-allocated output tensor (consistent with Triton kernel)
-    bs_upper: int,  # CPU doesn't need this, but kept for interface consistency (can be ignored)
+    out_indices: torch.Tensor,
+    bs_upper: int,
     page_size: int,
     extend_num_tokens=None,
 ):
-    # Convert to Python list or scalar for processing
-    pre_lens = pre_lens_ptr.cpu().tolist()
-    seq_lens = seq_lens_ptr.cpu().tolist()
-    last_loc = last_loc_ptr.cpu().tolist()
-    free_pages = free_page_ptr.cpu().tolist()
+    # Ensure all tensors are on CPU and contiguous
+    pre_lens = pre_lens_ptr.to(device="cpu", dtype=torch.long).contiguous()
+    seq_lens = seq_lens_ptr.to(device="cpu", dtype=torch.long).contiguous()
+    last_loc = last_loc_ptr.to(device="cpu", dtype=torch.long).contiguous()
+    free_pages = free_page_ptr.to(device="cpu", dtype=torch.long).contiguous()
+    out_indices = out_indices.to(device="cpu", dtype=torch.long)
 
-    batch_size = len(pre_lens)
+    batch_size = pre_lens.numel()
 
-    extend_lens = [seq_lens[i] - pre_lens[i] for i in range(batch_size)]
-    num_new_pages_per_seq = []
-    for i in range(batch_size):
-        pages_before = ceil_div(pre_lens[i], page_size)
-        pages_after = ceil_div(seq_lens[i], page_size)
-        num_new_pages_per_seq.append(pages_after - pages_before)
+    extend_lens = seq_lens - pre_lens
+    pages_before = (pre_lens + page_size - 1) // page_size
+    pages_after = (seq_lens + page_size - 1) // page_size
+    num_new_pages_per_seq = pages_after - pages_before
 
-    # Initialize offsets
     output_offset = 0
     free_page_offset = 0
 
-    # Process each sequence
+    # Reusable page template: [0, 1, 2, ..., page_size - 1]
+    page_template = torch.arange(page_size, dtype=out_indices.dtype, device=out_indices.device)
+
     for pid in range(batch_size):
-        pre_len = pre_lens[pid]
-        seq_len = seq_lens[pid]
-        extend_len = extend_lens[pid]
-        last_token_pos = last_loc[pid]
+        pre_len = int(pre_lens[pid].item())
+        seq_len = int(seq_lens[pid].item())
+        extend_len = int(extend_lens[pid].item())
+        last_token_pos = int(last_loc[pid].item())
+        new_pages = int(num_new_pages_per_seq[pid].item())
 
         if extend_len <= 0:
-            # No extension, skip (but still need to advance free_page_offset)
-            free_page_offset += num_new_pages_per_seq[pid]
+            free_page_offset += new_pages
             continue
 
-        # === Part 1: Fill the remaining space of the current incomplete page ===
-        current_page_end = ceil_div(pre_len, page_size) * page_size
+        # Part 1: fill remaining slots in current incomplete page
+        current_page_end = ((pre_len + page_size - 1) // page_size) * page_size
         part1_end = min(seq_len, current_page_end)
         num_part1 = part1_end - pre_len
 
         if num_part1 > 0:
-            # out_indices[output_offset : output_offset + num_part1] = last_token_pos + 1 + i
-            for i in range(num_part1):
-                out_indices[output_offset + i] = last_token_pos + 1 + i
+            out_indices[output_offset: output_offset + num_part1] = torch.arange(
+                last_token_pos + 1,
+                last_token_pos + 1 + num_part1,
+                dtype=out_indices.dtype,
+                device=out_indices.device,
+            )
             output_offset += num_part1
 
         if pre_len + num_part1 == seq_len:
-            free_page_offset += num_new_pages_per_seq[pid]
+            free_page_offset += new_pages
             continue
 
-        # === Part 2: Fill complete new pages ===
+        # Part 2: fill complete new pages
         full_pages_start = current_page_end
         full_pages_end = (seq_len // page_size) * page_size
         num_part2 = full_pages_end - full_pages_start
 
         if num_part2 > 0:
-            for i in range(num_part2):
-                page_idx_in_free = free_page_offset + (i // page_size)
-                page_id = free_pages[page_idx_in_free]
-                token_in_page = i % page_size
-                out_indices[output_offset + i] = page_id * page_size + token_in_page
+            num_full_pages = num_part2 // page_size
+            page_ids = free_pages[free_page_offset: free_page_offset + num_full_pages]
+
+            # Build [page_id * page_size + 0..page_size-1] for each full page
+            values = page_ids.unsqueeze(1) * page_size + page_template.unsqueeze(0)
+            out_indices[output_offset: output_offset + num_part2] = values.reshape(-1)
+
             output_offset += num_part2
 
         if pre_len + num_part1 + num_part2 == seq_len:
-            free_page_offset += num_new_pages_per_seq[pid]
+            free_page_offset += new_pages
             continue
 
-        # === Part 3: Fill the last incomplete new page ===
+        # Part 3: fill the last incomplete new page
         num_part3 = seq_len - full_pages_end
         if num_part3 > 0:
-            last_page_idx = free_page_offset + num_new_pages_per_seq[pid] - 1
-            last_page_id = free_pages[last_page_idx]
-            for i in range(num_part3):
-                out_indices[output_offset + i] = last_page_id * page_size + i
+            last_page_idx = free_page_offset + new_pages - 1
+            last_page_id = int(free_pages[last_page_idx].item())
+            out_indices[output_offset: output_offset + num_part3] = (
+                last_page_id * page_size + page_template[:num_part3]
+            )
             output_offset += num_part3
 
-        # Push forward free_page_offset
-        free_page_offset += num_new_pages_per_seq[pid]
+        free_page_offset += new_pages
 
 
 def alloc_decode_cpu(
@@ -108,46 +113,32 @@ def alloc_decode_cpu(
     last_loc_ptr: torch.Tensor,
     free_page_ptr: torch.Tensor,
     out_indices: torch.Tensor,
-    bs_upper: int,  # Reserved parameter (not used in CPU)
+    bs_upper: int,
     page_size: int,
 ):
-    seq_lens = seq_lens_ptr.cpu().tolist()
-    last_loc = last_loc_ptr.cpu().tolist()
-    free_pages = free_page_ptr.cpu().tolist()
+    # Ensure CPU tensors
+    seq_lens = seq_lens_ptr.to(device="cpu", dtype=torch.long).contiguous()
+    last_loc = last_loc_ptr.to(device="cpu", dtype=torch.long).contiguous()
+    free_pages = free_page_ptr.to(device="cpu", dtype=torch.long).contiguous()
 
-    batch_size = len(seq_lens)
+    if torch.any(seq_lens <= 0):
+        raise ValueError("seq_lens must be positive for decode allocation")
 
-    # Calculate the number of new pages needed for each sequence (used to determine free_page offset)
-    num_new_pages_per_seq = []
-    for i in range(batch_size):
-        pre_len_i = seq_lens[i] - 1
-        pages_before = ceil_div(pre_len_i, page_size)
-        pages_after = ceil_div(seq_lens[i], page_size)
-        num_new_pages_per_seq.append(pages_after - pages_before)
+    pre_lens = seq_lens - 1
 
-    # Calculate prefix sum to determine the starting position in free_page_ptr for each sequence
-    prefix_sum = 0
-    for pid in range(batch_size):
-        num_new_pages_self = num_new_pages_per_seq[pid]
-        new_page_start_loc = (
-            prefix_sum  # Starting index in free_pages for current sequence
-        )
-        prefix_sum += num_new_pages_self
+    # A new page is needed when the previous length is exactly at a page boundary
+    need_new_page = (pre_lens % page_size) == 0
 
-        seq_len = seq_lens[pid]
-        pre_len = seq_len - 1
+    # Default case: reuse current page
+    out_indices[: seq_lens.numel()] = last_loc + 1
 
-        num_page_start_loc_self = ceil_div(seq_len, page_size) - ceil_div(
-            pre_len, page_size
-        )
+    if need_new_page.any():
+        # Compute per-sequence offset in free_pages using exclusive prefix sum
+        need_new_page_long = need_new_page.to(torch.long)
+        new_page_offsets = torch.cumsum(need_new_page_long, dim=0) - need_new_page_long
 
-        if num_page_start_loc_self == 0:
-            # Reuse current page, directly write last_loc + 1
-            out_indices[pid] = last_loc[pid] + 1
-        else:
-            # Allocate new page, take the first new page ID
-            page_id = free_pages[new_page_start_loc]
-            out_indices[pid] = page_id * page_size
+        selected_page_ids = free_pages[new_page_offsets[need_new_page]]
+        out_indices[: seq_lens.numel()][need_new_page] = selected_page_ids * page_size
 
 
 class C_PagedTokenToKVPoolAllocatorHook(BaseHook):
