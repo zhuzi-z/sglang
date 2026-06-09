@@ -27,7 +27,11 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
     ):
         self.workers = workers
         self.lb_proxy = lb_proxy if lb_proxy is not None else RoundRobinPolicy()
+        self.lb_proxy.init_workers(workers)
         self.loop = asyncio.new_event_loop()
+
+        # Worker's name -> requests
+        self.lb_routing_records: dict[str, list[GenericRequest]] = {}
 
     def get_request(
         self,
@@ -70,6 +74,9 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
             request_rate=benchmark_config.request_rate,
         ):
             worker = self.lb_proxy.select_worker(self.workers, req)
+            if worker.name not in self.lb_routing_records:
+                self.lb_routing_records[worker.name] = []
+            self.lb_routing_records[worker.name].append(req)
             task = asyncio.create_task(worker.async_generate(req))
             tasks.append(task)
 
@@ -87,6 +94,9 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
 
         return metrics
 
+    def set_lb_proxy(self, lb_proxy: LoadBalancingPolicy):
+        self.lb_proxy = lb_proxy
+
     def benchmark(self, benchmark_config: BenchmarkConfig, dataset: BaseDataset):
 
         return self.loop.run_until_complete(
@@ -96,15 +106,24 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
     def get_request_stats(self) -> list[dict]:
         result = []
         for worker in self.workers:
-            result.extend(worker.get_request_stats())
+            request_stats = worker.get_request_stats()
+            for item in request_stats:
+                item["worker"] = worker.name
+            result.extend(request_stats)
         return result
 
     def get_iteration_stats(self):
         result = []
         for worker in self.workers:
-            result.extend(worker.get_iteration_stats())
+            iteration_stats = worker.get_iteration_stats()
+            for item in iteration_stats:
+                item["worker"] = worker.name
+            result.extend(iteration_stats)
         return result
 
+    def get_lb_routing_records(self) -> dict[str, list[GenericRequest]]:
+        return self.lb_routing_records
+    
     def shutdown(self):
         for worker in self.workers:
             worker.shutdown()

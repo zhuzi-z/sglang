@@ -60,7 +60,17 @@ def estimate_kv_cache_pool_capacity(
 def calc_metrics(requests: list[Union[RequestStats, dict]]) -> dict:
     for idx, req in enumerate(requests):
         if isinstance(req, dict):
-            requests[idx] = RequestStats(**req)
+            requests[idx] = RequestStats(
+                gen_token_latencies=req["gen_token_latencies"],
+                queue_start=req["queue_start"],
+                queue_end=req["queue_end"],
+                last_event_time=req["last_event_time"],
+                input_length=req["input_length"],
+                output_length=req["output_length"],
+                final_device_hit_len=req["final_device_hit_len"],
+                final_host_hit_len=req["final_host_hit_len"],
+                final_storage_hit_len=req["final_storage_hit_len"]
+            )
 
     ttfts = []
     tpots = []
