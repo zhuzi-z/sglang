@@ -149,19 +149,19 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
 
         database.set_default_database_mode(database_mode)
 
-        # --- Replace the original function to support more flexible request input. --- #
+        # # --- Replace the original function to support more flexible request input. --- #
 
-        db_nearest_1d_point_helper = database._nearest_1d_point_helper
+        # db_nearest_1d_point_helper = database._nearest_1d_point_helper
 
-        def wrapped_nearest_1d_point_helper(
-            x: int, values: list[int], inner_only: bool = False
-        ):
-            # Disable the inner_only by default
-            return db_nearest_1d_point_helper(x, values, inner_only)
+        # def wrapped_nearest_1d_point_helper(
+        #     x: int, values: list[int], inner_only: bool = False
+        # ):
+        #     # Disable the inner_only by default
+        #     return db_nearest_1d_point_helper(x, values, inner_only)
 
-        database._nearest_1d_point_helper = wrapped_nearest_1d_point_helper
+        # database._nearest_1d_point_helper = wrapped_nearest_1d_point_helper
 
-        # --- End --- #
+        # # --- End --- #
 
         self._session = InferenceSession(
             model=get_perf_model(config, model, workload_distribution),

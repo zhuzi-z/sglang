@@ -20,5 +20,8 @@ class LoadBalancingPolicy(ABC):
     def update_loads(self, loads: dict[str, int]):
         pass
 
+    def init_workers(self, workers: list[BaseWorker]):
+        pass
+
     def reset(self):
         pass
