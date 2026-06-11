@@ -18,6 +18,7 @@ from sglang_simulator.simulation.sglang import (
     model_runner,
     scheduler,
     sgl_kernel_hook,
+    disaggregation
 )
 from sglang_simulator.utils.logger import get_logger
 
@@ -37,11 +38,8 @@ sglang_simulator_hook.install_class_hooks(
         cache_controller.C_HiCacheController,
         hiradix_cache.C_HiRadixCacheHook,
         mem_cache_allocator.C_PagedTokenToKVPoolAllocatorHook,
-        mem_pool_host.C_MHATokenToKVPoolHostHook,
         mem_pool_host.C_HostKVCacheHook,
-        mem_pool_host.C_DeepSeekV4SingleKVPoolHook,
-        mem_pool_host.C_DeepSeekV4PagedHostPoolHook,
-        mem_pool_host.C_DeepSeekV4StateHostPoolHook,
+        disaggregation.C_DecodePreallocQueueHook,
     ]
 )
 
@@ -79,6 +77,10 @@ class SGLangWorker(BaseWorker):
         )
 
     async def async_generate(self, req: GenericRequest):
+        simulation_params = {}
+        simulation_params["created_time"] = req.custom_params.get("created_time", 0)
+        if "total_request" in req.custom_params:
+            simulation_params["total_request"] = req.custom_params.get("total_request")
         return await self._engine.async_generate(
             prompt=req.prompt,
             input_ids=req.token_ids,
@@ -87,14 +89,10 @@ class SGLangWorker(BaseWorker):
                 "max_new_tokens": req.output_length,
                 "custom_params": {
                     # (tmp) Transfer simulation arguments to the scheduler through the custom_params in sampling_params
-                    "simulation": {
-                        "total_request": req.custom_params.get(
-                            "total_request", 1
-                        ),  # include the warmup requests.
-                        "created_time": req.custom_params.get("created_time", 0),
-                    }
+                    "simulation": simulation_params
                 },
             },
+            **req.extra_args
         )
 
     def generate(self, req: GenericRequest):
