@@ -52,11 +52,15 @@ class C_ModelRunnerHook(BaseHook):
             scheduler_config = resolve_scheduler_config(
                 server_args=self.server_args,
             )
-            return profile_device_available_bytes(
+            rest_memory = profile_device_available_bytes(
                 model=model,
                 device=hw,
                 scheduler_config=scheduler_config,
-            )
+            ) / (1 << 30)
+            if self.mambaish_config is not None:
+                rest_memory = self.handle_max_mamba_cache(rest_memory)
+            
+            return rest_memory * (1 << 30)
 
         
         def wrapped_init_pools(self, *args, **kwargs):
@@ -66,7 +70,11 @@ class C_ModelRunnerHook(BaseHook):
                 "index_head_dim",
                 "kv_lora_rank",
                 "head_dim",
-                "v_head_dim"
+                "v_head_dim",
+                # mamba2
+                "linear_value_head_dim",
+                "linear_key_head_dim",
+                "linear_conv_kernel_dim"
             ]
             
             # set all model_config keywords about kv cache pool allocation to 1 to reduce memory usage
@@ -124,9 +132,14 @@ class C_ModelRunnerHook(BaseHook):
         def wrapped_compute_logprobs_only(*args, **kwargs):
             return None
 
+        def override_init_attention_backend(self, *args, **kwargs):
+            # This might cause a CUDA exception.
+            self.attn_backend = None
+
         target.load_model = override_load_model
         target._profile_available_bytes = override_profile_available_bytes
         target._init_pools = wrapped_init_pools
         target.forward = wrapped_forward
         target.sample = wrapped_sample
         target.compute_logprobs_only = wrapped_compute_logprobs_only
+        target.init_attention_backend = override_init_attention_backend

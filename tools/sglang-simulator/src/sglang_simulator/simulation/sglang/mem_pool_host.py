@@ -153,7 +153,7 @@ class C_HostKVCacheHook(BaseHook):
             seg_len = compute_contiguous_index_lengths(host_indices, device_indices)
 
             size_per_token = get_refined_cache_size_per_token(self)
-            size_bytes_arr = seg_len * size_per_token / self.layer_num
+            size_bytes_arr = seg_len * size_per_token / (self.layer_num if hasattr(self, "layer_num") else 1)
             bandwidth_arr = C_HostKVCacheHook.hicache_transorport_estimator.est_bandwidth_batch(
                 size_bytes_arr, cat=TansportCat.H2D
             )
