@@ -58,6 +58,7 @@ def estimate_kv_cache_pool_capacity(
 
 
 def calc_metrics(requests: list[Union[RequestStats, dict]]) -> dict:
+    requests = requests.copy()
     for idx, req in enumerate(requests):
         if isinstance(req, dict):
             requests[idx] = RequestStats(

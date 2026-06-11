@@ -76,12 +76,19 @@ class ReqDispatcher:
         )  # tuple(created time, salt, request)
 
         self._can_dispatch = False
+        self.clock_aligned_with_first_req = False
 
     def disable_dispatch(self):
         self._can_dispatch = False
 
     def enable_dispatch(self):
         self._can_dispatch = True
+    
+    def reset(self):
+        self.immediate_release_requests.clear()
+        self.future_queue.clear()
+        self._can_dispatch = False
+        self.clock_aligned_with_first_req = False
 
     def has_next(self) -> bool:
         return len(self.future_queue) > 0
@@ -134,13 +141,13 @@ class ReqDispatcher:
 
             if (not self._can_dispatch) and len(self.future_queue) != 0:
                 _, _, gen_req = self.future_queue[-1]
-                total_request = gen_req.sampling_params.custom_params["simulation"][
-                    "total_request"
-                ]
+                # If the number of requests is not provided, the `_can_dispatch` will be triggered by user input.
+                total_request = gen_req.sampling_params.custom_params["simulation"].get(
+                    "total_request", float("inf")
+                )
 
                 if len(self.future_queue) == total_request:
                     self._can_dispatch = True
-                    heapq.heapify(self.future_queue)
                     logger.info("All requests received. Starting simulation now.")
                 else:
                     logger.info(
@@ -154,6 +161,13 @@ class ReqDispatcher:
         self.immediate_release_requests.clear()
 
         if self._can_dispatch:
+            if not self.clock_aligned_with_first_req and len(self.future_queue) > 0:
+                # Adjust the global clock to the first request's enqueue time, 
+                # since requests created in the decoding instance during PD disaggregation 
+                # do not start with a zero creation time.
+                heapq.heapify(self.future_queue)
+                StateManager.set_global_clock(self.future_queue[0][0])
+                self.clock_aligned_with_first_req = True
             # Process the arrived requests only after all requests have been added to the future queue
             current_timestamp = StateManager.get_global_clock()
             while len(self.future_queue) > 0:
@@ -248,10 +262,12 @@ class C_SchedulerHook(BaseHook):
         original_recv_requests = getattr(target, "recv_requests", None)
         original_prefetch_kvcache = target._prefetch_kvcache
         original_get_new_batch_prefill = target.get_new_batch_prefill
+        original_get_new_prebuilt_batch = target.get_new_prebuilt_batch
         original_run_batch = target.run_batch
         original_process_batch_result = target.process_batch_result
         original_event_loop_normal = target.event_loop_normal
         original_init_request_dispatcher = target.init_request_dispatcher
+        original_stream_output_generation = target.stream_output_generation
 
         def override_event_loop_overlap(self, *args, **kwargs):
             # To reduce the complexity of the simulation, the overlapping schedule is not needed.
@@ -303,11 +319,12 @@ class C_SchedulerHook(BaseHook):
 
         def wrapped_recv_requests(self, *args, **kwargs) -> list:
             recv_reqs = original_recv_requests(self, *args, **kwargs)
+            if self.server_args.disaggregation_mode == "decode" and recv_reqs:
+                pass
             C_SchedulerHook.REQ_DISPATCHER.add(recv_reqs)
             return C_SchedulerHook.REQ_DISPATCHER.dispatch()
-
-        def wrapped_get_new_batch_prefill(self, *args, **kwargs):
-            new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
+        
+        def statistics_new_batch(self, new_batch, is_req_pending: bool):
             now = time.time()
             if new_batch is not None:
                 for req in new_batch.reqs:
@@ -321,8 +338,9 @@ class C_SchedulerHook(BaseHook):
                     else:
                         # Chunked request
                         pass
-            elif len(self.running_batch.reqs) == 0 and len(self.waiting_queue) > 0:
-                # Prefetching
+            elif is_req_pending:
+                # When requests are pendding in the waiting queue, the new batch is empty.
+                # Then the `run_batch` may not be called and the global clock is not advanced.
                 StateManager.step_global_clock(0.005)
                 StateManager.set_current_inference_dur(0.005)
             else:
@@ -341,6 +359,20 @@ class C_SchedulerHook(BaseHook):
                 f"waiting queue={len(self.waiting_queue)}"
             )
 
+        def wrapped_get_new_batch_prefill(self, *args, **kwargs):
+            new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
+            is_req_pendding = len(self.running_batch.reqs) == 0 and len(self.waiting_queue) > 0
+            statistics_new_batch(self, new_batch, is_req_pending=is_req_pendding)
+            return new_batch
+
+        def wrapped_get_new_prebuilt_batch(self, *args, **kwargs):
+            new_batch = original_get_new_prebuilt_batch(self, *args, **kwargs)
+            is_req_pendding = len(self.running_batch.reqs) == 0 and (
+                len(self.waiting_queue)
+                + len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_prealloc_queue.queue)
+            ) > 0
+            statistics_new_batch(self, new_batch, is_req_pending=is_req_pendding)
             return new_batch
 
         def wrapped_prefetch_kvcache(self, *args, **kwargs):
@@ -535,6 +567,7 @@ class C_SchedulerHook(BaseHook):
             request_stats_manager.reset()
             C_SchedulerHook.ITERATION_STATS.clear()
             C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST = 0
+            C_SchedulerHook.REQ_DISPATCHER.reset()
 
             ProfileReqOutput = getattr(
                 importlib.import_module("sglang.srt.managers.io_struct"),
@@ -564,15 +597,45 @@ class C_SchedulerHook(BaseHook):
         def override_continue_generation(self, *args, **kwargs):
             C_SchedulerHook.REQ_DISPATCHER.enable_dispatch()
 
+        def wrapped_stream_output_generation(self, reqs, *args, **kwargs):
+            original_send_output = self.send_to_detokenizer.send_output
+
+            def dummy_send_output(output, recv_obj=None):
+                for rid, finish_reason in zip(output.rids, output.finished_reasons):
+                    # When the request is finished, response the simulation statistics via finish_reason
+                    if finish_reason is not None:
+                        req_stat = request_stats_manager.get_req_stats(rid)
+                        finish_reason["simulation_stat"] = {
+                            "gen_token_latencies": req_stat.gen_token_latencies,
+                            "last_event_time": req_stat.last_event_time,
+                            "queue_start": req_stat.queue_start,
+                            "queue_end": req_stat.queue_end,
+                            "final_device_hit_len": req_stat.final_device_hit_len,
+                            "final_host_hit_len": req_stat.final_host_hit_len,
+                            "final_storage_hit_len": req_stat.final_storage_hit_len,
+                            "input_length": req_stat.input_length,
+                            "output_length": req_stat.output_length,
+                        }
+
+                original_send_output(output, recv_obj)
+
+            try:
+                self.send_to_detokenizer.send_output = dummy_send_output
+                return original_stream_output_generation(self, reqs, *args, **kwargs)
+            finally:
+                self.send_to_detokenizer.send_output = original_send_output
+
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
         target.get_new_batch_prefill = wrapped_get_new_batch_prefill
+        target.get_new_prebuilt_batch = wrapped_get_new_prebuilt_batch
         target.run_batch = wrapped_run_batch
         target.process_batch_result = wrapped_process_batch_result
         target._prefetch_kvcache = wrapped_prefetch_kvcache
         target.init_request_dispatcher = wrapped_init_request_dispatcher
         target.pause_generation = override_pause_generation
         target.continue_generation = override_continue_generation
+        target.stream_output_generation = wrapped_stream_output_generation
 
         if original_recv_requests:
             # version <= 0.5.12.post1
