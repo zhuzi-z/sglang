@@ -1,8 +1,8 @@
 {
     "platform": {
         "accelerator": {
-            "name": "a100_sxm",
-            "hbm_capacity_gb": 80
+            "name": "b300_sxm",
+            "hbm_capacity_gb": 80000
         },
         "disk_read_bandwidth_gb": 8,
         "disk_write_bandwidth_gb": 8,
@@ -11,12 +11,13 @@
         "num_device_per_node": 8
     },
     "predictor": {
-        "name": "aiconfigurator"
+        "name": "aiconfigurator",
+        "database_mode": "SOL"
     },
     "scheduler": {
         "tp_size": 1,
         "ep_size": 1,
         "dp_size": 1,
-        "backend_version": "0.5.9"
+        "backend_version": "0.5.10"
     }
 }

@@ -24,9 +24,8 @@ def calc_kv_cache_per_layer_elems(
         return num_kv_heads * model_info.head_dim * 2
 
 
-def estimate_kv_cache_pool_capacity(
-    model: ModelInfo, device: AcceleratorInfo, scheduler_config: SchedulerConfig
-) -> int:
+def profile_device_available_bytes(model: ModelInfo, device: AcceleratorInfo, scheduler_config: SchedulerConfig) -> int:
+
     perf_model = get_perf_model(scheduler_config, model)
     weights = 0
     for op in perf_model.context_ops:
@@ -38,6 +37,15 @@ def estimate_kv_cache_pool_capacity(
         scheduler_config.mem_fraction_static * device.hbm_capacity_gb
         - framework_reserved_mem_gb
     ) * (1 << 30) - weights
+    return int(rest_memory)
+
+
+def estimate_kv_cache_pool_capacity(
+    model: ModelInfo, device: AcceleratorInfo, scheduler_config: SchedulerConfig
+) -> int:
+    
+    rest_memory = profile_device_available_bytes(model, device, scheduler_config)
+
     kv_cache_space_per_token = (
         calc_kv_cache_cell_elems(
             model, scheduler_config.tp_size, scheduler_config.pp_size

@@ -1,4 +1,7 @@
 import os
+import random
+import numpy as np
+from copy import deepcopy
 
 from sglang_simulator.dataset import DatasetArgs, SimpleDataset, get_dataset
 from sglang_simulator.simulation.benchmark import BenchmarkConfig
@@ -13,24 +16,20 @@ from sglang_simulator.simulation.sglang.bench_runner import (
     SGLangBenchmarkRunner,
 )
 
+random.seed(0)
+np.random.seed(0)
 
-def test_benchmark_sglang():
+
+def run_sgl_benchmark(server_args: dict):
+
     from sglang.srt.server_args import ServerArgs  # noqa
 
-    model_path = "Qwen/Qwen3-8B"
     runner = SGLangBenchmarkRunner(
         server_args=ServerArgs(
-            model_path=model_path,
-            load_format="dummy",
-            device="cpu",
-            enable_hierarchical_cache=True,
-            hicache_ratio=2,
-            hicache_storage_backend="file",
-            hicache_storage_prefetch_policy="wait_complete",
-            max_total_tokens=10000,
-            page_size=2,
+            **server_args
         )
     )
+    runner.clear_hicache_storage()
 
     # Benchmark settings
     benchmark_config = BenchmarkConfig(request_rate=10, ignore_request_timestamp=True)
@@ -39,12 +38,12 @@ def test_benchmark_sglang():
     dataset_args = DatasetArgs(
         "random_ids",
         num_prompts=100,
-        min_input_len=1000,
-        max_input_len=1001,
+        min_input_len=1025,  # [:1024] => align with page size
+        max_input_len=1026,
         min_output_len=1,
         max_output_len=2,
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(server_args["model_path"])
     dataset = get_dataset(dataset_args, tokenizer=tokenizer)
 
     # Split requests for cache tests
@@ -79,6 +78,36 @@ def test_benchmark_sglang():
     assert metrics["kv_cache_storage_hit_ratio"] > 0.95
 
     runner.shutdown()
+
+
+def test_benchmark_sglang():
+    model_server_args_list = [
+        {"model_path": "Qwen/Qwen3-8B"},
+        {"model_path": "zai-org/GLM-5"},
+        {"model_path": "sgl-project/DeepSeek-V4-Flash-FP8"},
+    ]
+
+    common_args = {
+            "load_format": "dummy",
+            "device": "cpu",
+            "enable_hierarchical_cache": True,
+            "hicache_ratio": 2,
+            "hicache_storage_backend": "file",
+            "hicache_storage_prefetch_policy": "wait_complete",
+            "max_total_tokens": 10 * 1024, 
+            "page_size": 256,
+            "swa_full_tokens_ratio": 1 
+    }
+
+    for model_server_args in model_server_args_list:
+        if model_server_args["model_path"] == "sgl-project/DeepSeek-V4-Flash-FP8":
+            os.environ["SGLANG_ENABLE_UNIFIED_RADIX_TREE"] = "1"
+        else:
+            os.environ.pop("SGLANG_ENABLE_UNIFIED_RADIX_TREE", None)
+
+        server_args = deepcopy(common_args)
+        server_args.update(model_server_args)
+        run_sgl_benchmark(server_args)
 
 
 if __name__ == "__main__":
