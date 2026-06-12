@@ -39,6 +39,7 @@ sglang_simulator_hook.install_class_hooks(
         model_runner.C_ModelRunnerHook,
         hicache_storage.C_StorageBackendFactory,
         cache_controller.C_HiCacheController,
+        mem_pool.C_DeepSeekV4SingleKVPoolHook,
         mem_pool.C_MambaPoolHook,
         hiradix_cache.C_HiRadixCacheHook,
         mem_cache_allocator.C_PagedTokenToKVPoolAllocatorHook,

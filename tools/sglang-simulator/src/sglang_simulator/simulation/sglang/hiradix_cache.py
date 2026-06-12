@@ -3,7 +3,7 @@ from sglang_simulator.hook import BaseHook
 
 class C_HiRadixCacheHook(BaseHook):
     HOOK_CLASS_NAME = r"HiRadixCache|UnifiedRadixCache"
-    HOOK_MODULE_NAME = r"sglang.srt.mem_cache.(hiradix_cache|unified_radix_cache)"
+    HOOK_MODULE_NAME = r"sglang\.srt\.mem_cache\.(hiradix_cache|unified_radix_cache)"
     REGEX = True
 
 
