@@ -12,6 +12,11 @@ class RequestStatsManager:
             self.stats[rid] = RequestStats(rid=rid)
         return self.stats[rid]
 
+    def pop_req_stats(self, rid: str) -> RequestStats:
+        if rid not in self.stats:
+            self.stats[rid] = RequestStats(rid=rid)
+        return self.stats.pop(rid)
+
     def get_all_req_stats(self) -> list[RequestStats]:
         return list(self.stats.values())
 

@@ -71,9 +71,9 @@ class ReqDispatcher:
         # If the simulation mode is `OFFLINE`, only control requests, such as `flush_cache`
         # and `server_info`, are released immediately.
         self.immediate_release_requests = []
-        self.future_queue: list[tuple[float, int, Any]] = (
-            []
-        )  # tuple(created time, salt, request)
+        self.future_queue: list[
+            tuple[float, int, Any]
+        ] = []  # tuple(created time, salt, request)
         self.offline_recv_all_requests = False
 
     def has_next(self) -> bool:
@@ -162,30 +162,33 @@ class ReqDispatcher:
                 "BatchTokenizedGenerateReqInput",
                 "TokenizedGenerateReqInput",
             ]:
-                simulation_args = None
+                simulation_args = {}
                 if req.sampling_params.custom_params is not None:
                     simulation_args = req.sampling_params.custom_params.get(
-                        "simulation"
+                        "simulation", {}
                     )
-                # The warm-up request might not include any simulation arguments.
-                if simulation_args is None:
-                    continue
+
                 req_stats = request_stats_manager.get_req_stats(req.rid)
                 req_stats.rid = req.rid
                 req_stats.input_length = len(req.input_ids)
                 req_stats.output_length = req.sampling_params.max_new_tokens
 
                 if self.mode == SimulationMode.BLOCKING:
-                    if "server_created_time" not in simulation_args:
-                        logger.warning(
-                            "The request's creation time is missing, which may cause the TTFT to be inaccurate."
-                        )
-                    req_stats.created_time = simulation_args.get(
-                        "server_created_time", now
-                    )
+                    # if "server_created_time" not in simulation_args:
+                    #     logger.warning(
+                    #         "The request's creation time is missing, which may cause the TTFT to be inaccurate."
+                    #     )
+                    # req_stats.created_time = simulation_args.get(
+                    #     "server_created_time", now
+                    # )
+                    req_stats.created_time = now
                     req_stats.last_event_time = req_stats.created_time
                     req_stats.queue_start = now
                 elif self.mode == SimulationMode.OFFLINE:
+                    # The warm-up request might not include any simulation arguments.
+                    if len(simulation_args) == 0:
+                        continue
+
                     req_stats.created_time = simulation_args["created_time"]
                     req_stats.last_event_time = req_stats.created_time
                     # Align with the real queue start timestamp if queue_start is not None. For debugging only.
@@ -247,6 +250,7 @@ class C_SchedulerHook(BaseHook):
         original_process_batch_result = target.process_batch_result
         original_event_loop_normal = target.event_loop_normal
         original_init_request_dispatcher = target.init_request_dispatcher
+        original_stream_output_generation = target.stream_output_generation
 
         def override_event_loop_overlap(self, *args, **kwargs):
             # To reduce the complexity of the simulation, the overlapping schedule is not needed.
@@ -395,18 +399,9 @@ class C_SchedulerHook(BaseHook):
                     C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += (
                         time.perf_counter() - pred_start
                     )
-                    predicted_latency = float(predicted_latency)
+                    predicted_latency = abs(float(predicted_latency))
 
-                    forward_latency = 0
-                    if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
-                        time.sleep(abs(predicted_latency))
-                        now = time.time()
-                        forward_latency = now - StateManager.get_last_real_time_ts()
-                        StateManager.set_last_real_time_ts(now)
-                    else:
-                        forward_latency = predicted_latency
-
-                    StateManager.set_current_inference_dur(forward_latency)
+                    StateManager.set_current_inference_dur(predicted_latency)
 
                 C_SchedulerHook.SIMULATION_BATCH = simulation_batch
 
@@ -428,24 +423,29 @@ class C_SchedulerHook(BaseHook):
                 hicache_l2_backup_dur = StateManager.pop_hicache_l2_backup_dur()
                 current_inference_dur = StateManager.get_current_inference_dur()
 
+                advance_dur = 0
                 if C_SchedulerHook.OVERLAP_SCHEDULE:
-                    StateManager.step_global_clock(
-                        max(
-                            hicache_l2_load_dur - StateManager.get_last_inference_dur(),
-                            0,
-                        )
+                    advance_dur += max(
+                        hicache_l2_load_dur - StateManager.get_last_inference_dur(),
+                        0,
                     )
-                    StateManager.step_global_clock(current_inference_dur)
+                    advance_dur += current_inference_dur
                 else:
-                    StateManager.step_global_clock(
-                        hicache_l2_load_dur + current_inference_dur
-                    )
+                    advance_dur += hicache_l2_load_dur + current_inference_dur
                 # Step CPU overhead BEFORE recording latencies,
                 # so current iter's CPU time is reflected in current iter's TTFT.
                 now = time.time()
-                cpu_overhead = now - StateManager.get_last_real_time_ts()
-                StateManager.step_global_clock(cpu_overhead)
-                StateManager.set_last_real_time_ts(now)
+
+                if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE:
+                    cpu_overhead = now - StateManager.get_last_real_time_ts()
+                    advance_dur += cpu_overhead
+                    StateManager.step_global_clock(advance_dur)
+                else:
+                    cpu_overhead = now - StateManager.get_last_real_time_ts()
+                    time.sleep(advance_dur)
+                    StateManager.set_global_clock(time.time())
+
+                StateManager.set_last_real_time_ts(time.time())
 
                 request_response_time = StateManager.get_global_clock()
                 # Request statistics
@@ -461,21 +461,24 @@ class C_SchedulerHook(BaseHook):
                         # Chunked request: nothing to do
                         pass
                 # Iteration statistics
-                C_SchedulerHook.ITERATION_STATS.append(
-                    {
-                        "requests": C_SchedulerHook.SIMULATION_BATCH.request_info(),
-                        "forward_latency": current_inference_dur,
-                        "l2_load_latency": hicache_l2_load_dur,
-                        "l2_backup_latency": hicache_l2_backup_dur,
-                        "preprocess_latency": C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST,
-                        "postprocess_latency": process_batch_result_end
-                        - process_batch_result_start,
-                        "cpu_overhead": cpu_overhead,
-                    }
-                )
+                if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE:
+                    C_SchedulerHook.ITERATION_STATS.append(
+                        {
+                            "requests": C_SchedulerHook.SIMULATION_BATCH.request_info(),
+                            "forward_latency": current_inference_dur,
+                            "l2_load_latency": hicache_l2_load_dur,
+                            "l2_backup_latency": hicache_l2_backup_dur,
+                            "preprocess_latency": C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST,
+                            "postprocess_latency": process_batch_result_end
+                            - process_batch_result_start,
+                            "cpu_overhead": cpu_overhead,
+                        }
+                    )
             else:
                 now = time.time()
-                StateManager.step_global_clock(now - StateManager.get_last_real_time_ts())
+                StateManager.step_global_clock(
+                    now - StateManager.get_last_real_time_ts()
+                )
                 StateManager.set_last_real_time_ts(now)
 
             return ret
@@ -561,6 +564,38 @@ class C_SchedulerHook(BaseHook):
                         _request_dispatcher._mapping[ty] = override_profile
             return ret
 
+        def wrapped_stream_output_generation(self, reqs, *args, **kwargs):
+            original_send_output = self.send_to_detokenizer.send_output
+
+            def dummy_send_output(output, recv_obj=None):
+                for rid, finish_reason in zip(output.rids, output.finished_reasons):
+                    # When the request is finished, response the simulation statistics via finish_reason
+                    if finish_reason is not None:
+                        req_stat = request_stats_manager.get_req_stats(rid)
+                        finish_reason["simulation_stat"] = {
+                            "created_time": req_stat.created_time,
+                            "gen_token_latencies": req_stat.gen_token_latencies,
+                            "last_event_time": req_stat.last_event_time,
+                            "queue_start": req_stat.queue_start,
+                            "queue_end": req_stat.queue_end,
+                            "final_device_hit_len": req_stat.final_device_hit_len,
+                            "final_host_hit_len": req_stat.final_host_hit_len,
+                            "final_storage_hit_len": req_stat.final_storage_hit_len,
+                            "input_length": req_stat.input_length,
+                            "output_length": req_stat.output_length,
+                        }
+
+                        if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
+                            request_stats_manager.pop_req_stats(rid)
+
+                original_send_output(output, recv_obj)
+
+            try:
+                self.send_to_detokenizer.send_output = dummy_send_output
+                return original_stream_output_generation(self, reqs, *args, **kwargs)
+            finally:
+                self.send_to_detokenizer.send_output = original_send_output
+
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
         target.get_new_batch_prefill = wrapped_get_new_batch_prefill
@@ -568,6 +603,7 @@ class C_SchedulerHook(BaseHook):
         target.process_batch_result = wrapped_process_batch_result
         target._prefetch_kvcache = wrapped_prefetch_kvcache
         target.init_request_dispatcher = wrapped_init_request_dispatcher
+        target.stream_output_generation = wrapped_stream_output_generation
 
         if original_recv_requests:
             # version <= 0.5.12.post1
