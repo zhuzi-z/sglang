@@ -21,6 +21,7 @@ from sglang_simulator.simulation.sglang import (
     model_runner,
     scheduler,
     sgl_kernel_hook,
+    server_args,
 )
 from sglang_simulator.utils.logger import get_logger
 
@@ -36,6 +37,7 @@ if not torch.cuda.is_available():
 # )
 sglang_simulator_hook.install_class_hooks(
     [
+        server_args.C_ServerArgsHook,
         scheduler.C_SchedulerHook,
         scheduler.C_SglangPrefillAdderHook,
         scheduler.C_SchedulerRequestReceiver,
