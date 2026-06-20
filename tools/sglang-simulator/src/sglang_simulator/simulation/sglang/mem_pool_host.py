@@ -133,7 +133,16 @@ class C_HostKVCacheHook(BaseHook):
                 logger.warning(
                     "Failed to disable pip memory while initializing the hoot memory pool."
                 )
-            return original_init(self, *args, **kwargs)
+
+            import psutil
+            psutil_virtual_memory = psutil.virtual_memory
+            # SGLang preserves at least 10 GB for other usage, which might cause HiCache initialization to fail.
+            psutil.virtual_memory = lambda: psutil_virtual_memory()._replace(
+                available=1024 * (1024**3)
+            )
+            ret = original_init(self, *args, **kwargs)
+            psutil.virtual_memory = psutil_virtual_memory
+            return ret
 
         target.__init__ = wrapped_init
 
