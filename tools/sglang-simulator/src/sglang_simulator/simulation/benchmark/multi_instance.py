@@ -78,17 +78,13 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
                 self.lb_routing_records[worker.name] = []
             self.lb_routing_records[worker.name].append(req)
 
-            # Estimate token cost consistent with GatewayPolicy._estimate_tokens
-            _output = req.output_length if req.output_length > 0 else 0
-            # token_cost = _output
-
-            async def _generate_with_callback(w=worker, r=req, tc=_output):
+            async def _generate_with_callback(w=worker, r=req):
                 try:
                     result = await w.async_generate(r)
-                    self.lb_proxy.on_request_complete(w.name, True, tc)
+                    self.lb_proxy.on_request_complete(w.name, True, req)
                     return result
                 except Exception:
-                    self.lb_proxy.on_request_complete(w.name, False, tc)
+                    self.lb_proxy.on_request_complete(w.name, False, req)
                     raise
 
             task = asyncio.create_task(_generate_with_callback())

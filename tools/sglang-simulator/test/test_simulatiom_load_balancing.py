@@ -202,5 +202,5 @@ def test_benchmark_sglang_router_cache_aware():
     runner2.shutdown()
 
 if __name__ == "__main__":
-    # test_benchmark_inner_round_robin()
+    test_benchmark_inner_round_robin()
     test_benchmark_sglang_router_cache_aware()

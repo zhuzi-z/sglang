@@ -50,9 +50,11 @@ class GatewayPolicy(LoadBalancingPolicy):
         self._inflight[chosen.name] = self._inflight.get(chosen.name, 0) + token_cost
         return chosen
 
-    def on_request_complete(self, worker_name: str, success: bool, token_cost: int = 1):
-        if worker_name in self._inflight:
-            self._inflight[worker_name] = max(0, self._inflight[worker_name] - token_cost)
+    def on_request_complete(self, worker_name: str, success: bool, req: GenericRequest | None  = None):
+        if req is not None:
+            token_cost = req.output_length if req.output_length > 0 else 0
+            if worker_name in self._inflight:
+                self._inflight[worker_name] = max(0, self._inflight[worker_name] - token_cost)
 
     def init_workers(self, workers):
         worker_infos = [self._PyWorkerInfo(url=w.name) for w in workers]
