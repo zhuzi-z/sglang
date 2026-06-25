@@ -77,7 +77,21 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
             if worker.name not in self.lb_routing_records:
                 self.lb_routing_records[worker.name] = []
             self.lb_routing_records[worker.name].append(req)
-            task = asyncio.create_task(worker.async_generate(req))
+
+            # Estimate token cost consistent with GatewayPolicy._estimate_tokens
+            _output = req.output_length if req.output_length > 0 else 0
+            # token_cost = _output
+
+            async def _generate_with_callback(w=worker, r=req, tc=_output):
+                try:
+                    result = await w.async_generate(r)
+                    self.lb_proxy.on_request_complete(w.name, True, tc)
+                    return result
+                except Exception:
+                    self.lb_proxy.on_request_complete(w.name, False, tc)
+                    raise
+
+            task = asyncio.create_task(_generate_with_callback())
             tasks.append(task)
 
         for worker in self.workers:

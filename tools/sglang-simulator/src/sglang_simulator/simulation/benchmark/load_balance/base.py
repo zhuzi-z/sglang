@@ -14,7 +14,7 @@ class LoadBalancingPolicy(ABC):
     @abstractmethod
     def name(self) -> str: ...
 
-    def on_request_complete(self, worker_name: str, success: bool):
+    def on_request_complete(self, worker_name: str, success: bool, token_cost: int = 1):
         pass
 
     def update_loads(self, loads: dict[str, int]):
