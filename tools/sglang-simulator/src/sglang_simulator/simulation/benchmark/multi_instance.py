@@ -77,7 +77,17 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
             if worker.name not in self.lb_routing_records:
                 self.lb_routing_records[worker.name] = []
             self.lb_routing_records[worker.name].append(req)
-            task = asyncio.create_task(worker.async_generate(req))
+
+            async def _generate_with_callback(w=worker, r=req):
+                try:
+                    result = await w.async_generate(r)
+                    self.lb_proxy.on_request_complete(w.name, True, req)
+                    return result
+                except Exception:
+                    self.lb_proxy.on_request_complete(w.name, False, req)
+                    raise
+
+            task = asyncio.create_task(_generate_with_callback())
             tasks.append(task)
 
         for worker in self.workers:
