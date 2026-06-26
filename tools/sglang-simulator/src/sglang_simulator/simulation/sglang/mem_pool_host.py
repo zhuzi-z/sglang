@@ -138,8 +138,15 @@ class C_HostKVCacheHook(BaseHook):
                 memory_write_bandwidth_bytes=ConfigManager.get_platform_config().memory_write_bandwidth,
             )
 
-            return original_init(self, *args, **kwargs)
-        
+            import psutil
+            psutil_virtual_memory = psutil.virtual_memory
+            # SGLang preserves at least 10 GB for other usage, which might cause HiCache initialization to fail.
+            psutil.virtual_memory = lambda: psutil_virtual_memory()._replace(
+                available=1024 * (1024**3)
+            )
+            ret = original_init(self, *args, **kwargs)
+            psutil.virtual_memory = psutil_virtual_memory
+            return ret
 
         def load_to_device_per_layer(
             self, device_pool, host_indices, device_indices, layer_id, io_backend

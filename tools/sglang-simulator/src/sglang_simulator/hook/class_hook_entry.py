@@ -39,7 +39,12 @@ def _custom_build_class_(func, name: str, *bases, **kwargs):
                 try:
                     hook.hook(target_class)
                 except Exception as e:
-                    logger.warning(f"Failed to hook class [{name}]. Error: {e}")
+                    logger.warning(
+                        "Failed to hook class [%s]. Error type: %s, message: %r",
+                        name,
+                        type(e).__name__,
+                        e,
+                    )
                 return target_class
 
     return _builtins_build_class_(func, name, *bases, **kwargs)

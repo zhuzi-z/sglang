@@ -122,11 +122,21 @@ class C_ModelRunnerHook(BaseHook):
 
         def wrapped_sample(self, *args, **kwargs):
             logits = args[0]
+            forward_batch = args[1]
+            batch_size = logits.next_token_logits.shape[0]
             ids = torch.ones(
-                size=(logits.next_token_logits.shape[0],),
+                size=(batch_size,),
                 device=self.device,
                 dtype=torch.int64,
             )
+            # Populate dummy logprobs when return_logprob is requested,
+            # otherwise process_batch_result_decode will crash on None.
+            if getattr(forward_batch, "return_logprob", False):
+                logits.next_token_logprobs = torch.zeros(
+                    size=(batch_size,),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
             return ids
 
         def wrapped_compute_logprobs_only(*args, **kwargs):

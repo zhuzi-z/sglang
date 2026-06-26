@@ -1,45 +1,13 @@
+from sglang_simulator.simulation.sglang.startup import init_hook
 import argparse
 import dataclasses
 import os
 import sys
 from typing import Optional
 
-import sglang_simulator.hook as sglang_simulator_hook
-import torch
-from sglang_simulator.simulation.sglang import (
-    cache_controller,
-    hicache_storage,
-    hiradix_cache,
-    mem_cache_allocator,
-    mem_pool,
-    mem_pool_host,
-    model_runner,
-    scheduler,
-    sgl_kernel_hook,
-)
 from sglang_simulator.utils import get_logger
 
-# hook the sglang implementation
-if not torch.cuda.is_available():
-    # CPU Platform
-    sglang_simulator_hook.install_module_hooks(
-        [sgl_kernel_hook.M_SGLangKernelLoadUtilHook]
-    )
-sglang_simulator_hook.install_class_hooks(
-    [
-        scheduler.C_SchedulerHook,
-        scheduler.C_SglangPrefillAdderHook,
-        scheduler.C_SchedulerRequestReceiver,
-        model_runner.C_ModelRunnerHook,
-        hicache_storage.C_StorageBackendFactory,
-        cache_controller.C_HiCacheController,
-        mem_pool.C_DeepSeekV4SingleKVPoolHook,
-        mem_pool.C_MambaPoolHook,
-        hiradix_cache.C_HiRadixCacheHook,
-        mem_cache_allocator.C_PagedTokenToKVPoolAllocatorHook,
-        mem_pool_host.C_HostKVCacheHook,
-    ]
-)
+init_hook()
 
 
 logger = get_logger("sgl_simulator")
