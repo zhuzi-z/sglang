@@ -8,6 +8,7 @@ from dataclasses import asdict
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
+from sglang_simulator.simulation.manager.l3_io_log import L3IOLog
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
@@ -489,6 +490,14 @@ class C_SchedulerHook(BaseHook):
                         for item in stats:
                             f.write(json.dumps(asdict(item)) + "\n")
 
+                    # L3 (HiCache storage) IO log — only rank 0 writes to disk
+                    # to avoid races when tp_size > 1 (other ranks still reset
+                    # their per-process L3IOLog below to free memory).
+                    if getattr(self, "tp_rank", 0) == 0:
+                        with open(f"{output_dir}/l3_io.jsonl", "w") as f:
+                            for item in L3IOLog.drain():
+                                f.write(json.dumps(item) + "\n")
+
                     logger.info(f"Simulation results saved to {output_dir}.")
 
                 except Exception as e:
@@ -499,6 +508,7 @@ class C_SchedulerHook(BaseHook):
             StateManager.reset()
             request_stats_manager.reset()
             C_SchedulerHook.ITERATION_STATS.clear()
+            L3IOLog.reset()
             C_SchedulerHook.LAST_CPU_TS = 0
             C_SchedulerHook.LAST_FLUSH_TS = time.time()
             C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST = 0

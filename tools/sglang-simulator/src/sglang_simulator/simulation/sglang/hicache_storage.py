@@ -4,6 +4,7 @@ from typing import Any, List, Optional
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import StateManager
+from sglang_simulator.simulation.manager.l3_io_log import L3IOLog
 from sglang_simulator.utils.logger import get_logger
 
 logger = get_logger("hisim")
@@ -27,6 +28,26 @@ def _extract_prefix_keys(extra_info) -> Optional[list]:
         return None
     # tolerate tuple/list
     return list(pk)
+
+
+def _record_io(*, op: str, api: str, pool: str, keys: list,
+               hits=None, prefix_keys=None, hit_policy=None,
+               page_size: int = _DEFAULT_PAGE_SIZE) -> None:
+    """Append one L3 IO record. Per-batch (not per-key) to keep volume sane."""
+    L3IOLog.append({
+        "ts": StateManager.get_global_clock(),
+        "wall_ts": time.time(),
+        "iteration": StateManager.get_iteration(),
+        "op": op,
+        "api": api,
+        "pool": pool,
+        "hit_policy": hit_policy,
+        "page_size": page_size,
+        "n_keys": len(keys),
+        "keys": list(keys),
+        "hits": hits,
+        "prefix_keys": prefix_keys,
+    })
 
 
 def _pool_name_str(name) -> str:
@@ -129,6 +150,8 @@ class MockHiCacheStorage:
         if not existed:
             kv.add(key)
             self._persist(_KV_POOL_NAME, [key])
+        _record_io(op="set", api="v1", pool=_KV_POOL_NAME, keys=[key],
+                   hits=[not existed])
         return True
 
     def batch_set(
@@ -145,10 +168,15 @@ class MockHiCacheStorage:
         kv.update(new_keys)
         self._persist(_KV_POOL_NAME, new_keys)
         # hits = "was newly written" per key (True = freshly added to L3)
+        _record_io(op="set", api="v1", pool=_KV_POOL_NAME, keys=keys,
+                   hits=[not e for e in existed],
+                   prefix_keys=_extract_prefix_keys(extra_info))
         return True
 
     def exists(self, key: str) -> bool:
         present = key in self._pool_set(_KV_POOL_NAME)
+        _record_io(op="exists", api="v1", pool=_KV_POOL_NAME, keys=[key],
+                   hits=[present])
         return present
 
     def batch_exists(self, keys: List[str], extra_info=None) -> int:
@@ -159,6 +187,9 @@ class MockHiCacheStorage:
             if k not in kv:
                 break
             hit_len += 1
+        _record_io(op="exists", api="v1", pool=_KV_POOL_NAME, keys=keys,
+                   hits=hit_len,
+                   prefix_keys=_extract_prefix_keys(extra_info))
         return hit_len
 
     def clear(self) -> bool:
@@ -233,11 +264,16 @@ class MockHiCacheStorage:
 
         # Emit one record per pool_transfer so consumers can see per-pool hits.
         prefix = _extract_prefix_keys(extra_info)
+        _record_io(op="exists", api="v2", pool=_KV_POOL_NAME, keys=keys,
+                   hits=kv_pages, prefix_keys=prefix)
         for transfer in pool_transfers or []:
             pool_name = _pool_name_str(getattr(transfer, "name", None))
             policy = getattr(transfer, "hit_policy", None)
             policy_value = getattr(policy, "value", policy)
             t_keys = getattr(transfer, "keys", None) or []
+            _record_io(op="exists", api="v2", pool=pool_name, keys=t_keys,
+                       hits=hit_count.get(pool_name, 0),
+                       hit_policy=policy_value, prefix_keys=prefix)
 
         # Try to return the real PoolTransferResult so consumers that
         # dataclass-introspect it (e.g. metrics) work; fall back to a
@@ -265,6 +301,9 @@ class MockHiCacheStorage:
             policy_value = getattr(policy, "value", policy)
             per_key_hits = [k in pool for k in t_keys]
             results[pool_name] = per_key_hits
+            _record_io(op="get", api="v2", pool=pool_name, keys=t_keys,
+                       hits=per_key_hits, hit_policy=policy_value,
+                       prefix_keys=prefix)
         return results
 
     def batch_set_v2(self, pool_transfers, extra_info=None) -> dict:
@@ -283,4 +322,7 @@ class MockHiCacheStorage:
             self._persist(pool_name, new_keys)
             results[pool_name] = [True] * len(t_keys)
             # hits[i]=True ⇒ this key was newly written this call (was missing)
+            _record_io(op="set", api="v2", pool=pool_name, keys=t_keys,
+                       hits=[not e for e in existed], hit_policy=policy_value,
+                       prefix_keys=prefix)
         return results

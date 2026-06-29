@@ -260,6 +260,31 @@ class C_HiCacheController(BaseHook):
                             else 0
                         )
 
+
+                    # Record op=get for the L3 read this prefetch represents.
+                    # Simulator's handle_prefetch_operation skips the real
+                    # _page_transfer (only times it), so MockHiCacheStorage's
+                    # batch_get is never called for v1 models. We emit the
+                    # record here using the hit hashes from _storage_hit_query
+                    # so v1-path models (GLM-5.1 / HiRadixCache / plain MLA/MHA)
+                    # also surface op=get in l3_io.jsonl.
+                    if storage_hit_count > 0:
+                        from sglang_simulator.simulation.sglang.hicache_storage import (
+                            _record_io,
+                        )
+                        hit_pages = list(operation.hash_value)
+                        _record_io(
+                            op="get",
+                            api="v1",
+                            pool="kv",
+                            keys=hit_pages,
+                            hits=[True] * len(hit_pages),
+                            prefix_keys=(
+                                list(operation.prefix_keys)
+                                if operation.prefix_keys is not None
+                                else None
+                            ),
+                        )
                     remain_dur, done = C_HiCacheController.drain_operation(
                         operation, storage_hit_count, remain_dur, kv_bytes, disk_bw
                     )
