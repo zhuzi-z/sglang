@@ -169,6 +169,7 @@ class PDDisaggBenchmarkRunner(BaseBenchmarkRunner):
         dataset: BaseDataset,
     ):
         for worker in self.all_workers:
+            worker.reset_stats()
             await worker.trigger_simulation()
             await worker.pause_generation()
 

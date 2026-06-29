@@ -14,6 +14,10 @@ class BaseWorker:
     def get_request_stats(self) -> list[dict]:
         pass
 
+    def reset_stats(self):
+        """Reset per-request stats for the next benchmark round."""
+        pass
+
     def get_iteration_stats(self) -> list[dict]:
         pass
 

@@ -63,6 +63,7 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
     ):
 
         for worker in self.workers:
+            worker.reset_stats()
             await worker.trigger_simulation()
             await worker.pause_generation()
 

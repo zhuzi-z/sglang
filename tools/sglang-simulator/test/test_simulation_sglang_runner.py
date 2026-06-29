@@ -8,7 +8,7 @@ from sglang_simulator.simulation.benchmark import BenchmarkConfig
 from transformers import AutoTokenizer
 
 os.environ["SGLANG_SIMULATOR_CONFIG_PATH"] = (
-    os.path.dirname(__file__) + "/assets/config.json"
+    os.path.dirname(__file__) + "/assets/config_sglang.json"
 )
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
