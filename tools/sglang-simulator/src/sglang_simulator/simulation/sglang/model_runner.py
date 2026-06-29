@@ -238,12 +238,119 @@ class C_ModelRunnerHook(BaseHook):
             batch = args[0]
             from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-            output = LogitsProcessorOutput(
-                next_token_logits=torch.empty(
-                    size=(batch.batch_size, self.model_config.vocab_size),
+            bs = batch.batch_size
+            output_kwargs = {
+                "next_token_logits": torch.empty(
+                    size=(bs, self.model_config.vocab_size),
                     device=self.device,
                 )
-            )
+            }
+
+            # Populate fake logprob fields when any request asks for logprobs.
+            # The simulator does not run real forward; without this, downstream
+            # code in scheduler_output_processor_mixin and tokenizer_manager
+            # would either raise AssertionError or build a broken meta_info
+            # missing keys like ``output_token_logprobs``.
+            #
+            # NOTE: ``batch`` here is a ``ForwardBatch`` (not a ScheduleBatch),
+            # so per-request lengths must be read from ``extend_seq_lens_cpu``
+            # and ``extend_logprob_start_lens_cpu`` rather than ``batch.reqs``.
+            if getattr(batch, "return_logprob", False):
+                output_kwargs["next_token_logprobs"] = torch.zeros(
+                    bs, device=self.device, dtype=torch.float32
+                )
+
+                # For prefill batches, build input_token_logprobs as a flat
+                # tensor whose length equals the sum of per-request logprob
+                # positions (extend_seq_len - extend_logprob_start_len).
+                per_req_num = [0] * bs
+                total_input = 0
+                if batch.forward_mode.is_extend():
+                    seq_lens = getattr(batch, "extend_seq_lens_cpu", None) or []
+                    start_lens = (
+                        getattr(batch, "extend_logprob_start_lens_cpu", None) or []
+                    )
+                    for i in range(min(bs, len(seq_lens))):
+                        end = seq_lens[i] or 0
+                        start = start_lens[i] if i < len(start_lens) else 0
+                        per_req_num[i] = max(0, end - (start or 0))
+                    total_input = sum(per_req_num)
+                # Always set input_token_logprobs (even if 0 elements) so that
+                # the downstream assertion `assert output.input_token_logprobs is not None`
+                # never fires.
+                output_kwargs["input_token_logprobs"] = torch.zeros(
+                    total_input, device=self.device, dtype=torch.float32
+                )
+
+                # Top-k logprobs: only if requested by any request in the batch.
+                # SGLang's scheduler_output_processor_mixin.py:222-227 calls
+                # ``.tolist()`` on each entry of next_token_top_logprobs_val/idx,
+                # so each per-request entry must be a torch.Tensor (not a list).
+                top_k_nums = getattr(batch, "top_logprobs_nums", None) or [0] * bs
+                if any(k > 0 for k in top_k_nums):
+                    # Use non-zero values: bool(tensor([0.0])) is False in
+                    # PyTorch, which causes detokenize_top_logprobs_tokens to
+                    # treat the entry as empty and append None, crashing
+                    # _process_logprobs_tokens with 'NoneType' has no attribute 'items'.
+                    output_kwargs["next_token_top_logprobs_val"] = [
+                        torch.ones(k, device=self.device, dtype=torch.float32)
+                        for k in top_k_nums
+                    ]
+                    output_kwargs["next_token_top_logprobs_idx"] = [
+                        torch.zeros(k, device=self.device, dtype=torch.int64)
+                        for k in top_k_nums
+                    ]
+                    # Input top logprobs are nested Python lists in SGLang's
+                    # logits_processor output (process_input_logprobs builds
+                    # list-of-lists), so plain lists are fine here.
+                    output_kwargs["input_top_logprobs_val"] = [
+                        [[0.0] * top_k_nums[i] for _ in range(per_req_num[i])]
+                        for i in range(bs)
+                    ]
+                    output_kwargs["input_top_logprobs_idx"] = [
+                        [[0] * top_k_nums[i] for _ in range(per_req_num[i])]
+                        for i in range(bs)
+                    ]
+
+                # token_ids_logprob: per-request fixed-vocab logprob list.
+                # next_token_token_ids_logprobs_val also calls .tolist() at
+                # line 230-231, so it must be tensors. The idx list is plain
+                # Python list of ints (line 144 in logprob.py).
+                token_ids_logprobs = getattr(batch, "token_ids_logprobs", None)
+                if token_ids_logprobs is not None and any(
+                    ids is not None and len(ids) > 0 for ids in token_ids_logprobs
+                ):
+                    def _n(ids):
+                        return len(ids) if ids else 0
+
+                    output_kwargs["next_token_token_ids_logprobs_val"] = [
+                        torch.ones(
+                            _n(token_ids_logprobs[i]),
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                        for i in range(bs)
+                    ]
+                    output_kwargs["next_token_token_ids_logprobs_idx"] = [
+                        list(token_ids_logprobs[i]) if token_ids_logprobs[i] else []
+                        for i in range(bs)
+                    ]
+                    output_kwargs["input_token_ids_logprobs_val"] = [
+                        [
+                            [0.0] * _n(token_ids_logprobs[i])
+                            for _ in range(per_req_num[i])
+                        ]
+                        for i in range(bs)
+                    ]
+                    output_kwargs["input_token_ids_logprobs_idx"] = [
+                        [
+                            list(token_ids_logprobs[i]) if token_ids_logprobs[i] else []
+                            for _ in range(per_req_num[i])
+                        ]
+                        for i in range(bs)
+                    ]
+
+            output = LogitsProcessorOutput(**output_kwargs)
             from sglang.srt.model_executor.model_runner import ModelRunnerOutput
 
             return ModelRunnerOutput(
