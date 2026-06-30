@@ -11,6 +11,7 @@ from sglang_simulator.spec import AcceleratorInfo, DataType, ModelInfo
 from sglang_simulator.time_predictor import (
     AIConfiguratorTimePredictor,
     FixedTimePredictor,
+    GBRTimePredictor,
     InferTimePredictor,
 )
 from sglang_simulator.utils import get_logger
@@ -205,6 +206,15 @@ class ConfigManager:
                 decode_overhead_ms=predictor_config.get(
                     "decode_overhead_ms", 0.0
                 ),
+            )
+        elif predictor_config.get("name") == "gbr":
+            return GBRTimePredictor(
+                model,
+                hw=hw,
+                config=sched_config,
+                database_path=predictor_config.get("database_path", ""),
+                model_path=predictor_config.get("model_path"),
+                decode_latency=predictor_config.get("decode_latency", 0.02),
             )
         else:
             raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")

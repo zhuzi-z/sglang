@@ -9,6 +9,9 @@ from sglang_simulator.time_predictor.base import (
 from sglang_simulator.time_predictor.fixed import (
     FixedTimePredictor,
 )
+from sglang_simulator.time_predictor.gbr import (
+    GBRTimePredictor,
+)
 
 __all__ = (
     ScheduleRequest,
@@ -16,4 +19,5 @@ __all__ = (
     InferTimePredictor,
     AIConfiguratorTimePredictor,
     FixedTimePredictor,
+    GBRTimePredictor,
 )
