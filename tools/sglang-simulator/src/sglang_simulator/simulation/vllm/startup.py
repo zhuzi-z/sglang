@@ -9,6 +9,7 @@ import sglang_simulator.hook as sglang_simulator_hook
 from sglang_simulator.simulation.vllm import (
     kv_connector,
     kv_offload,
+    platform,
     scheduler,
     worker,
 )
@@ -18,6 +19,9 @@ def init_hook():
     """Install all vLLM hooks. Must be called before importing vllm."""
     sglang_simulator_hook.install_class_hooks(
         [
+            # Platform hook — intercepts Platform class definition to inject
+            # _MockCudaPlatform before any platform detection runs.
+            platform.C_VLLMPlatformHook,
             # Worker hook (handles everything — no model_runner hooks needed)
             worker.C_VLLMWorkerHook,
             # Scheduler hook for time prediction

@@ -250,7 +250,18 @@ class C_VLLMWorkerHook(BaseHook):
                 kv_connector.clear_connector_metadata()
                 output.kv_connector_output = kv_output
 
+            # Store for sample_tokens (used in batch_queue/async mode)
+            self._last_model_output = output
             return output
+
+        def override_sample_tokens(self, grammar_output):
+            """Return the mock output built by execute_model.
+
+            In batch_queue mode, sample_tokens is called separately from
+            execute_model. Return the stored output from the last execute_model
+            call (both run on the same worker sequentially).
+            """
+            return self._last_model_output
 
         def override_sleep(self, level=1):
             pass
@@ -266,5 +277,6 @@ class C_VLLMWorkerHook(BaseHook):
         target.initialize_from_config = override_initialize_from_config
         target.compile_or_warm_up_model = override_compile_or_warm_up_model
         target.execute_model = override_execute_model
+        target.sample_tokens = override_sample_tokens
         target.sleep = override_sleep
         target.wake_up = override_wake_up

@@ -39,6 +39,8 @@ class VLLMServingRunner:
             "--enforce-eager",
             "--block-size", "16",
             "--gpu-memory-utilization", "0.9",
+            "--max-model-len", "8192",
+            "--num-gpu-blocks-override", "1000000",
         ]
         for k, v in extra_args.items():
             flag = "--" + k.replace("_", "-")
