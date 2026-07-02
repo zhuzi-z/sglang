@@ -80,6 +80,9 @@ class VLLMWorker(BaseWorker):
         )
         logger.info("[VLLMWorker] Initialized with model=%s", engine_args.model)
 
+        # Detect API availability: newer vLLM has enqueue/wait_for_completion
+        self._has_enqueue_api = hasattr(self._llm, "enqueue")
+
         # Async state
         self._completed_reqs: list[tuple[GenericRequest, object]] = []
         self._executor = ThreadPoolExecutor(max_workers=1)
@@ -88,10 +91,13 @@ class VLLMWorker(BaseWorker):
         self._batch_outputs: list = []
         self._batch_processed = False
         self._batch_lock = asyncio.Lock()
+        # For generate()-based fallback: collect prompts/params
+        self._batch_prompts: list = []
+        self._batch_sampling_params: list = []
 
     # ------------------------------------------------------------------
     # Async interface (for MultiInstanceBenchmarkRunner)
-    # Uses vLLM native enqueue() + wait_for_completion() API
+    # Supports both enqueue/wait_for_completion (v0.23+) and generate() fallback
     # ------------------------------------------------------------------
 
     async def trigger_simulation(self, output_dir: str | None = None):
@@ -99,13 +105,15 @@ class VLLMWorker(BaseWorker):
         self._enqueue_count = 0
         self._batch_outputs = []
         self._batch_processed = False
+        self._batch_prompts = []
+        self._batch_sampling_params = []
 
     async def pause_generation(self):
         """Called at the start of each benchmark round; clear previous stats."""
         self._completed_reqs = []
 
     async def async_generate(self, req: GenericRequest):
-        """Enqueue a request and coordinate batch wait_for_completion."""
+        """Enqueue a request and coordinate batch processing."""
         # Pass simulation metadata (created_time) via extra_args
         extra_args = None
         if req.custom_params:
@@ -122,22 +130,37 @@ class VLLMWorker(BaseWorker):
         )
         prompt = _resolve_prompt(req)
 
-        # enqueue() is sync & fast: adds to engine queue without processing
-        self._llm.enqueue(prompt, sp)
+        if self._has_enqueue_api:
+            # Newer vLLM: enqueue() is sync & fast, adds to engine queue
+            self._llm.enqueue(prompt, sp)
+        else:
+            # Older vLLM: collect for batch generate()
+            self._batch_prompts.append(prompt)
+            self._batch_sampling_params.append(sp)
+
         my_index = self._enqueue_count
         self._enqueue_count += 1
 
         # Yield to let all other concurrent tasks enqueue first
         await asyncio.sleep(0)
 
-        # First task to acquire lock triggers wait_for_completion for entire batch
+        # First task to acquire lock triggers batch processing
         async with self._batch_lock:
             if not self._batch_processed:
                 loop = asyncio.get_event_loop()
-                self._batch_outputs = await loop.run_in_executor(
-                    self._executor,
-                    lambda: self._llm.wait_for_completion(use_tqdm=True),
-                )
+                if self._has_enqueue_api:
+                    self._batch_outputs = await loop.run_in_executor(
+                        self._executor,
+                        lambda: self._llm.wait_for_completion(use_tqdm=True),
+                    )
+                else:
+                    # Fallback: use generate() with collected batch
+                    prompts = self._batch_prompts
+                    params = self._batch_sampling_params
+                    self._batch_outputs = await loop.run_in_executor(
+                        self._executor,
+                        lambda: self._llm.generate(prompts, params, use_tqdm=True),
+                    )
                 self._batch_processed = True
 
         output = self._batch_outputs[my_index]

@@ -14,6 +14,28 @@ from sglang_simulator.utils import get_logger
 logger = get_logger()
 
 
+class _ModelRunnerStub:
+    """Picklable stub for model_runner (must be module-level for multiprocess)."""
+
+    def __init__(self, kv_spec=None):
+        self._kv_spec = kv_spec
+        self.model_memory_usage = 0
+
+    def get_kv_cache_spec(self):
+        return self._kv_spec
+
+    def __getattr__(self, name):
+        # Any attribute not explicitly defined returns a no-op callable
+        if name.startswith('_'):
+            raise AttributeError(name)
+        return _noop
+
+
+def _noop(*args, **kwargs):
+    """Module-level no-op function (picklable)."""
+    return None
+
+
 def _build_kv_cache_spec(vllm_config) -> dict:
     """Build KV cache spec from HF model config (no model construction).
 
@@ -28,7 +50,17 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     """
     import torch
     from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
-    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+    # MambaAttentionBackendEnum moved between vLLM versions
+    try:
+        from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+        _mamba_gdn_type = MambaAttentionBackendEnum.GDN_ATTN
+    except (ImportError, ModuleNotFoundError):
+        try:
+            from vllm.attention.backends.registry import MambaAttentionBackendEnum
+            _mamba_gdn_type = MambaAttentionBackendEnum.GDN_ATTN
+        except (ImportError, ModuleNotFoundError):
+            _mamba_gdn_type = None
 
     model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
@@ -68,14 +100,30 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     if mamba_block_size is None:
         mamba_block_size = block_size
 
-    mamba_spec = MambaSpec(
+    # Build MambaSpec - constructor varies between vLLM versions:
+    # - Public vLLM v0.23: MambaSpec(shapes, dtypes, block_size, ..., mamba_type=Enum)
+    # - Modified vLLM: MambaSpec(block_size, shapes, dtypes, ..., mamba_type=str)
+    import dataclasses
+    mamba_kwargs = dict(
+        block_size=mamba_block_size,
         shapes=((1, 1), (1, 1, 1)),
         dtypes=(dtype, dtype),
-        block_size=mamba_block_size,
         page_size_padded=attn_page_size,
-        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
         mamba_cache_mode=getattr(cache_config, "mamba_cache_mode", "none"),
     )
+    # Determine mamba_type based on what the class expects
+    mamba_type_field = next(
+        (f for f in dataclasses.fields(MambaSpec) if f.name == "mamba_type"), None
+    )
+    if mamba_type_field is not None:
+        if mamba_type_field.type == str or mamba_type_field.type == "str":
+            # String-based mamba_type (modified vLLM)
+            mamba_kwargs["mamba_type"] = "gdn_attention"
+        elif _mamba_gdn_type is not None:
+            # Enum-based mamba_type (public vLLM)
+            mamba_kwargs["mamba_type"] = _mamba_gdn_type
+
+    mamba_spec = MambaSpec(**mamba_kwargs)
 
     kv_cache_spec: dict = {}
     for i, layer_type in enumerate(layer_types):
@@ -130,23 +178,16 @@ class C_VLLMWorkerHook(BaseHook):
             self.device = torch.device("cpu")
 
             # Stub model_runner — provides get_kv_cache_spec; all other
-            # method calls are no-ops.
-            class _Stub:
-                def __getattr__(self, name):
-                    return lambda *a, **kw: None
-
-            stub = _Stub()
+            # method calls are no-ops. Uses module-level class for picklability.
             kv_spec = _build_kv_cache_spec(self.vllm_config)
-            stub.get_kv_cache_spec = lambda: kv_spec
-            stub.model_memory_usage = 0
-            self.model_runner = stub
+            self.model_runner = _ModelRunnerStub(kv_spec=kv_spec)
 
             self.init_snapshot = None
             self.requested_memory = 0
             init_workspace_manager(self.device, 1)
             logger.info("[vLLM Hijack] Worker.init_device: stub initialized")
 
-        def override_load_model(self, **kwargs):
+        def override_load_model(self, *args, **kwargs):
             """Skip model loading entirely (no real model needed)."""
             logger.info("[vLLM Hijack] Worker.load_model: skipped")
 
@@ -193,7 +234,18 @@ class C_VLLMWorkerHook(BaseHook):
             )
 
             self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
-            ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+            # Skip worker_init (hybrid_connector) which requires CUDA
+            try:
+                import vllm.v1.hybrid_connector.engine_proxy as _engine_proxy
+                _orig_worker_init = _engine_proxy.worker_init
+                _engine_proxy.worker_init = lambda *a, **kw: None
+            except (ImportError, AttributeError):
+                _orig_worker_init = None
+            try:
+                ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+            finally:
+                if _orig_worker_init is not None:
+                    _engine_proxy.worker_init = _orig_worker_init
             logger.info(
                 "[vLLM Hijack] Worker.initialize_from_config: "
                 "KV connector initialized, num_blocks=%d",
@@ -202,10 +254,15 @@ class C_VLLMWorkerHook(BaseHook):
 
         def override_compile_or_warm_up_model(self):
             """Skip compilation and warmup entirely."""
-            from vllm.v1.worker.worker_base import CompilationTimes
-
             logger.info("[vLLM Hijack] Worker.compile_or_warm_up_model: skipped")
-            return CompilationTimes(language_model=0.0, encoder=0.0)
+            # Return type varies by vLLM version:
+            # - Public v0.23: returns CompilationTimes dataclass
+            # - Modified versions: returns None
+            try:
+                from vllm.v1.worker.worker_base import CompilationTimes
+                return CompilationTimes(language_model=0.0, encoder=0.0)
+            except ImportError:
+                return None
 
         def override_get_supported_tasks(self):
             """Return generate task (default for causal LM)."""
@@ -229,13 +286,22 @@ class C_VLLMWorkerHook(BaseHook):
 
             # Build mock output
             req_ids = list(num_scheduled_tokens.keys()) if num_scheduled_tokens else []
-            output = _ModelRunnerOutput(
+            # Build kwargs for ModelRunnerOutput (cross-version compat)
+            mro_kwargs = dict(
                 req_ids=req_ids,
                 req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
                 sampled_token_ids=[[1] for _ in req_ids],
                 logprobs=None,
                 prompt_logprobs_dict={},
             )
+            # Newer vLLM versions require kv_lens and pooler_output
+            import dataclasses as _dc
+            _mro_fields = {f.name for f in _dc.fields(_ModelRunnerOutput)}
+            if "kv_lens" in _mro_fields:
+                mro_kwargs["kv_lens"] = [0] * len(req_ids)
+            if "pooler_output" in _mro_fields:
+                mro_kwargs["pooler_output"] = [None] * len(req_ids)
+            output = _ModelRunnerOutput(**mro_kwargs)
 
             # KV connector post-forward
             if kv_connector is not None:

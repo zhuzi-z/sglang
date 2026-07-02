@@ -33,24 +33,60 @@ def run_vllm_benchmark(engine_args: dict):
     worker = VLLMWorker(engine_args=EngineArgs(**engine_args))
     runner = MultiInstanceBenchmarkRunner(workers=[worker])
 
+    # Detect effective block_size (may be auto-adjusted for hybrid models)
+    effective_block_size = engine_args.get("block_size", 16)
+    try:
+        effective_block_size = worker._llm.llm_engine.cache_config.block_size
+    except (AttributeError, TypeError):
+        pass
+    max_model_len = engine_args.get("max_model_len", 2048)
+    # Prefix caching requires at least 2 full blocks AND prompts must fit in max_model_len
+    min_required_input = effective_block_size * 4 + 1
+    can_test_prefix_cache = (effective_block_size < max_model_len) and (min_required_input <= max_model_len)
+
     # Benchmark settings
     benchmark_config = BenchmarkConfig(request_rate=10, ignore_request_timestamp=True)
 
-    # Build random requests aligned to block_size=16
+    # Build random requests aligned to effective block_size
     tokenizer = AutoTokenizer.from_pretrained(engine_args["model"])
+
+    if not can_test_prefix_cache:
+        # Hybrid model with huge block_size: just test basic completions
+        print(f"[SKIP] Prefix cache tests: effective block_size={effective_block_size} >= max_model_len={max_model_len}")
+        dataset_args = DatasetArgs(
+            "random_ids", num_prompts=4,
+            min_input_len=16, max_input_len=32,
+            min_output_len=1, max_output_len=2,
+        )
+        dataset = get_dataset(dataset_args, tokenizer=tokenizer)
+        metrics = runner.benchmark(benchmark_config, dataset=SimpleDataset(reqs=dataset))
+        assert metrics["completed"] == len(dataset)
+        runner.shutdown()
+        return
+
+    # Ensure prompts span enough full blocks for high cache ratio
+    min_input = effective_block_size * 4 + 1
+    max_input = min_input + 1
+    # Calculate how many prompts needed to evict all cached blocks
+    blocks_per_prompt = min_input // effective_block_size
+    num_gpu_blocks = engine_args.get("num_gpu_blocks_override", 100)
+    num_cached = 8
+    # Need enough eviction prompts to overflow the cache
+    evict_prompts_needed = (num_gpu_blocks // blocks_per_prompt) + 1
+    num_prompts = num_cached + 2 + evict_prompts_needed  # cached + gap + eviction
     dataset_args = DatasetArgs(
         "random_ids",
-        num_prompts=40,
-        min_input_len=65,  # [:64] => align with block_size=16 (4 full blocks)
-        max_input_len=66,
+        num_prompts=num_prompts,
+        min_input_len=min_input,
+        max_input_len=max_input,
         min_output_len=1,
         max_output_len=2,
     )
     dataset = get_dataset(dataset_args, tokenizer=tokenizer)
 
     # Split requests for cache tests
-    cached_ds = SimpleDataset(reqs=dataset[:8])
-    evict_l1_ds = SimpleDataset(reqs=dataset[10:30])
+    cached_ds = SimpleDataset(reqs=dataset[:num_cached])
+    evict_l1_ds = SimpleDataset(reqs=dataset[num_cached + 2:])
 
     # First run: warm up cache (populates both L1 GPU and L2 CPU)
     metrics = runner.benchmark(benchmark_config, dataset=cached_ds)
@@ -92,8 +128,9 @@ def test_vllm_benchmark():
         "block_size": 16,
         "gpu_memory_utilization": 0.9,
         "kv_offloading_size": 4.0,
-        "num_gpu_blocks_override": 100,
-        "max_model_len": 128,
+        "kv_offloading_backend": "native",
+        "num_gpu_blocks_override": 200,
+        "max_model_len": 2048,
         "enable_prefix_caching": True,
     }
 

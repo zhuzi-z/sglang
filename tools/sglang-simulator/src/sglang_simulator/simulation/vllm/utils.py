@@ -28,7 +28,11 @@ def resolve_model_info(model_config: "ModelConfig") -> ModelInfo:
         context_len=model_config.max_model_len,
         hidden_size=model_config.get_hidden_size(),
         head_dim=head_dim,
-        num_attention_heads=model_config.model_arch_config.total_num_attention_heads,
+        num_attention_heads=(
+            model_config.model_arch_config.total_num_attention_heads
+            if hasattr(model_config, "model_arch_config")
+            else hf_config.num_attention_heads
+        ),
         num_hidden_layers=model_config.get_total_num_hidden_layers(),
         num_key_value_heads=model_config.get_total_num_kv_heads(),
         v_head_dim=getattr(hf_config, "v_head_dim", head_dim),

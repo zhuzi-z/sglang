@@ -126,7 +126,7 @@ class C_VLLMSchedulerHook(BaseHook):
                 # OFFLINE mode: hold in future_queue
                 # Register request in self.requests (needed for engine tracking)
                 # but do NOT enqueue to waiting yet
-                if request.resumable:
+                if getattr(request, "resumable", False):
                     request.streaming_queue = deque()
                 self.requests[request.request_id] = request
 
@@ -151,7 +151,10 @@ class C_VLLMSchedulerHook(BaseHook):
             current_time = StateManager.get_global_clock()
             while future_queue and future_queue[0][0] <= current_time:
                 _, _, request = heapq.heappop(future_queue)
-                self._enqueue_waiting_request(request)
+                if hasattr(self, "_enqueue_waiting_request"):
+                    self._enqueue_waiting_request(request)
+                else:
+                    self.waiting.add_request(request)
                 # Record queue_start = time when request enters the waiting queue
                 rid = request.request_id
                 ct = req_created_time.get(rid, current_time)
@@ -200,6 +203,7 @@ class C_VLLMSchedulerHook(BaseHook):
                     if request is not None:
                         total_hit_len = request.num_computed_tokens - num_tokens
                         host_hit_len = 0
+                        # Try prefill_stats (public vLLM) or num_external_computed_tokens (modified vLLM)
                         if (
                             hasattr(request, "prefill_stats")
                             and request.prefill_stats is not None
@@ -212,6 +216,10 @@ class C_VLLMSchedulerHook(BaseHook):
                                 )
                                 or 0
                             )
+                        if host_hit_len == 0:
+                            host_hit_len = getattr(
+                                request, "num_external_computed_tokens", 0
+                            ) or 0
                         if total_hit_len > 0 and req_id in cls.REQUEST_STATS:
                             cls.REQUEST_STATS[req_id]["final_device_hit_len"] = (
                                 total_hit_len

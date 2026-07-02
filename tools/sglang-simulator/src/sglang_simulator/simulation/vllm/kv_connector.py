@@ -88,16 +88,20 @@ class MockOffloadConnector:
         # Resolve hash_block_size for proper block_hashes indexing
         self.block_size = vllm_config.cache_config.block_size
         if kv_cache_config is not None:
-            from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
-
-            _, self.hash_block_size = resolve_kv_cache_block_sizes(
-                kv_cache_config, vllm_config
-            )
+            try:
+                from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+                _, self.hash_block_size = resolve_kv_cache_block_sizes(
+                    kv_cache_config, vllm_config
+                )
+            except (ImportError, AttributeError):
+                # Older/modified vLLM versions don't have this function
+                self.hash_block_size = self.block_size
         else:
             self.hash_block_size = self.block_size
 
         # Scheduler state
         self._pending_loads: set[str] = set()
+        self._load_kv_async: bool = True
 
         if role == KVConnectorRole.SCHEDULER:
             # Clear stale storage from previous engine instance
@@ -129,7 +133,9 @@ class MockOffloadConnector:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
-        """Report all pending loads as immediately finished."""
+        """Report pending loads as finished if load_kv_async=True."""
+        if not self._load_kv_async:
+            return None, None
         meta = self._connector_metadata
         finished_recving = (
             set(meta.load_req_ids) if meta is not None and meta.load_req_ids else None
@@ -227,7 +233,7 @@ class MockOffloadConnector:
             # to allocate blocks for this request (e.g. budget exhausted).
             # _pending_loads is populated in update_state_after_alloc() which
             # is called only after successful block allocation.
-            return hit_tokens, True
+            return hit_tokens, self._load_kv_async
         return 0, False
 
     def build_connector_meta(
@@ -278,6 +284,18 @@ class MockOffloadConnector:
         """
         if num_external_tokens > 0:
             self._pending_loads.add(request.request_id)
+
+    def on_add_req(self, req) -> bool:
+        return False
+
+    def on_abort_req(self, reqid: str, reason: str = "", output: bool = True, iscore=True):
+        pass
+
+    def has_requests(self) -> bool:
+        return False
+
+    def step(self):
+        return None
 
     def on_new_request(self, request: "Request") -> None:
         pass
