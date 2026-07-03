@@ -39,6 +39,9 @@ class C_VLLMPlatformHook(BaseHook):
             dispatch_key = "CUDA"
             device_control_env_var = "CUDA_VISIBLE_DEVICES"
 
+            # ---- Attributes accessed directly (not via method call) ----
+            empty_cache = None  # checked as `if empty_cache is not None`
+
             def is_cuda(self) -> bool:
                 # Return False to skip module-level CUDA ops checks
                 # (cutlass_scaled_mm_supports_fp8, etc.) that need libcuda.so.
@@ -47,9 +50,19 @@ class C_VLLMPlatformHook(BaseHook):
             def is_cuda_alike(self) -> bool:
                 return False
 
+            @property
+            def supported_dtypes(self):
+                return [torch.bfloat16, torch.float16, torch.float32]
+
             @classmethod
             def get_device_capability(cls, device_id=0):
-                return None
+                return (8, 0)  # A100 equivalent
+
+            @classmethod
+            def has_device_capability(
+                cls, capability: int, device_id: int = 0
+            ) -> bool:
+                return capability <= 80
 
             @classmethod
             def check_and_update_config(cls, vllm_config) -> None:
@@ -60,6 +73,11 @@ class C_VLLMPlatformHook(BaseHook):
                     )
 
             @classmethod
+            def pre_register_and_update(cls, parser=None) -> None:
+                """No-op: nothing to pre-register in simulation."""
+                pass
+
+            @classmethod
             def support_hybrid_kv_cache(cls) -> bool:
                 return True
 
@@ -68,18 +86,40 @@ class C_VLLMPlatformHook(BaseHook):
                 pass
 
             @classmethod
-            def set_device(cls, device: torch.device) -> None:
+            def set_device(cls, device) -> None:
                 """No-op: skip torch.cuda.set_device on CPU simulation."""
                 pass
 
             @classmethod
             def get_device_name(cls, device_id: int = 0) -> str:
-                return "MockCUDA"
+                return "NVIDIA A100-SXM4-80GB"
 
             @classmethod
             def get_device_total_memory(cls, device_id: int = 0) -> int:
                 """Return 80 GiB (A100 equivalent) for profiling calculations."""
                 return 80 * (1 << 30)
+
+            @classmethod
+            def get_attn_backend_cls(
+                cls, selected_backend, head_size, dtype,
+                kv_cache_dtype, block_size, use_v1, use_mla=False,
+            ):
+                return None
+
+            @classmethod
+            def verify_quantization(cls, quant: str) -> None:
+                pass
+
+            @classmethod
+            def get_current_memory_usage(cls, device=None) -> float:
+                return 0.0
+
+            def __getattr__(self, name):
+                """Fallback for any unimplemented platform method.
+                Returns a no-op callable to avoid AttributeError crashes."""
+                def _noop(*args, **kwargs):
+                    return None
+                return _noop
 
         # Use sys.modules directly: at hook time the parent module's attribute
         # binding is not yet complete, so `import vllm.platforms` would fail.
