@@ -72,6 +72,13 @@ class VLLMWorker(BaseWorker):
             if current == ea_default:
                 setattr(engine_args, field_name, sim_default)
 
+        # Set active worker_id for V6D RPC bypass ownership tracking
+        try:
+            from sglang_simulator.simulation.vllm.v6d_manager import set_active_worker_id
+            set_active_worker_id(name)
+        except ImportError:
+            pass
+
         self._llm = LLM(
             **{
                 f.name: getattr(engine_args, f.name)
@@ -79,6 +86,13 @@ class VLLMWorker(BaseWorker):
             }
         )
         logger.info("[VLLMWorker] Initialized with model=%s", engine_args.model)
+
+        # Clear active worker_id after init completes
+        try:
+            from sglang_simulator.simulation.vllm.v6d_manager import set_active_worker_id
+            set_active_worker_id(None)
+        except ImportError:
+            pass
 
         # Detect API availability: newer vLLM has enqueue/wait_for_completion
         self._has_enqueue_api = hasattr(self._llm, "enqueue")

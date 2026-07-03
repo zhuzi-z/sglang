@@ -63,7 +63,8 @@ class MockOffloadConnector:
     """
 
     # Shared storage instance (module-level singleton for in-process simulation)
-    _storage: set[str] = set()
+    # Shared storage: key -> owner_worker_id (for RPC bypass tracking)
+    _storage: dict[str, str] = {}
 
     def __init__(
         self,
@@ -103,9 +104,13 @@ class MockOffloadConnector:
         self._pending_loads: set[str] = set()
         self._load_kv_async: bool = True
 
+        # Capture active worker_id for RPC bypass ownership tracking
+        from sglang_simulator.simulation.vllm.v6d_manager import get_active_worker_id
+        self._worker_id = get_active_worker_id()
+
         if role == KVConnectorRole.SCHEDULER:
             # Clear stale storage from previous engine instance
-            MockOffloadConnector._storage.clear()
+            MockOffloadConnector._storage = {}
             logger.info(
                 "[MockOffloadConnector] SCHEDULER role, hash_block_size=%d",
                 self.hash_block_size,
@@ -217,11 +222,31 @@ class MockOffloadConnector:
         # Convert block hashes to string keys and do prefix match
         keys = [h.hex() if isinstance(h, bytes) else str(h) for h in remaining_hashes]
         hit_blocks = 0
+        local_hits = 0
+        remote_hits = 0
         for key in keys:
             if key not in self._storage:
                 break
             hit_blocks += 1
+            # Classify hit as local or remote (RPC bypass tracking)
+            owner = self._storage[key]
+            if self._worker_id and owner != self._worker_id:
+                remote_hits += 1
+            else:
+                local_hits += 1
         hit_tokens = hit_blocks * self.hash_block_size
+
+        # Record hit classification in V6dBlockOwnershipTracker
+        if hit_blocks > 0 and self._worker_id:
+            from sglang_simulator.simulation.vllm.v6d_manager import V6dBlockOwnershipTracker
+            if local_hits:
+                V6dBlockOwnershipTracker.record_hit(self._worker_id, "local", local_hits)
+            if remote_hits:
+                V6dBlockOwnershipTracker.record_hit(self._worker_id, "remote", remote_hits)
+                logger.info(
+                    "[RPC Bypass] Worker %s: cross-node hit! "
+                    "local=%d remote=%d (RPC bypassed)",
+                    self._worker_id, local_hits, remote_hits)
 
         # Cap to max allowed
         hit_tokens = min(hit_tokens, max_hit_tokens)
@@ -249,13 +274,16 @@ class MockOffloadConnector:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Store all block hashes for the finished request into cache storage."""
+        """Store all block hashes for the finished request into cache storage.
+
+        Records ownership (worker_id) for each block to enable RPC bypass
+        tracking: when another worker hits these blocks, it's a cross-node hit.
+        """
         if request.block_hashes:
-            keys = [
-                h.hex() if isinstance(h, bytes) else str(h)
-                for h in request.block_hashes
-            ]
-            self._storage.update(keys)
+            worker_id = self._worker_id or "unknown"
+            for h in request.block_hashes:
+                key = h.hex() if isinstance(h, bytes) else str(h)
+                self._storage[key] = worker_id
         return False, None
 
     def request_finished_all_groups(
@@ -264,13 +292,13 @@ class MockOffloadConnector:
         return self.request_finished(request, [])
 
     def reset_cache(self) -> bool | None:
-        MockOffloadConnector._storage.clear()
+        MockOffloadConnector._storage = {}
         return True
 
     @classmethod
     def reset_storage(cls):
         """Reset shared storage (for test isolation)."""
-        cls._storage = set()
+        cls._storage = {}
 
     # No-op scheduler stubs
     def update_state_after_alloc(
@@ -349,8 +377,20 @@ class C_KVConnectorFactoryHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
+        _original_create_connector = target.create_connector
+
         @classmethod
         def override_create_connector(cls, config, role, kv_cache_config):
+            # Allow real V6D connector through for V6D simulation testing
+            kv_transfer_config = getattr(config, "kv_transfer_config", None)
+            connector_name = getattr(kv_transfer_config, "kv_connector", None) if kv_transfer_config else None
+            if connector_name and "v6d" in connector_name.lower():
+                logger.info(
+                    "[KVConnector Hook] V6D connector (%s) detected: "
+                    "using MockOffloadConnector with RPC bypass tracking "
+                    "(V6D WebSocket RPC not available in CPU simulation)",
+                    connector_name,
+                )
             return MockOffloadConnector(config, role, kv_cache_config)
 
         target.create_connector = override_create_connector

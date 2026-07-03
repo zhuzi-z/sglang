@@ -70,6 +70,9 @@ class C_VLLMSchedulerHook(BaseHook):
             all_received = False
             req_created_time.clear()
             req_first_scheduled.clear()
+            # Per-instance tracking to avoid cross-worker contamination
+            self._sim_req_first_scheduled = set()
+            self._sim_req_created_time = {}
 
             original_init(self, vllm_config, *args, **kwargs)
             try:
@@ -193,8 +196,9 @@ class C_VLLMSchedulerHook(BaseHook):
                 else StateManager.get_global_clock()
             )
             for req_id, num_tokens in num_scheduled_tokens.items():
-                if req_id not in req_first_scheduled:
-                    req_first_scheduled.add(req_id)
+                _inst_first = getattr(self, "_sim_req_first_scheduled", req_first_scheduled)
+                if req_id not in _inst_first:
+                    _inst_first.add(req_id)
                     if req_id in cls.REQUEST_STATS:
                         cls.REQUEST_STATS[req_id]["queue_end"] = queue_end_time
                     # Track prefix cache hit: final_device_hit_len = total reused (L1+L2),

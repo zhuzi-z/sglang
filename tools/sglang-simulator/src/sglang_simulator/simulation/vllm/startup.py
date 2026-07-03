@@ -14,6 +14,10 @@ from sglang_simulator.simulation.vllm import (
     kv_offload,
     platform,
     scheduler,
+    v6d_backend,
+    v6d_manager,
+    v6d_swap,
+    v6d_worker,
     worker,
 )
 
@@ -104,5 +108,13 @@ def init_hook():
             kv_offload.C_VLLMSimpleCPUOffloadWorkerHook,
             # Native OffloadingConnectorWorker hook (default native path)
             kv_offload.C_VLLMOffloadingConnectorWorkerHook,
+            # V6D SwapHandler hook — replaces CUDA Stream/Event/DMA with CPU
+            v6d_swap.C_V6dSwapHandlerHook,
+            # V6D ObjectConnectorWorker hook — skips CUDA host registration
+            v6d_worker.C_V6dObjectConnectorWorkerHook,
+            # V6D ObjectBackend hook — replaces CUDA Event pool
+            v6d_backend.C_V6dObjectBackendHook,
+            # V6D ObjectManager hook — RPC bypass + ownership tracking
+            v6d_manager.C_V6dObjectManagerHook,
         ]
     )

@@ -27,6 +27,8 @@ class C_VLLMPlatformHook(BaseHook):
 
     @classmethod
     def hook(cls, target_class):
+        import torch
+
         iface = sys.modules["vllm.platforms.interface"]
         PlatformEnum = iface.PlatformEnum
 
@@ -64,6 +66,20 @@ class C_VLLMPlatformHook(BaseHook):
             @classmethod
             def manual_seed_all(cls, seed: int) -> None:
                 pass
+
+            @classmethod
+            def set_device(cls, device: torch.device) -> None:
+                """No-op: skip torch.cuda.set_device on CPU simulation."""
+                pass
+
+            @classmethod
+            def get_device_name(cls, device_id: int = 0) -> str:
+                return "MockCUDA"
+
+            @classmethod
+            def get_device_total_memory(cls, device_id: int = 0) -> int:
+                """Return 80 GiB (A100 equivalent) for profiling calculations."""
+                return 80 * (1 << 30)
 
         # Use sys.modules directly: at hook time the parent module's attribute
         # binding is not yet complete, so `import vllm.platforms` would fail.
