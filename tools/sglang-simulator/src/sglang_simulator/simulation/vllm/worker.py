@@ -298,11 +298,31 @@ class C_VLLMWorkerHook(BaseHook):
                 sched_config = resolve_scheduler_config(self.vllm_config)
                 ConfigManager.set_scheduler_config(sched_config)
                 available_bytes = profile_device_available_bytes(model, hw, sched_config)
-                logger.info(
-                    "[vLLM Hijack] Worker.determine_available_memory: "
-                    "profiled %d bytes (%.2f GiB)",
-                    available_bytes, available_bytes / (1 << 30),
-                )
+
+                # In CPU simulation, cap reported memory to avoid OOM from block
+                # metadata structures (prefix tree, block tables, free queues).
+                # Each block needs ~100-200 bytes of metadata in EngineCore.
+                # Physical RAM limit: use min(simulated, 4 GiB) to keep block
+                # count under ~1M, which needs ~200 MB metadata.
+                import psutil
+                phys_ram = psutil.virtual_memory().total
+                # Allow at most 25% of physical RAM for KV cache simulation
+                max_safe_bytes = int(phys_ram * 0.25)
+                if available_bytes > max_safe_bytes:
+                    logger.info(
+                        "[vLLM Hijack] Worker.determine_available_memory: "
+                        "capping simulated %d bytes (%.2f GiB) → %d bytes "
+                        "(%.2f GiB) to fit physical RAM (%d bytes)",
+                        available_bytes, available_bytes / (1 << 30),
+                        max_safe_bytes, max_safe_bytes / (1 << 30), phys_ram,
+                    )
+                    available_bytes = max_safe_bytes
+                else:
+                    logger.info(
+                        "[vLLM Hijack] Worker.determine_available_memory: "
+                        "profiled %d bytes (%.2f GiB)",
+                        available_bytes, available_bytes / (1 << 30),
+                    )
                 return available_bytes
             except Exception:
                 return 80 * (1 << 30)  # 80 GiB fallback
@@ -349,31 +369,39 @@ class C_VLLMWorkerHook(BaseHook):
 
             # Allocate CPU KV cache tensors for V6D mmap
             kv_caches: dict = {}
+            # CPU simulation: allocate MINIMAL tensors (1 page each) to avoid OOM.
+            # The full num_blocks count is preserved for scheduling/prefix logic,
+            # but we don't need actual KV data storage in simulation mode.
             if hasattr(kv_cache_config, "kv_cache_tensors") and \
                     kv_cache_config.kv_cache_tensors:
                 for kv_tensor in kv_cache_config.kv_cache_tensors:
+                    # Allocate only 1 page instead of full size
+                    minimal_size = min(kv_tensor.size, 4096)
                     tensor = torch.zeros(
-                        kv_tensor.size, dtype=torch.int8, device="cpu"
+                        minimal_size, dtype=torch.int8, device="cpu"
                     )
                     for layer_name in kv_tensor.shared_by:
                         kv_caches[layer_name] = tensor
                 logger.info(
-                    "[vLLM Hijack] Allocated %d CPU KV cache tensors "
-                    "(num_blocks=%d, total_bytes=%d)",
+                    "[vLLM Hijack] Allocated %d MINIMAL CPU KV cache tensors "
+                    "(num_blocks=%d, simulated_bytes=%d, actual_bytes=minimal)",
                     len(kv_cache_config.kv_cache_tensors), num_blocks,
                     sum(t.size for t in kv_cache_config.kv_cache_tensors),
                 )
             else:
                 kv_spec = self.model_runner.get_kv_cache_spec()
                 for layer_name, spec in kv_spec.items():
-                    tensor_size = num_blocks * spec.page_size_bytes
+                    # Allocate only 1 page instead of num_blocks * page_size
+                    minimal_size = min(spec.page_size_bytes, 4096)
                     tensor = torch.zeros(
-                        tensor_size, dtype=torch.int8, device="cpu"
+                        minimal_size, dtype=torch.int8, device="cpu"
                     )
                     kv_caches[layer_name] = tensor
                 logger.info(
-                    "[vLLM Hijack] Allocated %d CPU KV cache tensors "
-                    "(fallback, num_blocks=%d)", len(kv_caches), num_blocks,
+                    "[vLLM Hijack] Allocated %d MINIMAL CPU KV cache tensors "
+                    "(num_blocks=%d, page_size=%d, actual_alloc=minimal)",
+                    len(kv_caches), num_blocks,
+                    spec.page_size_bytes if kv_spec else 0,
                 )
 
             # Register with KV connector
