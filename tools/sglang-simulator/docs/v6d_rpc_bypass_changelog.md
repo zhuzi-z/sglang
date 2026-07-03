@@ -3,7 +3,7 @@
 > **项目**: sglang-hijack-sim / sglang-simulator  
 > **基线分支**: `/feat/vllm-pai`（同事提供的 vLLM 基础仿真框架）  
 > **增量范围**: KV Cache 全链路适配 + V6D 跨节点仿真  
-> **代码路径**: `/root/workspace/sglang-hijack-sim/tools/sglang-simulator/`  
+> **代码路径**: `tools/sglang-simulator/` (in sglang repo)  
 > **环境**: pai_vllm_v6d_1 (10.0.240.195:6677), pai_vllm_v6d_2 (10.0.42.92:6678)
 
 ---
@@ -394,39 +394,91 @@ set_active_worker_id(None)
 
 ---
 
-## 5. 跨节点 RPC 绕过方案
+## 5. 跨节点 Cache 状态共享方案
 
 ### 5.1 问题背景
 
 真实 V6D 集群中，跨物理节点 KV cache 共享通过 **SRPC (GPU DMA)** 实现。在 CPU 仿真中：
-- 无 GPU，SRPC 不可用
-- vineyardd 仅暴露 IPC socket，不监听 WebSocket RPC 端口 (7890)
-- V6dObjectConnector{Worker,Scheduler} 均依赖 WebSocket RPC，连接挂起
+- 无 GPU，SRPC 不可用（依赖 libcuda.so.1）
+- vineyardd 以 `-rpc=false` 启动，不监听 RPC 端口
+- 但 vineyardd 仍连接 etcd 存储元数据，etcd 跨节点可见
 
-### 5.2 解决方案
+### 5.2 解决方案：V6D etcd 后端
 
-在 `MockOffloadConnector` 中直接实现 ownership tracking：
+**完全移除进程内 `_storage` dict**，替换为 `V6DCacheStorage` 类，通过 V6D 的 etcd 后端实现跨物理机 cache 状态共享：
 
 ```
-Worker A 完成 Request → request_finished() → _storage[hash] = "worker_A"
-                                                       ↓
-Worker B 查询相同 prefix → get_num_new_matched_tokens()
-                            → _storage[hash] 存在, owner="worker_A" ≠ "worker_B"
-                            → remote_hit++ (跨节点命中!)
-                            → V6dBlockOwnershipTracker.record_hit()
-                            → 返回 hit_tokens (跳过 prefill)
+                    ┌─────────────────────────────────────────┐
+                    │        Shared etcd (V6D backend)         │
+                    │       11.226.24.110:2379                 │
+                    └──────────┬───────────────┬──────────────┘
+                               │               │
+              etcd v3 HTTP     │               │     etcd v3 HTTP
+                               │               │
+┌──────────────────────────────┴───┐   ┌───────┴──────────────────────────┐
+│  pai_vllm_v6d_1 (10.0.240.195)  │   │  pai_vllm_v6d_2 (10.0.42.92)    │
+│                                  │   │                                  │
+│  vineyardd (IPC + etcd)          │   │  V6D_ETCD_ENDPOINT 环境变量       │
+│       ↓                          │   │       ↓                          │
+│  V6DCacheStorage                 │   │  V6DCacheStorage                 │
+│       ↓                          │   │       ↓                          │
+│  MockOffloadConnector            │   │  MockOffloadConnector            │
+│    register_block()              │   │    lookup_block()                │
+│    lookup_block()                │   │    → REMOTE HIT!                 │
+└──────────────────────────────────┘   └──────────────────────────────────┘
 ```
 
-**关键**: 跨节点命中时**直接复用 block**（通过 vineyardd IPC 共享内存），省略了 RPC 数据搬运步骤。prefix match 语义完全保留，仅绕过了物理数据传输。
+**核心流程**：
+
+```
+Phase 1: Block 注册（Request 完成时）
+  Worker A (Node 1) 完成 Request
+    → request_finished()
+    → V6DCacheStorage.register_block(hash, "worker_node_0")
+    → etcd PUT: key="sim_kv_block/{hash}"
+              value={"owner_worker_id":"worker_node_0","block_hash":"..."}
+    → 真实网络 I/O: HTTP POST → etcd
+
+Phase 2: Prefix Match 查询（新 Request 到达 Node 2）
+  Worker B (Node 2) 收到相同 prefix 的 Request
+    → get_num_new_matched_tokens()
+    → 逐个 hash: V6DCacheStorage.lookup_block(hash)
+    → etcd GET → 返回 owner_worker_id
+    → owner != self._worker_id → REMOTE HIT（跨物理机命中!）
+    → 前缀连续性：第一个 miss 即停止
+
+Phase 3: 跳过数据传输，本地更新
+  命中后：
+    → 返回 hit_tokens，Scheduler 跳过 prefill
+    → Worker 端 start_load_kv() 为 no-op（跳过 SRPC 数据搬运）
+    → 直接标记为已加载（本地 cache 更新）
+```
 
 ### 5.3 设计决策
 
 | 决策 | 理由 |
 |------|------|
-| 在 MockOffloadConnector 而非 V6dObjectManager 中实现 | MockOffloadConnector 是实际执行 prefix match 的组件；V6dObjectManager 因 WebSocket 不可用实际不触发 |
-| `_storage` 为类级变量（全实例共享） | 多 Worker 仿真中 LLM 顺序创建，同进程内 class-level dict 自然跨实例可见 |
-| 通过 env var 传递 worker_id | vLLM EngineCore 在子进程运行，环境变量能跨进程继承 |
-| V6dBlockOwnershipTracker 用 /dev/shm/ 文件后端 | 为未来真正多进程部署预留扩展能力 |
+| 使用 etcd v3 HTTP API 而非 vineyard put_name | vineyardd 集群在 `-rpc=false` 下无法双节点组网（probe 失败），直接访问底层 etcd 绕过此限制 |
+| etcd endpoint 自动发现 | 从运行中的 vineyardd 进程命令行解析 `-etcd_endpoint`，或通过 `V6D_ETCD_ENDPOINT` 环境变量配置 |
+| 单例模式 (V6DCacheStorage._instance) | 避免多 Connector 实例重复建立 etcd 连接 |
+| owner_worker_id 归属追踪 | 准确区分 local hit / remote hit，为传输时延建模提供数据依据 |
+| 前缀连续匹配 (break on first miss) | 与 vLLM 线上 prefix cache 语义一致 |
+
+### 5.4 跨物理机验证结果
+
+**环境**：
+- pai_vllm_v6d_1 (10.0.240.195)：运行 vineyardd + etcd
+- pai_vllm_v6d_2 (10.0.42.92)：通过 10.x 网段访问 Node 1 的 etcd
+
+**双向验证**：
+```
+Node 1 注册 5 blocks (owner=worker_node_0) → etcd
+Node 2 查询 5 blocks → 全部 REMOTE HIT (owner≠self)
+Node 2 注册 3 blocks (owner=worker_node_1) → etcd
+Node 1 查询 → 3 REMOTE HIT + 5 LOCAL HIT
+
+真实网络路径: 10.0.42.92 → 10.0.240.195:2379 (etcd v3 HTTP)
+```
 
 ---
 
@@ -435,32 +487,43 @@ Worker B 查询相同 prefix → get_num_new_matched_tokens()
 ### 6.1 测试运行方式
 
 ```bash
-# 基础测试（不需要 V6D daemon 的单元测试 + 需要 daemon 的集成测试）
-cd /root/workspace/sglang-hijack-sim/tools/sglang-simulator
-python -m pytest test/test_v6d_hooks_unit.py test/test_v6d_cache_runner.py -v
+cd /root/workspace/sglang-dev/tools/sglang-simulator
 
-# 跨节点 RPC 绕过测试（需要 V6D daemon + 环境变量）
+# 全量测试（V6D daemon 需运行 + etcd 连接）
+python -m pytest test/test_simulation_vllm_runner.py \
+                 test/test_v6d_hooks_unit.py \
+                 test/test_v6d_cache_runner.py -v
+
+# 跨节点测试（需要 V6D daemon + etcd + V6D_MULTI_NODE=1）
 V6D_MULTI_NODE=1 python -m pytest test/test_v6d_cache_runner.py::TestV6dCacheMultiNode -v -s
+
+# 跨物理机测试（独立脚本，需两台机器）
+# Node 1: python test/test_cross_node_v6d.py --role store --etcd-endpoint http://11.226.24.110:2379
+# Node 2: python test/test_cross_node_v6d.py --role lookup --etcd-endpoint http://10.0.240.195:2379
 ```
 
 ### 6.2 测试结果
 
 ```
-32 passed, 1 skipped (cross-node test 需 V6D_MULTI_NODE=1)
-跨节点测试单独运行: 1 passed
+33 passed, 1 skipped (V6D_MULTI_NODE=1 单独运行额外 1 passed)
 
-跨节点测试输出:
+跨节点测试输出（单机多 Worker + etcd 后端）:
+[V6DCacheStorage] Connected to etcd at http://11.226.24.110:2379 (V6D backend)
 [RPC Bypass] Worker worker_node_1: cross-node hit! local=0 remote=4 (RPC bypassed)
 [RPC Bypass] Worker worker_node_1: cross-node hit! local=0 remote=4 (RPC bypassed)
-[RPC Bypass] Worker worker_node_1: cross-node hit! local=0 remote=4 (RPC bypassed)
-[RPC Bypass] Worker worker_node_1: cross-node hit! local=0 remote=4 (RPC bypassed)
+
+跨物理机测试输出:
+Node 1 (10.0.240.195): registered 5 blocks as worker_node_0
+Node 2 (10.0.42.92): 5/5 REMOTE HIT (100%)
+*** CROSS-PHYSICAL-MACHINE CACHE HIT VERIFIED ***
 ```
 
 ### 6.3 前置条件
 
-- V6D daemon 运行: `vineyardd --socket /tmp/vineyard.sock --size 256M -rpc=false`
+- V6D daemon 运行: `vineyardd --socket /tmp/vineyard.sock --size 256M -rpc=false -etcd_endpoint http://ETCD_HOST:2379 -etcd_prefix vineyard_cross`
 - 模型文件: `/host/models/Qwen/Qwen3-0.6B/`
 - `CUDA_VISIBLE_DEVICES=""` + `VLLM_ENABLE_V1_MULTIPROCESSING=0`
+- 跨机测试额外需要: 两台机器通过 10.x 网段互通 + 共享同一 etcd
 
 ---
 
@@ -468,17 +531,15 @@ V6D_MULTI_NODE=1 python -m pytest test/test_v6d_cache_runner.py::TestV6dCacheMul
 
 ### 7.1 已知限制
 
-1. **V6D WebSocket RPC 不可用**: vineyardd 启动时 `-rpc=false`，端口 7890 未监听。因此真实 V6dObjectConnector 无法使用，ownership 追踪在 MockOffloadConnector 内完成。
-
-2. **`_storage` 为进程内共享**: 如果改为真正多进程部署（每个 Worker 独立进程），需切换到 V6dBlockOwnershipTracker 的文件后端模式。
-
-3. **SRPC 需要 CUDA**: V6D 的 SRPC（GPU Direct DMA）无法在 CPU 环境使用，这是 RPC 绕过方案的根本原因。
+1. **SRPC 需要 CUDA**: V6D 的 SRPC（GPU Direct DMA）无法在 CPU 环境使用，跨节点数据传输被跳过（仅同步状态）。
+2. **vineyardd 集群不可组**: 两台 CPU 机器的 vineyardd 无法通过 `-rpc=false` 组成集群（probe 需要 RPC），因此使用 etcd 直连方案。
+3. **etcd 单点**: 当前 etcd 运行在 Node 1 上，若 Node 1 故障则所有节点丢失 cache 状态。生产环境需 etcd 集群。
 
 ### 7.2 后续方向
 
-- **切换到真实 V6D RPC**: 若 vineyardd 配置为 `-rpc=true` 且有 GPU，可修改 Factory Hook 让真实 V6D connector 通过，`C_V6dObjectManagerHook` 将自动生效。
-- **跨节点传输时延建模**: 当前 remote hit 直接跳过 prefill（假设传输瞬间完成），未来可在 `get_num_new_matched_tokens` 返回后注入传输时延。
-- **多 vineyardd 实例测试**: 当前测试使用单 daemon + 多 Worker，未来可扩展为双 daemon 拓扑。
+- **跨节点传输时延建模**: 当前 remote hit 直接跳过 prefill，未来可在 `get_num_new_matched_tokens` 返回后注入传输时延（基于网络带宽 + block 大小）。
+- **切换到真实 V6D RPC**: 若 vineyardd 配置为 `-rpc=true` 且有 GPU，可恢复 SRPC 数据传输路径。
+- **etcd 批量查询优化**: 当前逐 block 查询，可通过 etcd range query 实现批量前缀匹配，降低网络 RTT。
 
 ---
 
@@ -486,64 +547,97 @@ V6D_MULTI_NODE=1 python -m pytest test/test_v6d_cache_runner.py::TestV6dCacheMul
 
 ```
 src/sglang_simulator/simulation/vllm/
-├── startup.py          ← Hook 注册入口 (修改: +v6d_manager)
-├── platform.py         ← MockCudaPlatform (修改: +set_device/get_memory)
-├── engine_args.py      ← EngineArgs parallelism=1 (同事基础)
-├── worker.py           ← GPU Worker hook (修改: +head_dim注入/KV spec/V6D init)
-├── vllm_worker.py      ← VLLMWorker (修改: +worker_id生命周期)
-├── scheduler.py        ← Scheduler hook (修改: +per-instance fix)
-├── kv_connector.py     ← MockOffloadConnector + Factory Hook (修改: +RPC bypass)
-├── kv_offload.py       ← Native CPU offload hooks (新增)
-├── v6d_swap.py         ← V6D SwapHandler CUDA绕过 (新增)
-├── v6d_worker.py       ← V6D ConnectorWorker CUDA绕过 (新增)
-├── v6d_backend.py      ← V6D ObjectBackend Event绕过 (新增)
-├── v6d_manager.py      ← V6D ObjectManager hook + Tracker (新增)
-├── utils.py            ← vLLM 仿真工具 (同事基础)
-└── launch_server.py    ← vLLM 服务启动 (同事基础)
+├── startup.py            ← Hook 注册入口 (修改: +v6d_manager)
+├── platform.py           ← MockCudaPlatform (修改: +__getattr__/supported_dtypes)
+├── engine_args.py        ← EngineArgs parallelism=1 (同事基础)
+├── worker.py             ← GPU Worker hook (修改: +head_dim注入/KV spec/V6D init)
+├── vllm_worker.py        ← VLLMWorker (修改: +worker_id生命周期)
+├── scheduler.py          ← Scheduler hook (修改: +per-instance fix)
+├── kv_connector.py       ← MockOffloadConnector + Factory Hook (修改: +V6D etcd后端)
+├── v6d_cache_storage.py  ← V6D etcd 后端存储 (新增, 跨机 cache 状态管理)
+├── kv_offload.py         ← Native CPU offload hooks (新增)
+├── v6d_swap.py           ← V6D SwapHandler CUDA绕过 (新增)
+├── v6d_worker.py         ← V6D ConnectorWorker CUDA绕过 (新增)
+├── v6d_backend.py        ← V6D ObjectBackend Event绕过 (新增)
+├── v6d_manager.py        ← V6D ObjectManager hook + Tracker (新增)
+├── utils.py              ← vLLM 仿真工具 (同事基础)
+└── launch_server.py      ← vLLM 服务启动 (同事基础)
 
 test/
-├── test_v6d_cache_runner.py    ← V6D 集成测试 (新增, 5 tests)
-├── test_v6d_hooks_unit.py      ← V6D hook 单元测试 (新增, 28 tests)
-├── test_simulation_vllm_runner.py   ← vLLM runner 测试 (同事基础)
-├── test_simulation_vllm_serving.py  ← vLLM serving 测试 (同事基础)
-└── assets/config_vllm_v6d.json      ← V6D 仿真配置 (新增)
+├── test_v6d_cache_runner.py       ← V6D 集成测试 (5 tests + 1 cross-node)
+├── test_v6d_hooks_unit.py         ← V6D hook 单元测试 (28 tests)
+├── test_cross_node_v6d.py         ← 跨物理机验证脚本
+├── test_simulation_vllm_runner.py ← vLLM runner 测试 (同事基础)
+├── test_simulation_vllm_serving.py← vLLM serving 测试 (同事基础)
+└── assets/config_vllm_v6d.json    ← V6D 仿真配置 (新增)
 ```
 
 ---
 
 ## 9. 维护操作手册
 
-### 9.1 添加新 Worker 节点
-
-```python
-worker_n = VLLMWorker(engine_args=EngineArgs(...), name="worker_node_N")
-# name 参数自动传递给 MockOffloadConnector，ownership tracking 自动工作
-```
-
-### 9.2 查看跨节点命中统计
-
-```python
-from sglang_simulator.simulation.vllm.v6d_manager import V6dBlockOwnershipTracker
-stats = V6dBlockOwnershipTracker.get_stats("worker_node_1")
-# → {"local_hits": 10, "remote_hits": 16}
-```
-
-### 9.3 测试隔离
-
-```python
-V6dBlockOwnershipTracker.reset()       # 清除 /dev/shm/ 文件
-MockOffloadConnector.reset_storage()   # 清除类级 _storage dict
-```
-
-### 9.4 环境部署
+### 9.1 环境部署（单机）
 
 ```bash
-# 启动 vineyardd (CPU 模式，禁用 RPC)
-vineyardd --socket /tmp/vineyard.sock --size 256M -rpc=false &
+# 启动 etcd（如果机器上没有现成的）
+# etcd 默认监听 2379 端口
+
+# 启动 vineyardd (CPU 模式，连接 etcd)
+vineyardd --socket /tmp/vineyard.sock --size 256M -rpc=false \
+  -etcd_endpoint http://ETCD_HOST:2379 -etcd_prefix vineyard_cross &
 
 # 安装仿真器
 cd tools/sglang-simulator && pip install -e .
 
 # 运行测试
-CUDA_VISIBLE_DEVICES="" V6D_MULTI_NODE=1 python -m pytest test/ -v
+CUDA_VISIBLE_DEVICES="" python -m pytest test/ -v \
+  --ignore=test/test_simulatiom_load_balancing.py \
+  --ignore=test/test_simulation_pd_disagg.py \
+  --ignore=test/test_simulation_sglang_runner.py \
+  --ignore=test/test_simulation_time_predictor.py
+```
+
+### 9.2 环境部署（跨机）
+
+```bash
+# Node 1: 启动 vineyardd + etcd
+vineyardd --socket /tmp/vineyard.sock --size 256M -rpc=false \
+  -etcd_endpoint http://11.226.24.110:2379 -etcd_prefix vineyard_cross &
+
+# Node 2: 设置 etcd endpoint 环境变量（指向 Node 1 的 etcd）
+export V6D_ETCD_ENDPOINT=http://10.0.240.195:2379
+
+# 两机均可运行仿真，cache 状态通过 etcd 自动同步
+```
+
+### 9.3 添加新 Worker 节点
+
+```python
+worker_n = VLLMWorker(engine_args=EngineArgs(...), name="worker_node_N")
+# name 自动传递给 MockOffloadConnector → V6DCacheStorage
+# ownership tracking 通过 etcd 自动跨机可见
+```
+
+### 9.4 查看 cache 状态
+
+```python
+from sglang_simulator.simulation.vllm.v6d_cache_storage import V6DCacheStorage
+storage = V6DCacheStorage.get_instance()
+print(storage.get_stats())
+# → {"connected": True, "etcd_endpoint": "http://...:2379", "backend": "etcd_v3_http"}
+
+# 查看跨节点命中统计
+from sglang_simulator.simulation.vllm.v6d_manager import V6dBlockOwnershipTracker
+stats = V6dBlockOwnershipTracker.get_stats("worker_node_1")
+# → {"local_hits": 10, "remote_hits": 16}
+```
+
+### 9.5 测试隔离
+
+```python
+from sglang_simulator.simulation.vllm.v6d_cache_storage import V6DCacheStorage
+V6DCacheStorage.reset_instance()          # 清除 etcd 中所有 block 注册
+
+from sglang_simulator.simulation.vllm.v6d_manager import V6dBlockOwnershipTracker
+V6dBlockOwnershipTracker.reset()          # 清除 /dev/shm/ 统计文件
 ```
