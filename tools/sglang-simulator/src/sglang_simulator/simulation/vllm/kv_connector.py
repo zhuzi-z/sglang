@@ -1,7 +1,10 @@
 """
-MockOffloadConnector — implements KVConnectorBase_V1 with pluggable
-BaseCacheStorage for simulating external KV cache offloading (L2/L3)
-without CUDA or network dependencies.
+MockOffloadConnector — implements KVConnectorBase_V1 with V6D-backed
+cache storage for cross-node KV cache sharing simulation.
+
+Block ownership is stored via V6D daemon (IPC → vineyardd → etcd),
+enabling true cross-physical-machine cache state visibility and hit
+detection without CUDA/GPU dependencies.
 
 Also provides C_KVConnectorFactoryHook to intercept connector creation.
 """
@@ -62,9 +65,8 @@ class MockOffloadConnector:
       - get_finished: report loads as immediately completed
     """
 
-    # Shared storage instance (module-level singleton for in-process simulation)
-    # Shared storage: key -> owner_worker_id (for RPC bypass tracking)
-    _storage: dict[str, str] = {}
+    # Block ownership storage backed by V6D daemon (cross-node via etcd)
+    # Replaces in-process dict with real distributed storage
 
     def __init__(
         self,
@@ -108,12 +110,15 @@ class MockOffloadConnector:
         from sglang_simulator.simulation.vllm.v6d_manager import get_active_worker_id
         self._worker_id = get_active_worker_id()
 
+        # Initialize V6D-backed cache storage (singleton, cross-node visible)
+        from sglang_simulator.simulation.vllm.v6d_cache_storage import V6DCacheStorage
+        self._v6d_storage = V6DCacheStorage.get_instance()
+
         if role == KVConnectorRole.SCHEDULER:
-            # Clear stale storage from previous engine instance
-            MockOffloadConnector._storage = {}
             logger.info(
-                "[MockOffloadConnector] SCHEDULER role, hash_block_size=%d",
-                self.hash_block_size,
+                "[MockOffloadConnector] SCHEDULER role, hash_block_size=%d, "
+                "v6d_connected=%s",
+                self.hash_block_size, self._v6d_storage.connected,
             )
         elif role == KVConnectorRole.WORKER:
             logger.info("[MockOffloadConnector] WORKER role (all transfers no-op)")
@@ -207,7 +212,11 @@ class MockOffloadConnector:
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
-        """Query storage for prefix cache hits beyond num_computed_tokens."""
+        """Query V6D for prefix cache hits beyond num_computed_tokens.
+
+        Each block hash is looked up via V6D (IPC → vineyardd → etcd),
+        enabling true cross-physical-machine cache hit detection.
+        """
         num_skipped = num_computed_tokens // self.hash_block_size
         remaining_hashes = request.block_hashes[num_skipped:]
 
@@ -219,17 +228,17 @@ class MockOffloadConnector:
         if max_hit_tokens <= 0:
             return 0, False
 
-        # Convert block hashes to string keys and do prefix match
+        # Convert block hashes to string keys and do prefix match via V6D
         keys = [h.hex() if isinstance(h, bytes) else str(h) for h in remaining_hashes]
         hit_blocks = 0
         local_hits = 0
         remote_hits = 0
         for key in keys:
-            if key not in self._storage:
-                break
+            owner = self._v6d_storage.lookup_block(key)
+            if owner is None:
+                break  # prefix continuity: stop at first miss
             hit_blocks += 1
-            # Classify hit as local or remote (RPC bypass tracking)
-            owner = self._storage[key]
+            # Classify hit as local or remote
             if self._worker_id and owner != self._worker_id:
                 remote_hits += 1
             else:
@@ -274,16 +283,17 @@ class MockOffloadConnector:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        """Store all block hashes for the finished request into cache storage.
+        """Register all block hashes into V6D for cross-node visibility.
 
-        Records ownership (worker_id) for each block to enable RPC bypass
-        tracking: when another worker hits these blocks, it's a cross-node hit.
+        Each block is persisted to etcd via vineyardd, making it discoverable
+        by workers on other physical machines. Records owner_worker_id for
+        accurate local/remote hit classification.
         """
         if request.block_hashes:
             worker_id = self._worker_id or "unknown"
             for h in request.block_hashes:
                 key = h.hex() if isinstance(h, bytes) else str(h)
-                self._storage[key] = worker_id
+                self._v6d_storage.register_block(key, worker_id)
         return False, None
 
     def request_finished_all_groups(
@@ -292,13 +302,15 @@ class MockOffloadConnector:
         return self.request_finished(request, [])
 
     def reset_cache(self) -> bool | None:
-        MockOffloadConnector._storage = {}
+        from sglang_simulator.simulation.vllm.v6d_cache_storage import V6DCacheStorage
+        V6DCacheStorage.reset_instance()
         return True
 
     @classmethod
     def reset_storage(cls):
-        """Reset shared storage (for test isolation)."""
-        cls._storage = {}
+        """Reset V6D storage (for test isolation)."""
+        from sglang_simulator.simulation.vllm.v6d_cache_storage import V6DCacheStorage
+        V6DCacheStorage.reset_instance()
 
     # No-op scheduler stubs
     def update_state_after_alloc(
