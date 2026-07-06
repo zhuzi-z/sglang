@@ -56,7 +56,8 @@ class C_VLLMPlatformHook(BaseHook):
 
             @classmethod
             def get_device_capability(cls, device_id=0):
-                return (8, 0)  # A100 equivalent
+                from vllm.platforms.interface import DeviceCapability
+                return DeviceCapability(8, 0)  # A100 equivalent
 
             @classmethod
             def has_device_capability(
