@@ -10,6 +10,7 @@ Similar to SGLang's future_queue pattern:
 """
 
 import heapq
+import os
 import time
 from collections import deque
 
@@ -23,6 +24,10 @@ from sglang_simulator.time_predictor import ScheduleRequest
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
+
+# Max decode steps (output length) from environment variable
+# None means no override (use original sampling_params.max_tokens)
+_MAX_DECODE_STEPS = int(v) if (v := os.environ.get("SGLANG_SIMULATOR_MAX_DECODE_STEPS")) is not None else None
 
 
 class C_VLLMSchedulerHook(BaseHook):
@@ -103,6 +108,13 @@ class C_VLLMSchedulerHook(BaseHook):
             """Intercept add_request to divert simulation requests
             into future_queue based on created_time."""
             nonlocal seq_counter, total_expected, all_received
+
+            # Force output length from environment variable (only if set)
+            if _MAX_DECODE_STEPS is not None:
+                if request.sampling_params is not None:
+                    request.sampling_params.max_tokens = _MAX_DECODE_STEPS
+                    request.sampling_params.ignore_eos = True
+                request.max_tokens = _MAX_DECODE_STEPS
 
             created_time = None
             if request.sampling_params and request.sampling_params.extra_args:
