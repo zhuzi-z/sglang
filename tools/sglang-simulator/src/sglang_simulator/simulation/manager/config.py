@@ -185,8 +185,28 @@ class ConfigManager:
                 workload_distribution=workload_distribution,
                 enable_oom_check=enable_oom_check,
             )
+        elif predictor_config.get("name") == "ml":
+            from sglang_simulator.time_predictor.ml import MLTimePredictor
+            return MLTimePredictor(
+                model,
+                hw=hw,
+                config=sched_config,
+                database_path=predictor_config.get("database_path"),
+                latency_scale=predictor_config.get("latency_scale", 1.0),
+            )
+        elif predictor_config.get("name") == "gbr":
+            from sglang_simulator.time_predictor.gbr import GBRTimePredictor
+            return GBRTimePredictor(
+                model,
+                hw=hw,
+                config=sched_config,
+                database_path=predictor_config.get("database_path"),
+                model_path=predictor_config.get("model_path"),
+                decode_latency=predictor_config.get("decode_latency", 0.02),
+            )
         else:
-            raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")
+            raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}. "
+                             f"Supported: aiconfigurator, ml, gbr")
 
     @classmethod
     def ignore_cpu_overhead(cls) -> bool:
