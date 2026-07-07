@@ -89,17 +89,20 @@ class C_VLLMSchedulerHook(BaseHook):
                     if hasattr(self, 'kv_cache_config'):
                         kv_cache_config = self.kv_cache_config
                     self.connector = MockHybridConnector(vllm_config, None, kv_cache_config)
-                    # Register with SupportsHMA so _connector_finished uses
-                    # request_finished_all_groups (avoids single-group assertion
-                    # on hybrid models with multiple kv_cache_groups)
-                    try:
-                        from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
-                        SupportsHMA.register(MockHybridConnector)
-                    except Exception:
-                        pass
                     logger.info('[Scheduler Hook] Force-created MockHybridConnector (no kv_transfer_config)')
                 except Exception as e:
                     logger.warning('[Scheduler Hook] Failed to create connector: %s', e)
+
+            # Always register MockHybridConnector with SupportsHMA regardless
+            # of how the connector was created (factory hook or fallback above).
+            # This ensures _connector_finished uses request_finished_all_groups
+            # on hybrid models with multiple kv_cache_groups (e.g. Qwen3.5).
+            try:
+                from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
+                from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
+                SupportsHMA.register(MockHybridConnector)
+            except Exception:
+                pass
             # Share scheduler reference with MockHybridConnector
             try:
                 from sglang_simulator.simulation.vllm.kv_connector import set_scheduler_ref
