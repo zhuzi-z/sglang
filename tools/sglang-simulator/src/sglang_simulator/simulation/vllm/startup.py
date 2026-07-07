@@ -88,6 +88,16 @@ def _patch_torch_cuda_for_cpu():
 
 def init_hook():
     """Install all vLLM hooks. Must be called before importing vllm."""
+    # Ensure deterministic block hashes across nodes for cross-node cache sharing.
+    # vLLM uses PYTHONHASHSEED to initialize NONE_HASH; without it, each process
+    # gets os.urandom(32) making block hashes non-reproducible across machines.
+    import os
+    if 'PYTHONHASHSEED' not in os.environ:
+        os.environ['PYTHONHASHSEED'] = '42'
+        import logging
+        logging.getLogger('sglang_simulator').warning(
+            '[init_hook] PYTHONHASHSEED not set, defaulting to 42 for cross-node hash consistency')
+
     _patch_triton_for_cpu()
     _patch_torch_cuda_for_cpu()
 
