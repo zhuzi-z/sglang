@@ -1,14 +1,15 @@
 import argparse
 import os
 
-import sgl_hook
+from scheduler import C_SchedulerReqHook, C_TokenizerManagerHook
+from topk_dispatch import C_TopKBalancedDispatchHook
 from sglang_simulator.hook import install_class_hooks
 
 install_class_hooks(
     [
-        sgl_hook.C_SchedulerReqHook,
-        sgl_hook.C_TokenizerManagerHook,
-        sgl_hook.C_TopKBalancedDispatchHook,
+        C_SchedulerReqHook,
+        C_TokenizerManagerHook,
+        C_TopKBalancedDispatchHook,
     ]
 )
 

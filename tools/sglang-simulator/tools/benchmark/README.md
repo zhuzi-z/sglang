@@ -1,6 +1,6 @@
-# Collect GPU Execution Time of `ScheduleBatch` in SGLang
+# Collect GPU Execution Time of `ScheduleBatch` in LLM Inference
 
-This tool is mainly used to collect the GPU execution time of `ScheduleBatch` in SGLang.
+This tool is mainly used to collect the GPU execution time of `ScheduleBatch` in SGLang and vLLM.
 
 ## 1. Start the service
 
@@ -40,4 +40,13 @@ The exported data will be saved in the directory specified by `SGL_HOOK_REQ_INFO
 
 ```sh
 curl http://localhost:30000/stop_profile
+```
+
+## 4. vLLM Benchmark
+
+``` sh
+python ./vllm_launch_server.py serve \
+    --model "Qwen/Qwen3-30B-A3B" \
+    --profiler-config.profiler="torch" \
+    --profiler-config.torch_profiler_dir="."
 ```
