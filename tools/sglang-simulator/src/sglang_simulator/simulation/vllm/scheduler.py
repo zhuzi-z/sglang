@@ -80,6 +80,33 @@ class C_VLLMSchedulerHook(BaseHook):
             self._sim_req_created_time = {}
 
             original_init(self, vllm_config, *args, **kwargs)
+            # Ensure connector is created even without kv_transfer_config
+            # (simulation always uses MockHybridConnector for cross-node cache)
+            if self.connector is None:
+                try:
+                    from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
+                    kv_cache_config = None
+                    if hasattr(self, 'kv_cache_config'):
+                        kv_cache_config = self.kv_cache_config
+                    self.connector = MockHybridConnector(vllm_config, None, kv_cache_config)
+                    # Register with SupportsHMA so _connector_finished uses
+                    # request_finished_all_groups (avoids single-group assertion
+                    # on hybrid models with multiple kv_cache_groups)
+                    try:
+                        from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
+                        SupportsHMA.register(MockHybridConnector)
+                    except Exception:
+                        pass
+                    logger.info('[Scheduler Hook] Force-created MockHybridConnector (no kv_transfer_config)')
+                except Exception as e:
+                    logger.warning('[Scheduler Hook] Failed to create connector: %s', e)
+            # Share scheduler reference with MockHybridConnector
+            try:
+                from sglang_simulator.simulation.vllm.kv_connector import set_scheduler_ref
+                set_scheduler_ref(self)
+            except Exception:
+                pass
+
             try:
                 from sglang_simulator.simulation.manager import ConfigManager
                 from sglang_simulator.simulation.vllm.utils import (
@@ -263,9 +290,12 @@ class C_VLLMSchedulerHook(BaseHook):
 
             if not simulation_batch.is_empty():
                 StateManager.inc_iteration()
-                predicted_latency = float(
-                    cls.INFERENCE_PREDICTOR.predict_infer_time(simulation_batch)
-                )
+                if cls.INFERENCE_PREDICTOR is not None:
+                    predicted_latency = float(
+                        cls.INFERENCE_PREDICTOR.predict_infer_time(simulation_batch)
+                    )
+                else:
+                    predicted_latency = 0.001  # fallback: 1ms per step
 
                 if cls.SIM_MODE == SimulationMode.BLOCKING:
                     time.sleep(abs(predicted_latency))
@@ -288,6 +318,8 @@ class C_VLLMSchedulerHook(BaseHook):
 
         def wrapped_get_num_unfinished(self):
             return original_get_num_unfinished(self) + len(future_queue)
+
+
 
         target.__init__ = wrapped_init
         target.add_request = wrapped_add_request
