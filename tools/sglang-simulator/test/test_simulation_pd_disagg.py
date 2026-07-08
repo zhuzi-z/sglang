@@ -94,6 +94,8 @@ def test_pd_disagg_multi_instance():
             # Check token latency, specifically for the second token, 
             # which is the first token produced by the decoding worker.
             assert lat > 0
+        # KV cache transfer duration should be recorded on the decode side.
+        assert req["kv_cache_transfer_duration"] > 0
 
     runner.shutdown()
 

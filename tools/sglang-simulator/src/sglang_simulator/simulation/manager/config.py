@@ -145,6 +145,11 @@ class ConfigManager:
         return cls._scheduler_config
 
     @classmethod
+    def get_kv_transfer_config(cls) -> dict:
+        config = cls._get_raw_config()
+        return config.get("kv_transfer_config", {})
+
+    @classmethod
     def _parse_server_args(cls, server_args: dict, backend: str) -> SchedulerConfig:
         if backend == "sglang":
             return SchedulerConfig(

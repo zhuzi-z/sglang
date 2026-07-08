@@ -649,6 +649,9 @@ class C_SchedulerHook(BaseHook):
                             "final_storage_hit_len": req_stat.final_storage_hit_len,
                             "input_length": req_stat.input_length,
                             "output_length": req_stat.output_length,
+                            "kv_cache_transfer_queue_start_time": req_stat.kv_cache_transfer_queue_start_time,
+                            "kv_cache_transfer_start_time": req_stat.kv_cache_transfer_start_time,
+                            "kv_cache_transfer_duration": req_stat.kv_cache_transfer_duration,
                         }
 
                 original_send_output(output, recv_obj)

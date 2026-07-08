@@ -68,6 +68,10 @@ class RequestStats:
     created_time: float = -1
     gen_token_latencies: list[float] = field(default_factory=list)
 
+    kv_cache_transfer_queue_start_time: float = -1
+    kv_cache_transfer_start_time: float = -1
+    kv_cache_transfer_duration: float = 0.0
+
     def is_complete(self) -> bool:
         return True
 

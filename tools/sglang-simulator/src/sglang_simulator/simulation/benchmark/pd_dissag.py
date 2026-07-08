@@ -161,6 +161,16 @@ class PDDisaggBenchmarkRunner(BaseBenchmarkRunner):
                 (prefill_sim_stat.get("gen_token_latencies") or [])
                 + (decode_sim_stat.get("gen_token_latencies") or [])
             ),
+            # KV cache transfer only happens on the decode side.
+            "kv_cache_transfer_queue_start_time": decode_sim_stat.get(
+                "kv_cache_transfer_queue_start_time", -1
+            ),
+            "kv_cache_transfer_start_time": decode_sim_stat.get(
+                "kv_cache_transfer_start_time", -1
+            ),
+            "kv_cache_transfer_duration": decode_sim_stat.get(
+                "kv_cache_transfer_duration", 0.0
+            ),
         })
 
     async def async_benchmark(
