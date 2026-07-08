@@ -1,24 +1,25 @@
 """
-MockHybridConnector — Simulates the real HybridConnector's cross-node KV
-cache loading flow WITHOUT CUDA/GPU dependencies.
+MockHybridConnector v2 — Simulates cross-node KV cache sharing via V6D/etcd.
 
-Real HybridConnector flow:
-  1. on_add_req(req) → intercepts request (returns True = "eaten")
-  2. sched_allocate_slots() → finds local prefix hits + allocates blocks
-  3. async_get_num_new_matched_tokens() → V6D lookup for remote hits
-  4. Worker-side DMA transfer (CUDA ops) → loads remote KV data
-  5. _step_loaded() → sets req.num_computed_tokens += remote_hits
-  6. sched_add_req(req) → adds to scheduler waiting queue
+Design principle: NEVER allocate blocks in on_add_req.  All block allocation
+happens inside the scheduler's scheduling loop (one request at a time) via
+get_num_new_matched_tokens, ensuring proper LRU ordering and preventing
+batch-arrival cache thrashing.
 
-CPU Simulation:
-  Steps 3-4 are replaced with synchronous etcd lookup (no real data to
-  transfer). The net effect is the same: req enters scheduler with
-  num_computed_tokens already reflecting both local and remote hits.
+Flow (aligned with scheduler's connector path):
+  1. on_add_req(req) → always returns False (request enters scheduler normally)
+  2. Scheduler scheduling loop (per-request, sequential):
+     a. get_computed_blocks(req) → local prefix hits
+     b. get_num_new_matched_tokens(req, local_hit) → etcd lookup for remote
+     c. allocate_slots(req, ...) → allocates all needed blocks at once
+     d. cache_blocks → caches everything into local prefix cache
+  3. request_finished(req) → registers block hashes to etcd for cross-node
+     visibility (replaces V6D seal)
 
-This ensures the scheduler takes the SAME code path as the real system:
-  - request.num_computed_tokens > 0 → enters "else" branch
-  - num_external_computed_tokens = 0 in scheduling loop
-  - No _mamba_block_aligned_split assertion triggered
+This eliminates the "batch allocation storm" bug where on_add_req allocated
+blocks for ALL queued requests at once (during _process_input_queue), causing
+earlier requests' cached prefixes to be evicted before later requests in the
+same batch could benefit from them.
 """
 
 from __future__ import annotations
@@ -73,21 +74,18 @@ class MockHybridMetadata:
 
 
 # ---------------------------------------------------------------------------
-# MockHybridConnector
+# MockHybridConnector v2
 # ---------------------------------------------------------------------------
 
 
 class MockHybridConnector:
-    """Simulates HybridConnector's cross-node KV cache flow for CPU.
+    """Simulates HybridConnector's cross-node KV cache sharing for CPU.
 
-    Key behavioral contract (same as real HybridConnector):
-    - on_add_req() → True: intercepts request, performs synchronous
-      local prefix lookup + etcd remote lookup, then adds request to
-      scheduler with updated num_computed_tokens
-    - get_num_new_matched_tokens() → (0, False): never used because
-      requests arrive at scheduler with num_computed_tokens > 0
-    - request_finished() → registers block_hashes to etcd for
-      cross-node visibility (replaces seal() in real V6D)
+    Key behavioral contract:
+    - on_add_req() → False: NEVER eats request; let scheduler handle
+    - get_num_new_matched_tokens() → (remote_tokens, False): returns V6D
+      remote hit count; False = no async load (CPU sim, instant)
+    - request_finished() → registers block_hashes to etcd
     """
 
     def __init__(self, config: "VllmConfig", role, kv_cache_config):
@@ -108,7 +106,6 @@ class MockHybridConnector:
         # Track registered blocks for stats
         self._registered_blocks = 0
         self._remote_hits_total = 0
-        self._local_hits_total = 0
 
         logger.info(
             "[MockHybridConnector] Initialized: worker_id=%s, "
@@ -118,59 +115,60 @@ class MockHybridConnector:
         )
 
     # ------------------------------------------------------------------
-    # Core interface: on_add_req (mirrors HybridConnector.on_add_req)
+    # Core interface: on_add_req — NEVER eats, always returns False
     # ------------------------------------------------------------------
 
     def on_add_req(self, req: "Request") -> bool:
-        """Intercept request and perform synchronous cross-node lookup.
+        """Always returns False — request enters scheduler normally.
 
-        Mirrors real HybridConnector flow:
-        1. Find local prefix cache hits (via kv_cache_manager)
-        2. Query etcd for remote hits (replaces V6D async_lookup)
-        3. Set req.num_computed_tokens = local + remote
-        4. Add request to scheduler waiting queue
-        5. Return True (request "eaten")
-
-        If etcd is not connected or no remote hits, returns False to
-        let the scheduler handle normally (pure local prefix matching).
+        We do NOT allocate blocks or query etcd here. All work is deferred
+        to get_num_new_matched_tokens (called by scheduler in its scheduling
+        loop, one request at a time).
         """
-        scheduler = get_scheduler_ref()
-        if scheduler is None:
-            return False
+        return False
 
+    # ------------------------------------------------------------------
+    # get_num_new_matched_tokens: V6D etcd lookup (called by scheduler)
+    # ------------------------------------------------------------------
+
+    def get_num_new_matched_tokens(
+        self, request: "Request", num_computed_tokens: int
+    ) -> tuple[int, bool]:
+        """Query V6D/etcd for remote prefix hits beyond local cache.
+
+        Called by scheduler INSIDE the scheduling loop (one request at a time).
+        This ensures block allocation happens sequentially, avoiding the batch
+        cache thrashing bug.
+
+        When remote hits are found, returns load_kv_async=True to trigger the
+        WAITING_FOR_REMOTE_KVS path. This path uses block-aligned cache_blocks
+        (via _update_waiting_for_remote_kv), which is critical for mamba hybrid
+        models where cache_blocks requires block-aligned num_tokens.
+
+        We simultaneously signal "transfer complete" by adding the request_id
+        to scheduler.finished_recving_kv_req_ids, so the request becomes ready
+        on the very next scheduling step (simulating instant CPU transfer).
+
+        Args:
+            request: The request being scheduled.
+            num_computed_tokens: Number of tokens already locally cached.
+
+        Returns:
+            (num_external_tokens, load_kv_async):
+            - num_external_tokens: additional tokens available via V6D
+            - load_kv_async: True if remote hit found (triggers async path)
+        """
         if not self._v6d_storage.connected:
-            return False
+            return 0, False
 
         # Skip short prompts (matches VLLM_KVS_ON_MIN_LENGTH behavior)
         min_length = int(os.environ.get("VLLM_KVS_ON_MIN_LENGTH", "0"))
-        if req.num_prompt_tokens <= min_length + 1:
-            return False
+        if request.num_prompt_tokens <= min_length + 1:
+            return 0, False
 
-        # Step 1: Find local prefix hits
-        # (same as sched_allocate_slots does in real HybridConnector)
-        #
-        # NOTE: suppress prefix_cache_stats recording for this internal probe.
-        # If there is no remote hit we return False and the scheduler will
-        # re-run get_computed_blocks (which records stats there). Recording
-        # here too would double-count the local prefix stats for every request
-        # NOT eaten by the connector, polluting "Prefix cache hit rate".
-        kv_cache_manager = scheduler.kv_cache_manager
-        prev_log_stats = kv_cache_manager.log_stats
-        try:
-            kv_cache_manager.log_stats = False
-            computed_blocks, num_local_computed = (
-                kv_cache_manager.get_computed_blocks(req)
-            )
-        except Exception as e:
-            logger.warning(
-                "[MockHybridConnector] get_computed_blocks failed: %s", e)
-            return False
-        finally:
-            kv_cache_manager.log_stats = prev_log_stats
-
-        # Step 2: Query etcd for remote hits starting after local prefix
-        num_skipped_blocks = num_local_computed // self.hash_block_size
-        remaining_hashes = req.block_hashes[num_skipped_blocks:]
+        # Query etcd for remote hits starting after local prefix
+        num_skipped_blocks = num_computed_tokens // self.hash_block_size
+        remaining_hashes = request.block_hashes[num_skipped_blocks:]
 
         remote_hit_blocks = 0
         if remaining_hashes:
@@ -183,115 +181,50 @@ class MockHybridConnector:
 
         remote_hit_tokens = remote_hit_blocks * self.hash_block_size
 
-        # If no remote hits, let scheduler handle normally (local-only path)
-        if remote_hit_tokens == 0:
-            return False
+        if remote_hit_tokens > 0:
+            # Classify hits for logging
+            same_worker_count = 0
+            cross_node_count = 0
+            for h in remaining_hashes[:remote_hit_blocks]:
+                key = h.hex() if isinstance(h, bytes) else str(h)
+                owner = self._v6d_storage.lookup_block(key)
+                if owner == self._worker_id:
+                    same_worker_count += 1
+                elif owner is not None:
+                    cross_node_count += 1
 
-        # Step 3: Allocate blocks for ONLY the connector-loaded prefix.
-        #
-        # The real HybridConnector allocates just the remote-loaded prefix
-        # (block-aligned) with delay_cache_blocks=True, moves the request to
-        # WAITING_FOR_REMOTE_KV, and once the async load finishes the scheduler
-        # (_update_waiting_for_remote_kv) caches those blocks into the LOCAL
-        # prefix cache and lets normal scheduling prefill the rest.
-        #
-        # This mock has no async load, so we replicate that completion path
-        # synchronously (Step 3b). Allocating ONLY remote_hit_tokens keeps the
-        # new allocation block-aligned, which is REQUIRED for cache_blocks to
-        # cache the mamba blocks (mamba "light" mode caches one aligned block
-        # per call). The remaining prompt tokens are prefilled + cached later by
-        # the normal scheduler loop (request enters with num_computed_tokens>0).
-        total_computed = num_local_computed + remote_hit_tokens
-        num_new_tokens = req.num_tokens - total_computed
+            self._remote_hits_total += remote_hit_blocks
+            total_computed = num_computed_tokens + remote_hit_tokens
+            remaining = request.num_tokens - total_computed
 
-        try:
-            new_blocks = scheduler.kv_cache_manager.allocate_slots(
-                req,
-                remote_hit_tokens,
-                num_local_computed,
-                computed_blocks,
-                delay_cache_blocks=True,
-            )
-        except Exception as e:
-            logger.warning(
-                "[MockHybridConnector] allocate_slots failed: %s", e)
-            return False
-
-        if new_blocks is None:
-            # Block allocation failed, let scheduler handle (may retry later)
-            logger.debug(
-                "[MockHybridConnector] Block allocation failed for req %s",
-                req.request_id)
-            return False
-
-        # Step 3b: Cache the connector-loaded prefix into the LOCAL prefix
-        # cache, mirroring Scheduler._update_waiting_for_remote_kv (the real
-        # HybridConnector completion path). Without this the served prefix is
-        # never locally cached, so every later request with the same prefix
-        # keeps going through V6D -- collapsing the local prefix hit rate.
-        try:
-            kv_cache_manager.cache_blocks(req, total_computed)
-        except Exception as e:
-            logger.warning(
-                "[MockHybridConnector] local cache_blocks failed: %s", e)
-
-        # Step 4: Update request state (mirrors _step_loaded)
-        req.num_computed_tokens = total_computed
-        req.num_external_computed_tokens = remote_hit_tokens
-
-        # Record the LOCAL prefix hit exactly once for this eaten request.
-        # (We suppressed recording during the probe above; the scheduler will
-        # NOT re-run get_computed_blocks for eaten requests because they enter
-        # with num_computed_tokens > 0 -> the scheduler "else" branch.)
-        if prev_log_stats and kv_cache_manager.prefix_cache_stats is not None:
-            kv_cache_manager.prefix_cache_stats.record(
-                num_tokens=req.num_tokens,
-                num_hits=num_local_computed,
-                preempted=req.num_preemptions > 0,
+            logger.info(
+                "[MockHybridConnector] Request %s: "
+                "local_prefix=%d tokens, remote_hit=%d tokens (%d blocks), "
+                "total_computed=%d, remaining=%d | "
+                "owners: same_worker=%d, cross_node=%d",
+                request.request_id,
+                num_computed_tokens, remote_hit_tokens, remote_hit_blocks,
+                total_computed, remaining,
+                same_worker_count, cross_node_count,
             )
 
-        # Track stats
-        self._remote_hits_total += remote_hit_blocks
-        self._local_hits_total += num_local_computed // self.hash_block_size
-
-        # Classify hits for logging
-        local_owner_count = 0
-        remote_owner_count = 0
-        for i, h in enumerate(remaining_hashes[:remote_hit_blocks]):
-            key = h.hex() if isinstance(h, bytes) else str(h)
-            owner = self._v6d_storage.lookup_block(key)
-            if owner == self._worker_id:
-                local_owner_count += 1
+            # Signal "instant transfer complete" so _update_waiting_for_remote_kv
+            # finds this request ready on the next scheduling step.
+            scheduler = get_scheduler_ref()
+            if scheduler is not None:
+                scheduler.finished_recving_kv_req_ids.add(request.request_id)
             else:
-                remote_owner_count += 1
+                logger.warning(
+                    "[MockHybridConnector] No scheduler ref! "
+                    "Cannot signal transfer complete for %s",
+                    request.request_id,
+                )
 
-        logger.info(
-            "[MockHybridConnector] Request %s: "
-            "local_prefix=%d tokens, remote_hit=%d tokens (%d blocks), "
-            "total_computed=%d, remaining=%d | "
-            "owners: same_worker=%d, cross_node=%d",
-            req.request_id,
-            num_local_computed, remote_hit_tokens, remote_hit_blocks,
-            total_computed, num_new_tokens,
-            local_owner_count, remote_owner_count,
-        )
+            # load_kv_async=True triggers WAITING_FOR_REMOTE_KVS path
+            # which uses block-aligned cache_blocks in
+            # _update_waiting_for_remote_kv
+            return remote_hit_tokens, True
 
-        # Step 5: Add request to scheduler (mirrors sched_add_req)
-        scheduler.add_request(req)
-        return True
-
-    # ------------------------------------------------------------------
-    # get_num_new_matched_tokens: ALWAYS returns (0, False)
-    # This matches real HybridConnector behavior exactly.
-    # ------------------------------------------------------------------
-
-    def get_num_new_matched_tokens(
-        self, request: "Request", num_computed_tokens: int
-    ) -> tuple[int, bool]:
-        """Always returns (0, False) — same as real HybridConnector.
-
-        Remote hits are handled in on_add_req(), not here.
-        """
         return 0, False
 
     # ------------------------------------------------------------------
@@ -305,15 +238,17 @@ class MockHybridConnector:
     ) -> tuple[bool, dict[str, Any] | None]:
         """Register all block hashes to etcd for cross-node visibility.
 
-        Replaces V6D's seal() operation in real system. After prefill
-        completes, blocks become discoverable by other nodes via etcd.
+        After prefill completes, blocks become discoverable by other nodes.
         """
         if request.block_hashes:
-            worker_id = self._worker_id or "unknown"
+            # Use worker_id directly (may be None — consistent with lookup)
+            worker_id = self._worker_id
             registered = 0
             for h in request.block_hashes:
                 key = h.hex() if isinstance(h, bytes) else str(h)
-                if self._v6d_storage.register_block(key, worker_id):
+                # Store worker_id as-is (None stored as "None" string in JSON)
+                value = worker_id if worker_id is not None else "__self__"
+                if self._v6d_storage.register_block(key, value):
                     registered += 1
             self._registered_blocks += registered
             logger.debug(
@@ -337,7 +272,7 @@ class MockHybridConnector:
         self, request: "Request", blocks: "KVCacheBlocks",
         num_external_tokens: int
     ) -> None:
-        """No-op: blocks are pre-allocated in on_add_req."""
+        """No-op: scheduler handles allocation directly."""
         pass
 
     def build_connector_meta(
@@ -406,7 +341,6 @@ class MockHybridConnector:
 
     def get_kv_connector_stats(self):
         return None
-
 
     def get_finished_count(self):
         """Return None to use default world_size for output aggregation."""
