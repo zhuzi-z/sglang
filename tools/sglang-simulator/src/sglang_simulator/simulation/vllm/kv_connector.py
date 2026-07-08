@@ -148,14 +148,25 @@ class MockHybridConnector:
 
         # Step 1: Find local prefix hits
         # (same as sched_allocate_slots does in real HybridConnector)
+        #
+        # NOTE: suppress prefix_cache_stats recording for this internal probe.
+        # If there is no remote hit we return False and the scheduler will
+        # re-run get_computed_blocks (which records stats there). Recording
+        # here too would double-count the local prefix stats for every request
+        # NOT eaten by the connector, polluting "Prefix cache hit rate".
+        kv_cache_manager = scheduler.kv_cache_manager
+        prev_log_stats = kv_cache_manager.log_stats
         try:
+            kv_cache_manager.log_stats = False
             computed_blocks, num_local_computed = (
-                scheduler.kv_cache_manager.get_computed_blocks(req)
+                kv_cache_manager.get_computed_blocks(req)
             )
         except Exception as e:
             logger.warning(
                 "[MockHybridConnector] get_computed_blocks failed: %s", e)
             return False
+        finally:
+            kv_cache_manager.log_stats = prev_log_stats
 
         # Step 2: Query etcd for remote hits starting after local prefix
         num_skipped_blocks = num_local_computed // self.hash_block_size
@@ -176,15 +187,27 @@ class MockHybridConnector:
         if remote_hit_tokens == 0:
             return False
 
-        # Step 3: Allocate blocks for the full request
-        # (mirrors sched_allocate_slots in real system)
+        # Step 3: Allocate blocks for ONLY the connector-loaded prefix.
+        #
+        # The real HybridConnector allocates just the remote-loaded prefix
+        # (block-aligned) with delay_cache_blocks=True, moves the request to
+        # WAITING_FOR_REMOTE_KV, and once the async load finishes the scheduler
+        # (_update_waiting_for_remote_kv) caches those blocks into the LOCAL
+        # prefix cache and lets normal scheduling prefill the rest.
+        #
+        # This mock has no async load, so we replicate that completion path
+        # synchronously (Step 3b). Allocating ONLY remote_hit_tokens keeps the
+        # new allocation block-aligned, which is REQUIRED for cache_blocks to
+        # cache the mamba blocks (mamba "light" mode caches one aligned block
+        # per call). The remaining prompt tokens are prefilled + cached later by
+        # the normal scheduler loop (request enters with num_computed_tokens>0).
         total_computed = num_local_computed + remote_hit_tokens
         num_new_tokens = req.num_tokens - total_computed
 
         try:
             new_blocks = scheduler.kv_cache_manager.allocate_slots(
                 req,
-                num_new_tokens + remote_hit_tokens,
+                remote_hit_tokens,
                 num_local_computed,
                 computed_blocks,
                 delay_cache_blocks=True,
@@ -201,9 +224,31 @@ class MockHybridConnector:
                 req.request_id)
             return False
 
+        # Step 3b: Cache the connector-loaded prefix into the LOCAL prefix
+        # cache, mirroring Scheduler._update_waiting_for_remote_kv (the real
+        # HybridConnector completion path). Without this the served prefix is
+        # never locally cached, so every later request with the same prefix
+        # keeps going through V6D -- collapsing the local prefix hit rate.
+        try:
+            kv_cache_manager.cache_blocks(req, total_computed)
+        except Exception as e:
+            logger.warning(
+                "[MockHybridConnector] local cache_blocks failed: %s", e)
+
         # Step 4: Update request state (mirrors _step_loaded)
         req.num_computed_tokens = total_computed
         req.num_external_computed_tokens = remote_hit_tokens
+
+        # Record the LOCAL prefix hit exactly once for this eaten request.
+        # (We suppressed recording during the probe above; the scheduler will
+        # NOT re-run get_computed_blocks for eaten requests because they enter
+        # with num_computed_tokens > 0 -> the scheduler "else" branch.)
+        if prev_log_stats and kv_cache_manager.prefix_cache_stats is not None:
+            kv_cache_manager.prefix_cache_stats.record(
+                num_tokens=req.num_tokens,
+                num_hits=num_local_computed,
+                preempted=req.num_preemptions > 0,
+            )
 
         # Track stats
         self._remote_hits_total += remote_hit_blocks
