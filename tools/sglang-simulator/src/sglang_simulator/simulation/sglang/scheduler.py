@@ -75,18 +75,26 @@ class ReqDispatcher:
             []
         )  # tuple(created time, salt, request)
 
+        self._num_expected_new_reqs: int = -1
+        self._num_received_new_reqs = 0
         self._can_dispatch = False
         self.clock_aligned_with_first_req = False
 
+    def set_num_new_reqs(self, num: int):
+        self._num_expected_new_reqs = num
+
     def disable_dispatch(self):
+        self._num_received_new_reqs = 0
         self._can_dispatch = False
 
     def enable_dispatch(self):
-        self._can_dispatch = True
+        pass
     
     def reset(self):
         self.immediate_release_requests.clear()
         self.future_queue.clear()
+        self._num_expected_new_reqs = -1
+        self._num_received_new_reqs = 0
         self._can_dispatch = False
         self.clock_aligned_with_first_req = False
 
@@ -131,6 +139,7 @@ class ReqDispatcher:
                         "Add request to waiting queue with custom queue start timestamp."
                     )
 
+                self._num_received_new_reqs += 1
                 self.future_queue.append(
                     (
                         sim_params.get("queue_start") or sim_params["created_time"],
@@ -143,15 +152,18 @@ class ReqDispatcher:
                 _, _, gen_req = self.future_queue[-1]
                 # If the number of requests is not provided, the `_can_dispatch` will be triggered by user input.
                 total_request = gen_req.sampling_params.custom_params["simulation"].get(
-                    "total_request", float("inf")
+                    "total_request"
                 )
 
-                if len(self.future_queue) == total_request:
+                if total_request:
+                    self._num_expected_new_reqs = total_request
+
+                if self._num_received_new_reqs == self._num_expected_new_reqs:
                     self._can_dispatch = True
                     logger.info("All requests received. Starting simulation now.")
                 else:
                     logger.info(
-                        f"Offline simulation mode enabled. {total_request} requests expected in total. Received {len(self.future_queue)} requests so far."
+                        f"Offline simulation mode enabled. {self._num_received_new_reqs} requests expected in total. Received {len(self.future_queue)} requests so far."
                     )
 
     def dispatch(self) -> list:
@@ -267,7 +279,6 @@ class C_SchedulerHook(BaseHook):
         original_process_batch_result = target.process_batch_result
         original_event_loop_normal = target.event_loop_normal
         original_init_request_dispatcher = target.init_request_dispatcher
-        original_stream_output_generation = target.stream_output_generation
 
         def override_event_loop_overlap(self, *args, **kwargs):
             # To reduce the complexity of the simulation, the overlapping schedule is not needed.
@@ -291,6 +302,13 @@ class C_SchedulerHook(BaseHook):
             setattr(server_args, "decode_attention_backend", "torch_native")
 
             original_init(self, *args, **kwargs)
+
+            if hasattr(self, "send_to_detokenizer"):
+                hijack_send_to_detokenizer_send_output(getattr(self, "send_to_detokenizer"))
+            elif hasattr(self, "ipc_channels") and hasattr(self.ipc_channels, "send_to_detokenizer"):
+                hijack_send_to_detokenizer_send_output(getattr(self.ipc_channels, "send_to_detokenizer"))
+            else:
+                logger.error("Fail to hijack the send_to_detokenizer's send_output, which return request's statistic information.")
 
             try:
                 if ConfigManager.get_model_info() is None:
@@ -485,6 +503,13 @@ class C_SchedulerHook(BaseHook):
                     # so advance global_clock but DO NOT include it in this request's
                     # response_time.
                     StateManager.step_global_clock(hicache_l2_backup_dur)
+
+                now = time.time()
+                if not ConfigManager.ignore_cpu_overhead():
+                    cpu_overhead = now - StateManager.get_last_real_time_ts()
+                    StateManager.step_global_clock(cpu_overhead)
+                StateManager.set_last_real_time_ts(now)
+
                 # Request statistics
                 for req in batch.reqs:
                     if len(req.output_ids) != 0:  # not chunked
@@ -506,10 +531,23 @@ class C_SchedulerHook(BaseHook):
                         "l2_backup_latency": hicache_l2_backup_dur,
                     }
                 )
-            StateManager.set_last_real_time_ts(time.time())
             return ret
 
         def override_profile(req, *args, **kwargs):
+
+            from sglang.srt.managers.io_struct import ProfileReqType
+            from sglang.srt.managers.io_struct import ProfileReqOutput
+
+            if req.type == ProfileReqType.START_PROFILE and req.profile_prefix is not None:
+                try:
+                    config = json.loads(req.profile_prefix)
+                    if config["type"] == "config":
+                        if config.get("num_new_reqs"):
+                            ReqDispatcher(C_SchedulerHook.SIM_MODE).set_num_new_reqs(config.get("num_new_reqs"))
+                    return ProfileReqOutput(True, "Configured")
+                except Exception:
+                    logger.warning(f"Fail to get configuration from req's attr `profile_prefix={req.profile_prefix}`")
+
             stats: list[RequestStats] = []
             for item in request_stats_manager.get_all_req_stats():
                 if item.rid is not None and item.input_length > 0:
@@ -569,10 +607,6 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST = 0
             C_SchedulerHook.REQ_DISPATCHER.reset()
 
-            ProfileReqOutput = getattr(
-                importlib.import_module("sglang.srt.managers.io_struct"),
-                "ProfileReqOutput",
-            )
             result = {
                 "total_request": len(stats),
                 "output_directory": output_dir,
@@ -597,8 +631,8 @@ class C_SchedulerHook(BaseHook):
         def override_continue_generation(self, *args, **kwargs):
             C_SchedulerHook.REQ_DISPATCHER.enable_dispatch()
 
-        def wrapped_stream_output_generation(self, reqs, *args, **kwargs):
-            original_send_output = self.send_to_detokenizer.send_output
+        def hijack_send_to_detokenizer_send_output(send_to_detokenizer):
+            original_send_output = send_to_detokenizer.send_output
 
             def dummy_send_output(output, recv_obj=None):
                 for rid, finish_reason in zip(output.rids, output.finished_reasons):
@@ -619,11 +653,7 @@ class C_SchedulerHook(BaseHook):
 
                 original_send_output(output, recv_obj)
 
-            try:
-                self.send_to_detokenizer.send_output = dummy_send_output
-                return original_stream_output_generation(self, reqs, *args, **kwargs)
-            finally:
-                self.send_to_detokenizer.send_output = original_send_output
+            send_to_detokenizer.send_output = dummy_send_output
 
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
@@ -635,7 +665,6 @@ class C_SchedulerHook(BaseHook):
         target.init_request_dispatcher = wrapped_init_request_dispatcher
         target.pause_generation = override_pause_generation
         target.continue_generation = override_continue_generation
-        target.stream_output_generation = wrapped_stream_output_generation
 
         if original_recv_requests:
             # version <= 0.5.12.post1

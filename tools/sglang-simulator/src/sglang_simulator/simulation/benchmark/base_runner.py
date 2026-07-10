@@ -8,7 +8,7 @@ class BaseWorker:
     def pause_generation(self):
         pass
 
-    def continue_generation(self):
+    def continue_generation(self, num_new_reqs: int):
         pass
 
     def get_request_stats(self) -> list[dict]:

@@ -24,6 +24,7 @@ class ConfigManager:
     _platform_config: Optional[PlatformConfig] = None
     _scheduler_config: Optional[SchedulerConfig] = None
     _raw_config: Optional[dict] = None
+    _ignore_cpu_overhead: Optional[bool] = None
 
     @classmethod
     def _get_raw_config(cls) -> dict:
@@ -186,3 +187,12 @@ class ConfigManager:
             )
         else:
             raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")
+
+    @classmethod
+    def ignore_cpu_overhead(cls) -> bool:
+        if cls._ignore_cpu_overhead is None:
+            raw_config = cls._get_raw_config()
+            cls._ignore_cpu_overhead = raw_config.get("scheduler", {}).get(
+                "ignore_cpu_overhead", False
+            )
+        return cls._ignore_cpu_overhead

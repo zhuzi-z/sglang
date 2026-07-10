@@ -68,6 +68,10 @@ class SGLangWorker(BaseWorker):
     def generate(self, req: GenericRequest):
         self._engine.loop.run_until_complete(self.async_generate(req))
 
+    async def configure(self, config: dict):
+        config.update({"type": "config"})
+        await self._engine.tokenizer_manager.start_profile(profile_prefix=json.dumps(config)) 
+
     async def trigger_simulation(self, output_dir: str | None = None):
         if output_dir is None:
             self.output_dir = f"/tmp/sglang_simulator/{self.name}"
@@ -106,9 +110,10 @@ class SGLangWorker(BaseWorker):
             PauseGenerationReqInput(mode="in_place")
         )
 
-    async def continue_generation(self):
+    async def continue_generation(self, num_new_reqs: int = -1):
         from sglang.srt.managers.io_struct import ContinueGenerationReqInput
 
+        await self.configure({"num_new_reqs": num_new_reqs})
         await self._engine.tokenizer_manager.continue_generation(
             ContinueGenerationReqInput()
         )

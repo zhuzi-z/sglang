@@ -102,5 +102,6 @@ class C_PagedTokenToKVPoolAllocatorHook(BaseHook):
             if self.device == "cpu":
                 self.alloc_extend = types.MethodType(alloc_extend, self)
                 self.alloc_decode = types.MethodType(alloc_decode, self)
+                self.roundup = self.page_size - 1
 
         target.__init__ = wrapped_init

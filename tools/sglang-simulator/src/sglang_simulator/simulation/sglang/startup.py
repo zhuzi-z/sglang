@@ -38,6 +38,7 @@ def init_hook():
             hiradix_cache.C_HiRadixCacheHook,
             mem_pool.C_MambaPoolHook,
             mem_pool.C_DeepSeekV4SingleKVPoolHook,
+            mem_pool.C_DSATokenToKVPoolHook,
             mem_cache_allocator.C_PagedTokenToKVPoolAllocatorHook,
             mem_pool_host.C_HostKVCacheHook,
             disaggregation.C_DecodePreallocQueueHook,

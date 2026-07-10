@@ -49,7 +49,6 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
 
             req.custom_params.update(
                 {
-                    "total_request": len(dataset),  # include the warmup requests.
                     "created_time": created_time,
                 }
             )
@@ -67,13 +66,17 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
             await worker.pause_generation()
 
         tasks = []
+        worker_request_count = {w.name: 0 for w in self.workers}
         logger.info(f"Created {len(dataset)} request tasks.")
         for req in self.get_request(
             dataset,
             ignore_timestamp=benchmark_config.ignore_request_timestamp,
             request_rate=benchmark_config.request_rate,
+            with_req_num=len(self.workers) > 1
         ):
             worker = self.lb_proxy.select_worker(self.workers, req)
+            worker_request_count[worker.name] += 1
+
             if worker.name not in self.lb_routing_records:
                 self.lb_routing_records[worker.name] = []
             self.lb_routing_records[worker.name].append(req)
@@ -91,7 +94,7 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
             tasks.append(task)
 
         for worker in self.workers:
-            await worker.continue_generation()
+            await worker.continue_generation(num_new_reqs=worker_request_count[worker.name])
 
         _ = await asyncio.gather(*tasks)
 
