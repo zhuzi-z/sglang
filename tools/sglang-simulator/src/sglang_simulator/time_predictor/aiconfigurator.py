@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import numpy as np
@@ -132,6 +133,18 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         self.prefill_scale_factor = prefill_scale_factor
         self.decode_scale_factor = decode_scale_factor
         self.prefill_min_latency = prefill_min_latency
+        self.fixed_step_latency_s = self._get_fixed_step_latency_s()
+        self.enable_oom_check = enable_oom_check
+        self._is_oom = False
+
+        if self.fixed_step_latency_s is not None:
+            logger.info(
+                "AIConfigurator predictor bypassed: fixed step latency = %.6f s",
+                self.fixed_step_latency_s,
+            )
+            self._session = None
+            return
+
         if isinstance(database_mode, str):
             database_mode = self._get_database_mode(database_mode)
 
@@ -170,7 +183,28 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         )
 
         self.enable_oom_check = enable_oom_check
-        self._is_oom = False
+
+    def _get_fixed_step_latency_s(self) -> Optional[float]:
+        value = os.environ.get("SGLANG_SIMULATOR_FIXED_STEP_LATENCY_MS")
+        if value is None or value == "":
+            return None
+        try:
+            latency_ms = float(value)
+        except ValueError:
+            logger.warning(
+                "Invalid SGLANG_SIMULATOR_FIXED_STEP_LATENCY_MS=%r, "
+                "falling back to AIConfigurator predictor.",
+                value,
+            )
+            return None
+        if latency_ms < 0:
+            logger.warning(
+                "Invalid SGLANG_SIMULATOR_FIXED_STEP_LATENCY_MS=%r: "
+                "latency must be non-negative, falling back to AIConfigurator predictor.",
+                value,
+            )
+            return None
+        return latency_ms / 1e3
 
     def _get_database_mode(self, mode: str) -> DatabaseMode:
         return {
@@ -257,6 +291,9 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         return latency_dict
 
     def predict_infer_time(self, batch: ScheduleBatch) -> float:
+        if self.fixed_step_latency_s is not None:
+            return self.fixed_step_latency_s
+
         latency_dict = self.predict_infer_latency_dict(batch)
         infer_time = sum(latency_dict.values())
 
