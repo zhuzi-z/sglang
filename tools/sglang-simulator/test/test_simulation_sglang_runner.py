@@ -73,6 +73,7 @@ def run_sgl_benchmark(server_args: dict):
     metrics = runner.benchmark(benchmark_config, dataset=cached_ds)
     assert metrics["kv_cache_storage_hit_ratio"] > 0.95
 
+    worker.clear_hicache_storage()
     runner.shutdown()
 
 

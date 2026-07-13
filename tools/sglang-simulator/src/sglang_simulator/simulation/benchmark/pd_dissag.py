@@ -1,6 +1,7 @@
 import asyncio
 import random
 from typing import Iterator
+from collections import defaultdict
 
 import numpy as np
 from sglang_simulator.dataset import BaseDataset, GenericRequest
@@ -29,6 +30,10 @@ class PDDisaggBenchmarkRunner(BaseBenchmarkRunner):
     ):
         self.prefill_workers = prefill_workers
         self.decode_workers = decode_workers
+        assert len(set(w.name for w in prefill_workers + decode_workers)) == \
+                len(prefill_workers) + len(decode_workers), "The worker's names should be unique."
+        self.worker_request_count: dict[str, int] = defaultdict(int)
+
         self.prefill_lb_proxy = prefill_lb_proxy or RoundRobinPolicy()
         self.decode_lb_proxy = decode_lb_proxy or RoundRobinPolicy()
         self.prefill_lb_proxy.init_workers(prefill_workers)
@@ -74,8 +79,10 @@ class PDDisaggBenchmarkRunner(BaseBenchmarkRunner):
         )
         if prefill_worker:
             self.lb_routing_records.setdefault(prefill_worker.name, []).append(req)
+            self.worker_request_count[prefill_worker.name] += 1
         if decode_worker:
             self.lb_routing_records.setdefault(decode_worker.name, []).append(req)
+            self.worker_request_count[decode_worker.name] += 1
 
         req.extra_args.update({
             "bootstrap_host": "2.2.2.2",   # fake bootstrap host
@@ -202,7 +209,7 @@ class PDDisaggBenchmarkRunner(BaseBenchmarkRunner):
             ))
 
         for worker in self.prefill_workers:
-            await worker.continue_generation()
+            await worker.continue_generation(num_new_reqs=self.worker_request_count[worker.name])
         
         prefill_stats_list = await asyncio.gather(*prefill_gen_tasks)
 
@@ -213,7 +220,7 @@ class PDDisaggBenchmarkRunner(BaseBenchmarkRunner):
             ))
 
         for worker in self.decode_workers:
-            await worker.continue_generation()
+            await worker.continue_generation(num_new_reqs=self.worker_request_count[worker.name])
         
         decode_stats_list = await asyncio.gather(*decode_gen_tasks)
 

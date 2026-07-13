@@ -72,7 +72,6 @@ class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):
             dataset,
             ignore_timestamp=benchmark_config.ignore_request_timestamp,
             request_rate=benchmark_config.request_rate,
-            with_req_num=len(self.workers) > 1
         ):
             worker = self.lb_proxy.select_worker(self.workers, req)
             worker_request_count[worker.name] += 1

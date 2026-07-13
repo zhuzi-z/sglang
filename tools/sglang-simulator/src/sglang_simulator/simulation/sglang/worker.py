@@ -43,7 +43,7 @@ class SGLangWorker(BaseWorker):
 
     def clear_hicache_storage(self):
         self._engine.loop.run_until_complete(
-            self.engine.tokenizer_manager.clear_hicache_storage()
+            self._engine.tokenizer_manager.clear_hicache_storage()
         )
 
     async def async_generate(self, req: GenericRequest):

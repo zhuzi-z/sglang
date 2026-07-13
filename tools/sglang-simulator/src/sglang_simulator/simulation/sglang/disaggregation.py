@@ -61,30 +61,38 @@ class C_DecodePreallocQueueHook(BaseHook):
 
         original_extend = target.extend
         original_commit_transfer_to_req = target._commit_transfer_to_req
+        original_poll_with_metadata_gate = target._poll_with_metadata_gate
+        original_poll_with_staging = target._poll_with_staging
+
+        def _downgrade_incomplete_polls(polls, decode_reqs):
+            from sglang.srt.disaggregation.base.conn import KVPoll
+
+            for i, poll_val in enumerate(polls):
+                if poll_val == int(KVPoll.Success):
+                    decode_req = decode_reqs[i]
+                    completion_time = getattr(
+                        decode_req, "_sim_transfer_completion_time", None
+                    )
+                    if (
+                        completion_time is not None
+                        and StateManager.get_global_clock()
+                        < completion_time
+                    ):
+                        polls[i] = int(KVPoll.Transferring)
+            return polls
 
         def wrapped_extend(self, decode_reqs):
-            # Record the queue entry time when requests enter the transfer
-            # queue (handshake done, prefill begins sending).
+            # Record the queue entry time and estimate the simulated transfer
+            # completion time when requests enter the transfer queue.
+            cls._ensure_initialized()
             current_clock = StateManager.get_global_clock()
             for decode_req in decode_reqs:
                 req_stats = request_stats_manager.get_req_stats(
                     decode_req.req.rid
                 )
                 req_stats.kv_cache_transfer_queue_start_time = current_clock
-            return original_extend(self, decode_reqs)
 
-        def wrapped_commit_transfer_to_req(self, decode_req):
-            # The fake receiver returns Success instantly; defer the actual
-            # commit until the simulated transfer duration has elapsed.
-            cls._ensure_initialized()
-
-            completion_time = getattr(
-                decode_req, "_sim_transfer_completion_time", None
-            )
-
-            if completion_time is None:
-                # First poll: estimate transfer bytes and duration, then record
-                # the expected completion time against the global clock.
+                # Estimate transfer bytes and duration.
                 transfer_tokens = decode_req.req.seqlen - len(
                     decode_req.req.prefix_indices
                 )
@@ -92,21 +100,13 @@ class C_DecodePreallocQueueHook(BaseHook):
                 transfer_dur = cls.TRANSFER_ESTIMATOR.est_transfer_dur(
                     transfer_bytes
                 )
-
-                req_stats = request_stats_manager.get_req_stats(
-                    decode_req.req.rid
-                )
                 req_stats.kv_cache_transfer_duration = transfer_dur
 
                 # Transfers are serialized on a single link: the actual
                 # start is the later of queue entry, current clock, and the
                 # previous transfer's completion time.
-                queue_start_time = req_stats.kv_cache_transfer_queue_start_time
-                if queue_start_time < 0:
-                    queue_start_time = StateManager.get_global_clock()
                 transfer_start_time = max(
-                    queue_start_time,
-                    StateManager.get_global_clock(),
+                    current_clock,
                     cls.LAST_TRANSFER_COMPLETION_TIME,
                 )
                 req_stats.kv_cache_transfer_start_time = transfer_start_time
@@ -117,10 +117,22 @@ class C_DecodePreallocQueueHook(BaseHook):
                     "_sim_transfer_completion_time",
                     completion_time,
                 )
+            return original_extend(self, decode_reqs)
 
-            if StateManager.get_global_clock() >= completion_time:
-                return original_commit_transfer_to_req(self, decode_req)
-            return False
+        def wrapped_poll_with_metadata_gate(self):
+            polls = original_poll_with_metadata_gate(self)
+            return _downgrade_incomplete_polls(polls, self.queue)
+
+        def wrapped_poll_with_staging(self):
+            polls = original_poll_with_staging(self)
+            return _downgrade_incomplete_polls(polls, self.queue)
+
+        def wrapped_commit_transfer_to_req(self, decode_req):
+            # The poll gate ensures this is only called when the simulated
+            # transfer is complete, so we can always delegate to the original.
+            return original_commit_transfer_to_req(self, decode_req)
 
         target.extend = wrapped_extend
         target._commit_transfer_to_req = wrapped_commit_transfer_to_req
+        target._poll_with_metadata_gate = wrapped_poll_with_metadata_gate
+        target._poll_with_staging = wrapped_poll_with_staging
