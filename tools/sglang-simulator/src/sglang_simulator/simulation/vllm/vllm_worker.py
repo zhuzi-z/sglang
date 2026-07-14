@@ -238,9 +238,13 @@ class VLLMWorker(BaseWorker):
     def reset_stats(self):
         """Reset per-request stats for the next benchmark round."""
         from sglang_simulator.simulation.vllm.scheduler import C_VLLMSchedulerHook
+        from sglang_simulator.simulation.manager import StateManager
 
         C_VLLMSchedulerHook.REQUEST_STATS.clear()
         C_VLLMSchedulerHook.ITERATION_STATS.clear()
+        # Reset global simulation state (global_clock, iteration counter, etc.)
+        # to prevent state leakage across consecutive benchmark runs.
+        StateManager.reset()
 
     def get_iteration_stats(self) -> list[dict]:
         """Return per-iteration stats collected by the scheduler hook."""

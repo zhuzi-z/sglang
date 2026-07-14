@@ -219,6 +219,7 @@ class C_VLLMSchedulerHook(BaseHook):
                 # Check if all requests have been received
                 if seq_counter >= total_expected:
                     all_received = True
+                    StateManager.set_last_real_time_ts(time.time())
                     logger.info(
                         "All %d requests received. Starting simulation.",
                         total_expected,
@@ -306,6 +307,10 @@ class C_VLLMSchedulerHook(BaseHook):
                         past_kv_length=req_info.get("kv_cache_len", 0),
                     )
                 )
+            
+            now = time.time()
+            cpu_overhead = now - StateManager.get_last_real_time_ts()
+            StateManager.set_last_real_time_ts(now)
 
             if not simulation_batch.is_empty():
                 StateManager.inc_iteration()
@@ -321,22 +326,35 @@ class C_VLLMSchedulerHook(BaseHook):
                     event_time = time.time()
                 else:
                     StateManager.set_current_inference_dur(predicted_latency)
-                    StateManager.step_global_clock(predicted_latency)
+                    StateManager.step_global_clock(predicted_latency + cpu_overhead)
                     event_time = StateManager.get_global_clock()
 
-                # Record per-token latency for all scheduled requests
                 for req_id in num_scheduled_tokens:
                     st = cls.REQUEST_STATS.get(req_id)
                     if st is not None:
-                        st["gen_token_latencies"].append(
-                            event_time - st["last_event_time"]
-                        )
-                        st["last_event_time"] = event_time
+                        req_obj = self.requests.get(req_id)
+                        if req_obj is not None:
+                            kv_cache_len = request_infos[req_id].get(
+                                "kv_cache_len", 0
+                            )
+                            # Skip if the request is still running with chunked prefill.
+                            is_decode = (
+                                (kv_cache_len + num_scheduled_tokens[req_id]) >= req_obj.num_prompt_tokens
+                            )
+                        else:
+                            is_decode = True  # fallback: treat as decode
+
+                        if is_decode:
+                            st["gen_token_latencies"].append(
+                                event_time - st["last_event_time"]
+                            )
+                            st["last_event_time"] = event_time
 
                 cls.ITERATION_STATS.append(
                     {
                         "requests": simulation_batch.request_info(),
                         "forward_latency": predicted_latency,
+                        "cpu_overhead": cpu_overhead,
                     }
                 )
 
