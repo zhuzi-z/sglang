@@ -309,15 +309,16 @@ class C_VLLMSchedulerHook(BaseHook):
                 )
             
             now = time.time()
-            cpu_overhead = now - StateManager.get_last_real_time_ts()
+            last_real_ts = StateManager.get_last_real_time_ts()
+            cpu_overhead = (now - last_real_ts) if last_real_ts > 0 else 0
             StateManager.set_last_real_time_ts(now)
 
             if not simulation_batch.is_empty():
                 StateManager.inc_iteration()
                 if cls.INFERENCE_PREDICTOR is not None:
-                    predicted_latency = float(
+                    predicted_latency = abs(float(
                         cls.INFERENCE_PREDICTOR.predict_infer_time(simulation_batch)
-                    )
+                    ))
                 else:
                     predicted_latency = 0.001  # fallback: 1ms per step
 
@@ -337,9 +338,10 @@ class C_VLLMSchedulerHook(BaseHook):
                             kv_cache_len = request_infos[req_id].get(
                                 "kv_cache_len", 0
                             )
-                            # Skip if the request is still running with chunked prefill.
+                             # Skip if the request is still running with chunked prefill.
                             is_decode = (
-                                (kv_cache_len + num_scheduled_tokens[req_id]) >= req_obj.num_prompt_tokens
+                                kv_cache_len + num_scheduled_tokens[req_id]
+                                >= req_obj.num_prompt_tokens
                             )
                         else:
                             is_decode = True  # fallback: treat as decode
