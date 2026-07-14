@@ -106,19 +106,47 @@ class C_WorkerHook(BaseHook):
             ) as f:
                 for batch_infos in SCHEDULE_INFOS:
                     f.write(json.dumps(batch_infos) + "\n")
-            
-            with open(
-                f"{SGL_HOOK_REQ_INFO_DIR}/{rank_suffix}.requests.jsonl",
-                "w",
-            ) as f:
-                for req_infos in REQUEST_INFOS.values():
-                    f.write(json.dumps(asdict(req_infos)) + "\n")
 
-            print(f"Data has been saved to {SGL_HOOK_REQ_INFO_DIR}")
+            print(f"Schedule batch data has been saved to {SGL_HOOK_REQ_INFO_DIR}/{rank_suffix}.schedule_batch.jsonl")
             SCHEDULE_INFOS.clear()
-            REQUEST_INFOS.clear()
 
         target.profile = override_profile
+
+
+
+class C_EngineCoreHook(BaseHook):
+
+    HOOK_MODULE_NAME = "vllm.v1.engine.core"
+    HOOK_CLASS_NAME = "EngineCore"
+
+    @classmethod
+    def hook(cls, target) -> None:
+
+        original_profile = target.profile
+
+        def wrapped_profile(self, is_start: bool = True):
+            if not is_start:
+                # stop_profile: export REQUEST_INFOS before delegating to
+                # the executor (which forwards profile to workers).
+                SGL_HOOK_REQ_INFO_DIR = os.getenv(
+                    "SGL_HOOK_REQ_INFO_DIR", os.getcwd()
+                )
+
+                with open(
+                    f"{SGL_HOOK_REQ_INFO_DIR}/rank0.requests.jsonl", "w"
+                ) as f:
+                    for req_infos in REQUEST_INFOS.values():
+                        f.write(json.dumps(asdict(req_infos)) + "\n")
+
+                print(
+                    f"Request data has been saved to "
+                    f"{SGL_HOOK_REQ_INFO_DIR}/rank0.requests.jsonl"
+                )
+                REQUEST_INFOS.clear()
+
+            return original_profile(self, is_start)
+
+        target.profile = wrapped_profile
 
 
 
