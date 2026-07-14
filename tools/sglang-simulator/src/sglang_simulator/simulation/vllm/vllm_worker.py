@@ -240,6 +240,13 @@ class VLLMWorker(BaseWorker):
         from sglang_simulator.simulation.vllm.scheduler import C_VLLMSchedulerHook
 
         C_VLLMSchedulerHook.REQUEST_STATS.clear()
+        C_VLLMSchedulerHook.ITERATION_STATS.clear()
+
+    def get_iteration_stats(self) -> list[dict]:
+        """Return per-iteration stats collected by the scheduler hook."""
+        from sglang_simulator.simulation.vllm.scheduler import C_VLLMSchedulerHook
+
+        return list(C_VLLMSchedulerHook.ITERATION_STATS)
 
     # ------------------------------------------------------------------
     # Sync interface

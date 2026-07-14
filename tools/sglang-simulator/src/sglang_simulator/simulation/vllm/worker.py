@@ -446,11 +446,32 @@ class C_VLLMWorkerHook(BaseHook):
 
             # Build mock output
             req_ids = list(num_scheduled_tokens.keys()) if num_scheduled_tokens else []
+
+            # Determine which requests are still in prefill (chunked prefill).
+            # During prefill, the model runner must return empty sampled_token_ids
+            # so the scheduler does not prematurely finish the request.
+            # NOTE: _update_after_schedule has already advanced each request's
+            # num_computed_tokens before execute_model is called, but the values
+            # captured in scheduler_output are pre-advance.
+            prefill_req_ids = set()
+            for new_req in scheduler_output.scheduled_new_reqs:
+                sched = num_scheduled_tokens.get(new_req.req_id, 0)
+                prompt_len = len(new_req.prompt_token_ids) if new_req.prompt_token_ids else 0
+                if new_req.num_computed_tokens + sched < prompt_len:
+                    prefill_req_ids.add(new_req.req_id)
+            cached_reqs = scheduler_output.scheduled_cached_reqs
+            if cached_reqs and cached_reqs.num_prefill_tokens:
+                for i, req_id in enumerate(cached_reqs.req_ids):
+                    sched = num_scheduled_tokens.get(req_id, 0)
+                    prompt_len = cached_reqs.num_prefill_tokens[i]
+                    if cached_reqs.num_computed_tokens[i] + sched < prompt_len:
+                        prefill_req_ids.add(req_id)
+
             import dataclasses as _dc
             mro_kwargs = dict(
                 req_ids=req_ids,
                 req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
-                sampled_token_ids=[[1] for _ in req_ids],
+                sampled_token_ids=[[] if rid in prefill_req_ids else [1] for rid in req_ids],
                 logprobs=None,
                 prompt_logprobs_dict={},
             )

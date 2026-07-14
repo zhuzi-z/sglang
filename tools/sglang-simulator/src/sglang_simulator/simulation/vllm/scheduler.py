@@ -45,6 +45,10 @@ class C_VLLMSchedulerHook(BaseHook):
     #   gen_token_latencies, last_event_time, created_time
     REQUEST_STATS: dict[str, dict] = {}
 
+    # Per-iteration stats collected during simulation.
+    # Each entry: {iteration, forward_mode, request_infos, iter_latency, forward_latency}
+    ITERATION_STATS: list[dict] = []
+
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
@@ -270,57 +274,36 @@ class C_VLLMSchedulerHook(BaseHook):
                 if cls.SIM_MODE == SimulationMode.BLOCKING
                 else StateManager.get_global_clock()
             )
-            for req_id, num_tokens in num_scheduled_tokens.items():
-                _inst_first = getattr(self, "_sim_req_first_scheduled", req_first_scheduled)
-                if req_id not in _inst_first:
-                    _inst_first.add(req_id)
-                    if req_id in cls.REQUEST_STATS:
-                        cls.REQUEST_STATS[req_id]["queue_end"] = queue_end_time
-                    # Track prefix cache hit: final_device_hit_len = total reused (L1+L2),
-                    # final_host_hit_len = L2 portion. Metric layer subtracts for per-level ratios.
-                    request = self.requests.get(req_id)
-                    if request is not None:
-                        total_hit_len = request.num_computed_tokens - num_tokens
-                        host_hit_len = 0
-                        # Try prefill_stats (public vLLM) or num_external_computed_tokens (modified vLLM)
-                        if (
-                            hasattr(request, "prefill_stats")
-                            and request.prefill_stats is not None
-                        ):
-                            host_hit_len = (
-                                getattr(
-                                    request.prefill_stats,
-                                    "num_external_cached_tokens",
-                                    0,
-                                )
-                                or 0
-                            )
-                        if host_hit_len == 0:
-                            host_hit_len = getattr(
-                                request, "num_external_computed_tokens", 0
-                            ) or 0
-                        if total_hit_len > 0 and req_id in cls.REQUEST_STATS:
-                            cls.REQUEST_STATS[req_id]["final_device_hit_len"] = (
-                                total_hit_len
-                            )
-                        if host_hit_len > 0 and req_id in cls.REQUEST_STATS:
-                            cls.REQUEST_STATS[req_id]["final_host_hit_len"] = (
-                                host_hit_len
-                            )
+
+            for req in scheduler_output.scheduled_new_reqs:
+                rid = req.req_id
+                
+                cls.REQUEST_STATS[rid].update(
+                    {
+                        "queue_end": queue_end_time,
+                        "final_device_hit_len": req.num_computed_tokens
+                    }
+                )
+
+            request_infos = {}
+            for req_id, sched_token in scheduler_output.num_scheduled_tokens.items():
+                request_infos[req_id] = {"extend_input_len": sched_token}
+
+            for req_id, completed_token in zip(
+                scheduler_output.scheduled_cached_reqs.req_ids, 
+                scheduler_output.scheduled_cached_reqs.num_computed_tokens
+            ):
+                request_infos[req_id]["kv_cache_len"] = completed_token
+            
+            for req in scheduler_output.scheduled_new_reqs:
+                request_infos[req.req_id]["kv_cache_len"] = req.num_computed_tokens
 
             simulation_batch = ScheduleBatch(reqs=[])
-            for req_id, num_tokens in num_scheduled_tokens.items():
-                request = self.requests.get(req_id)
-                if request is None:
-                    continue
-                # _update_after_schedule() already advanced num_computed_tokens,
-                # so past_kv_length = num_computed_tokens - num_tokens.
-                # extend_length = num_tokens directly (prefill > 1, decode == 1).
-                past_kv_length = request.num_computed_tokens - num_tokens
+            for req_info in request_infos.values():
                 simulation_batch.reqs.append(
                     ScheduleRequest(
-                        extend_length=num_tokens,
-                        past_kv_length=max(0, past_kv_length),
+                        extend_length=req_info["extend_input_len"],
+                        past_kv_length=req_info.get("kv_cache_len", 0),
                     )
                 )
 
@@ -349,6 +332,13 @@ class C_VLLMSchedulerHook(BaseHook):
                             event_time - st["last_event_time"]
                         )
                         st["last_event_time"] = event_time
+
+                cls.ITERATION_STATS.append(
+                    {
+                        "requests": simulation_batch.request_info(),
+                        "forward_latency": predicted_latency,
+                    }
+                )
 
             return scheduler_output
 
