@@ -3,6 +3,12 @@
 Loads a joblib pickle of a sklearn-compatible regressor and predicts forward latency
 from batch composition features. Train one with `train_latency_model.py`.
 
+Supports two bundle formats:
+  - Single model:  {"model": regressor, "features": [...]}
+  - Dual model:    {"prefill": regressor, "decode": regressor, "features": [...]}
+    The dual format routes decode batches (all extend==1) to the decode model
+    and everything else to the prefill model, avoiding scale-mismatch issues.
+
 hisim_config.json usage:
     "predictor": {
         "name": "ml",
@@ -67,12 +73,42 @@ class MLTimePredictor(InferTimePredictor):
             )
 
         bundle = joblib.load(database_path)
-        if isinstance(bundle, dict) and "model" in bundle:
-            self._model = bundle["model"]
+        self._prefill_model = None
+        self._decode_model = None
+
+        if isinstance(bundle, dict) and "prefill" in bundle and "decode" in bundle:
+            # Dual-model bundle: separate prefill/decode regressors
+            self._prefill_model = bundle["prefill"]
+            self._decode_model = bundle["decode"]
             saved_features = bundle.get("features", self.FEATURE_NAMES)
+            logger.info(
+                "MLTimePredictor dual-model loaded from %s "
+                "(prefill=%s, decode=%s, n_features=%d, latency_scale=%.4f)",
+                database_path,
+                type(self._prefill_model).__name__,
+                type(self._decode_model).__name__,
+                len(saved_features), float(latency_scale),
+            )
+        elif isinstance(bundle, dict) and "model" in bundle:
+            # Single-model bundle (backward compatible)
+            self._prefill_model = bundle["model"]
+            self._decode_model = bundle["model"]
+            saved_features = bundle.get("features", self.FEATURE_NAMES)
+            logger.info(
+                "MLTimePredictor loaded from %s (model=%s, n_features=%d, latency_scale=%.4f)",
+                database_path, type(self._prefill_model).__name__,
+                len(saved_features), float(latency_scale),
+            )
         else:
-            self._model = bundle
+            # Bare regressor (backward compatible)
+            self._prefill_model = bundle
+            self._decode_model = bundle
             saved_features = self.FEATURE_NAMES
+            logger.info(
+                "MLTimePredictor loaded from %s (model=%s, n_features=%d, latency_scale=%.4f)",
+                database_path, type(self._prefill_model).__name__,
+                len(saved_features), float(latency_scale),
+            )
 
         if list(saved_features) != list(self.FEATURE_NAMES):
             logger.warning(
@@ -83,15 +119,10 @@ class MLTimePredictor(InferTimePredictor):
         self._features = saved_features
         self._call_count = 0
         self._latency_scale = float(latency_scale)
-        logger.info(
-            "MLTimePredictor loaded from %s (model=%s, n_features=%d, latency_scale=%.4f)",
-            database_path, type(self._model).__name__, len(self._features), self._latency_scale,
-        )
 
-    def predict_infer_time(self, batch: ScheduleBatch) -> float:
-        if batch.is_empty():
-            return 0.0
-
+    @staticmethod
+    def _extract_features(batch: ScheduleBatch) -> list[float]:
+        """Extract 18-dim feature vector from a ScheduleBatch."""
         exts = [req.extend_length for req in batch.reqs]
         pasts = [req.past_kv_length for req in batch.reqs]
 
@@ -104,7 +135,7 @@ class MLTimePredictor(InferTimePredictor):
         max_e = max(exts); max_p = max(pasts)
         min_e = min(exts); min_p = min(pasts)
 
-        feats = [
+        return [
             bs, sum_e, max_e, min_e,
             sum_p, max_p, min_p,
             sum_ep, sum_e2, sum_p2,
@@ -118,5 +149,13 @@ class MLTimePredictor(InferTimePredictor):
             int(any(e > 1 for e in exts)),
         ]
 
+    def predict_infer_time(self, batch: ScheduleBatch) -> float:
+        if batch.is_empty():
+            return 0.0
+
+        feats = self._extract_features(batch)
+        is_decode = feats[-2] == 1  # is_decode feature
+        model = self._decode_model if is_decode else self._prefill_model
+
         self._call_count += 1
-        return float(self._model.predict([feats])[0]) * self._latency_scale
+        return float(model.predict([feats])[0]) * self._latency_scale
