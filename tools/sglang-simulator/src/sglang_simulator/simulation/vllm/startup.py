@@ -13,6 +13,7 @@ from sglang_simulator.simulation.vllm import (
     kv_connector,
     kv_offload,
     platform,
+    profile_hook,
     scheduler,
     v6d_backend,
     v6d_manager,
@@ -112,6 +113,9 @@ def init_hook():
             worker.C_VLLMWorkerHook,
             # Scheduler hook for time prediction
             scheduler.C_VLLMSchedulerHook,
+            # Profile hook — hijacks /start_profile & /stop_profile to
+            # export REQUEST_STATS / ITERATION_STATS in serving scenarios
+            profile_hook.C_VLLMProfileHook,
             # KV connector factory hook (returns MockOffloadConnector)
             kv_connector.C_KVConnectorFactoryHook,
             # Native SimpleCPUOffloadWorker hook (bypasses CUDA for native offload)

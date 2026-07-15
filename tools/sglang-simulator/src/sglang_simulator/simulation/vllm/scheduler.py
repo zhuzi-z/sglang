@@ -278,11 +278,16 @@ class C_VLLMSchedulerHook(BaseHook):
 
             for req in scheduler_output.scheduled_new_reqs:
                 rid = req.req_id
-                
+
+                req_obj = self.requests.get(rid)
+                input_length = (
+                    req_obj.num_prompt_tokens if req_obj is not None else 0
+                )
                 cls.REQUEST_STATS[rid].update(
                     {
                         "queue_end": queue_end_time,
-                        "final_device_hit_len": req.num_computed_tokens
+                        "final_device_hit_len": req.num_computed_tokens,
+                        "input_length": input_length,
                     }
                 )
 

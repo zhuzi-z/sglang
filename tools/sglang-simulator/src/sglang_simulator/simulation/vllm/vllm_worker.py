@@ -27,6 +27,7 @@ init_hook()
 
 from vllm import LLM, SamplingParams  # noqa: E402
 from vllm.engine.arg_utils import EngineArgs  # noqa: E402
+from vllm.config import ProfilerConfig
 
 logger = get_logger("sglang_simulator")
 
@@ -121,6 +122,7 @@ class VLLMWorker(BaseWorker):
         self._batch_processed = False
         self._batch_prompts = []
         self._batch_sampling_params = []
+        self._llm.start_profile()
 
     async def pause_generation(self):
         """Called at the start of each benchmark round; clear previous stats."""
