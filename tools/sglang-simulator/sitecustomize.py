@@ -8,6 +8,7 @@ hooks without installing a global .pth file.
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -78,6 +79,14 @@ def _install_v6d_ipc_hook() -> None:
     VineyardPeer._sglang_simulator_cpu_ipc_hook = True
 
 
+def _call_init_hook(init_hook) -> None:
+    signature = inspect.signature(init_hook)
+    if "force" in signature.parameters:
+        init_hook(force=True)
+    else:
+        init_hook()
+
+
 def _install_hooks() -> None:
     enable_all = _enabled("SGLANG_SIMULATOR_ENABLE_HOOK")
     enable_vllm = enable_all or _enabled("SGLANG_SIMULATOR_ENABLE_VLLM_HOOK")
@@ -95,12 +104,12 @@ def _install_hooks() -> None:
     if enable_vllm:
         from sglang_simulator.simulation.vllm.startup import init_hook as init_vllm_hook
 
-        init_vllm_hook(force=True)
+        _call_init_hook(init_vllm_hook)
 
     if enable_sglang:
         from sglang_simulator.simulation.sglang.startup import init_hook as init_sglang_hook
 
-        init_sglang_hook(force=True)
+        _call_init_hook(init_sglang_hook)
 
 
 _install_hooks()
