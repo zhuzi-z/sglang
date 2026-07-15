@@ -17,8 +17,8 @@
 #   1. 清理残留进程
 #   2. 设置环境变量
 #   3. 安装 sglang_simulator (从源码 pip install)
-#   4. 写入 HiSim 配置和 PTH hook
-#   5. 启动 dashllm serving
+#   4. 写入 HiSim 配置
+#   5. 通过 PYTHONPATH + sitecustomize.py 启用 hook 并启动 dashllm serving
 #
 # 关于 CPU 仿真内存管理 (无需外部 patch):
 #   sglang_simulator 的 worker.py 已内置以下机制:
@@ -79,6 +79,15 @@ export V6D_ARGS="--peer=tiered_vineyard --vineyard-size=500G --memory-usage-max=
 export V6D_ENABLE_TRACKER="1"
 export LAZY_INITIALIZE_KV_TRANSFER_OUTSIDE_VLLM="1"
 export VLLM_V6D_ASYNC_REGISTER="1"
+
+# dashllm 只有在 DS_LLM_LAUNCH_V6D=1 且 KVS_METASERVICE_REDIS_URI 非空时才会自动拉起 v6d。
+# CPU 仿真集群要求真实 vineyard IPC daemon 可用，因此默认 fail-fast，避免服务看似启动但实际未拉起 v6d。
+export REQUIRE_REAL_V6D_IPC="${REQUIRE_REAL_V6D_IPC:-1}"
+if [[ "${REQUIRE_REAL_V6D_IPC}" == "1" && -z "${KVS_METASERVICE_REDIS_URI:-}" ]]; then
+    echo "[ERROR] REQUIRE_REAL_V6D_IPC=1 but KVS_METASERVICE_REDIS_URI is empty."
+    echo "[ERROR] Set KVS_METASERVICE_REDIS_URI via dashctl/env before launching dashllm_cmd serving."
+    exit 2
+fi
 
 # ---- vLLM ----
 export VLLM_USE_V1="1"
@@ -203,7 +212,7 @@ echo "[3/5] 完成"
 echo "[4/5] 写入 HiSim 配置..."
 
 CONFIG_PATH="/home/admin/hisim/config.json"
-PTH_PATH="/usr/local/lib/python3.12/dist-packages/sglang_simulator.pth"
+SIMULATOR_PATH="/root/workspace/sglang-dev/tools/sglang-simulator"
 mkdir -p "$(dirname "$CONFIG_PATH")"
 
 cat > "$CONFIG_PATH" <<'EOF'
@@ -235,10 +244,6 @@ cat > "$CONFIG_PATH" <<'EOF'
 }
 EOF
 
-cat > "$PTH_PATH" <<'EOF'
-import sglang_simulator.simulation.vllm.startup as vllm_startup; vllm_startup.init_hook()
-EOF
-
 echo "[4/5] 完成"
 
 # ==============================================================================
@@ -247,6 +252,9 @@ echo "[4/5] 完成"
 echo "[5/5] 启动 dashllm serving..."
 
 # Serving 阶段覆盖
+export PYTHONPATH="$SIMULATOR_PATH:${PYTHONPATH:-}"
+export SGLANG_SIMULATOR_ENABLE_VLLM_HOOK=1
+export SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1
 export SGLANG_SIMULATOR_OUTPUT_MODE=BLOCKING
 export SGLANG_SIMULATOR_CONFIG_PATH="$CONFIG_PATH"
 export VLLM_FLASH_ATTN_FP8_ATTENTION=0
@@ -255,6 +263,11 @@ echo "=========================================="
 echo "[HiSim] model_path=$model_path"
 echo "[HiSim] V6D_ETCD_ENDPOINT=$V6D_ETCD_ENDPOINT"
 echo "[HiSim] CONFIG_PATH=$CONFIG_PATH"
+echo "[HiSim] PYTHONPATH=$PYTHONPATH"
+echo "[HiSim] SGLANG_SIMULATOR_ENABLE_VLLM_HOOK=$SGLANG_SIMULATOR_ENABLE_VLLM_HOOK"
+echo "[HiSim] SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=$SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK"
+echo "[HiSim] REQUIRE_REAL_V6D_IPC=$REQUIRE_REAL_V6D_IPC"
+echo "[HiSim] KVS_METASERVICE_REDIS_URI=${KVS_METASERVICE_REDIS_URI:-<missing>}"
 echo "=========================================="
 
 exec /usr/local/bin/dashllm_cmd serving
