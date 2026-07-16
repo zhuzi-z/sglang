@@ -587,8 +587,22 @@ def set_active_worker_id(worker_id: str | None) -> None:
 
 
 def get_active_worker_id() -> str | None:
-    """Get the currently active worker ID from environment."""
-    return os.environ.get(_ENV_KEY)
+    """Get active worker id, deriving a stable per-instance id when absent."""
+    explicit = os.environ.get(_ENV_KEY)
+    if explicit:
+        return explicit
+
+    pod_name = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME")
+    worker_name = os.environ.get("WORKER_NAME")
+    if pod_name and worker_name:
+        return f"{pod_name}:{worker_name}"
+    if pod_name:
+        return pod_name
+    for key in ("SPECTRUM_INSTANCE_NAME", "POD_IP", "ALIYUN_ECI_ETH0_IP"):
+        value = os.environ.get(key)
+        if value:
+            return value
+    return None
 
 
 def set_manager_worker_id(connector, worker_id: str) -> None:

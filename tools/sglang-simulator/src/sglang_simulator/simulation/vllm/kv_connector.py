@@ -95,7 +95,10 @@ class MockHybridConnector:
         self._config = config
         self._kv_cache_config = kv_cache_config
         self._v6d_storage = V6DCacheStorage.get_instance()
-        self._worker_id = os.environ.get("_SIM_V6D_ACTIVE_WORKER_ID", None)
+        from sglang_simulator.simulation.vllm.v6d_manager import (
+            get_active_worker_id,
+        )
+        self._worker_id = get_active_worker_id()
 
         # Derive hash_block_size from config (same as real connector)
         if kv_cache_config and hasattr(kv_cache_config, "hash_block_size"):
