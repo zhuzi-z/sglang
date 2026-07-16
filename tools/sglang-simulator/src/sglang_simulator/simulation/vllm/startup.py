@@ -5,6 +5,7 @@ inference framework for simulation purposes.
 IMPORTANT: init_hook() must be called BEFORE any `import vllm.*` statement.
 """
 
+import json
 import os
 
 
@@ -13,6 +14,275 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 
 def _env_enabled(*names: str) -> bool:
     return any(os.environ.get(name, "").strip().lower() in _TRUE_VALUES for name in names)
+
+
+def _decode_kv_transfer_params(value):
+    """Decode explicitly provided kv_transfer_params from request inputs."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            return _decode_kv_transfer_params(json.loads(value))
+        except Exception:
+            return {}
+    if isinstance(value, (list, tuple)):
+        merged = {}
+        for item in value:
+            merged.update(_decode_kv_transfer_params(item))
+        return merged
+    return {}
+
+
+def _extract_explicit_kv_transfer_params(kwargs: dict) -> dict:
+    """Collect KV params from explicit fields only; never inspect request_id."""
+    if not isinstance(kwargs, dict):
+        return {}
+
+    kv_params = _decode_kv_transfer_params(kwargs.get("kv_transfer_params"))
+    encoder_extra_args = kwargs.get("encoder_extra_args")
+    if isinstance(encoder_extra_args, dict):
+        kv_params.update(
+            _decode_kv_transfer_params(
+                encoder_extra_args.get("kv_transfer_params")
+            )
+        )
+
+    for key in (
+        "do_remote_decode",
+        "do_remote_prefill",
+        "ali_llumnix_disagg",
+        "ali_max_computed_tokens",
+        "remote_host",
+        "remote_port",
+        "transfer_id",
+        "remote_engine_id",
+        "remote_bootstrap_addr",
+    ):
+        if key in kwargs and key not in kv_params:
+            kv_params[key] = kwargs[key]
+    return kv_params
+
+
+def _merge_kv_params_into_encoder_extra_args(kwargs: dict) -> dict:
+    kv_params = _extract_explicit_kv_transfer_params(kwargs)
+    if not kv_params:
+        return {}
+    encoder_extra_args = dict(kwargs.get("encoder_extra_args") or {})
+    merged = _decode_kv_transfer_params(
+        encoder_extra_args.get("kv_transfer_params")
+    )
+    merged.update(kv_params)
+    encoder_extra_args["kv_transfer_params"] = merged
+    kwargs["encoder_extra_args"] = encoder_extra_args
+    return merged
+
+
+def _merge_kv_params_into_sampling_params(kwargs: dict) -> dict:
+    kv_params = {}
+    kv_params.update(
+        _extract_explicit_kv_transfer_params(
+            kwargs.get("kwargs_for_epd_transfer") or {}
+        )
+    )
+    kv_params.update(_extract_explicit_kv_transfer_params(kwargs))
+
+    sampling_params = dict(kwargs.get("sampling_params") or {})
+    extra_args = dict(sampling_params.get("extra_args") or {})
+    existing = _decode_kv_transfer_params(extra_args.get("kv_transfer_params"))
+    existing.update(kv_params)
+    if not existing:
+        return {}
+
+    extra_args["kv_transfer_params"] = existing
+    sampling_params["extra_args"] = extra_args
+    kwargs["sampling_params"] = sampling_params
+    return existing
+
+
+def _install_dashllm_kv_transfer_hook(original_launch_v6d=None) -> None:
+    """Install non-invasive DashServing/vLLM kv_transfer_params passthrough."""
+    try:
+        import dashllm.core.backend._backend_vllm as backend_vllm
+    except Exception:
+        return
+
+    if (
+        original_launch_v6d is not None
+        and getattr(backend_vllm, "launch_v6d", None) is original_launch_v6d
+    ):
+        try:
+            from dashllm.utils import vineyard as dashllm_vineyard
+            backend_vllm.launch_v6d = dashllm_vineyard.launch_v6d
+        except Exception:
+            pass
+
+    backend_cls = getattr(backend_vllm, "_LLMBackend4vLLM", None)
+    if backend_cls is not None and not getattr(
+        backend_cls,
+        "_sglang_simulator_kv_transfer_params_hook",
+        False,
+    ):
+        original_generate = backend_cls.generate
+
+        def _patched_generate(self, model, **kwargs):
+            _merge_kv_params_into_encoder_extra_args(kwargs)
+            return original_generate(self, model, **kwargs)
+
+        backend_cls.generate = _patched_generate
+        backend_cls._sglang_simulator_kv_transfer_params_hook = True
+
+    try:
+        import dashllm.core.backend.engine._vllm_v1 as vllm_v1
+    except Exception:
+        vllm_v1 = None
+
+    engine_cls = getattr(vllm_v1, "vLLMEngine", None) if vllm_v1 else None
+    if engine_cls is not None and not getattr(
+        engine_cls,
+        "_sglang_simulator_vllm_engine_kv_params_hook",
+        False,
+    ):
+        original_engine_generate = engine_cls.generate
+        original_engine_generate_impl = getattr(engine_cls, "_generate_impl", None)
+
+        def _patched_engine_generate(self, *args, **kwargs):
+            _merge_kv_params_into_sampling_params(kwargs)
+            yield from original_engine_generate(self, *args, **kwargs)
+
+        engine_cls.generate = _patched_engine_generate
+
+        if original_engine_generate_impl is not None:
+            def _patched_engine_generate_impl(self, *args, **kwargs):
+                _merge_kv_params_into_sampling_params(kwargs)
+                yield from original_engine_generate_impl(self, *args, **kwargs)
+
+            engine_cls._generate_impl = _patched_engine_generate_impl
+
+        engine_cls._sglang_simulator_vllm_engine_kv_params_hook = True
+
+
+def _install_v6d_ipc_hook() -> None:
+    """Patch v6d startup so CPU-only package/PTH deployments can expose IPC."""
+    try:
+        import v6d.common.transfer as transfer
+        from v6d.server.peers.vineyard.peer import VineyardPeer
+    except Exception:
+        return
+
+    def _skip_srpc_init(base_addr: int, size: int, *args, **kwargs) -> None:
+        return None
+
+    transfer.init_srpc_transfer = _skip_srpc_init
+    if hasattr(transfer, "init_srpc"):
+        transfer.init_srpc = _skip_srpc_init
+    if hasattr(transfer, "init_srpc_"):
+        transfer.init_srpc_ = _skip_srpc_init
+
+    if hasattr(transfer, "init_mmap") and hasattr(
+        transfer, "init_transfer_engine_client"
+    ):
+        def _init_transfer_engine_client_without_srpc(fd: int, size: int) -> int:
+            return transfer.init_mmap(fd, size)
+
+        transfer.init_transfer_engine_client = _init_transfer_engine_client_without_srpc
+
+    try:
+        import v6d.lite.common.transfer_engine as transfer_engine
+    except Exception:
+        transfer_engine = None
+
+    if transfer_engine is not None:
+        if hasattr(transfer_engine, "init_srpc"):
+            transfer_engine.init_srpc = _skip_srpc_init
+        if hasattr(transfer_engine, "init_srpc_"):
+            transfer_engine.init_srpc_ = _skip_srpc_init
+        if hasattr(transfer_engine, "init_srpc_transfer"):
+            transfer_engine.init_srpc_transfer = _skip_srpc_init
+
+    try:
+        from v6d.client.peers.vineyard import mmap_manager
+    except Exception:
+        mmap_manager = None
+
+    if mmap_manager is not None and not getattr(
+        mmap_manager.ClientV6dMmapManager,
+        "_sglang_simulator_cpu_mmap_hook",
+        False,
+    ):
+        def _create_mmap_without_srpc(self, socket_path: str, is_lazy_strategy: bool):
+            from v6d.common.transfer import _vineyard_connect
+            from v6d.lite.common.transfer_engine import init_mmap
+
+            fd, map_size, offset, sock = _vineyard_connect(socket_path)
+            base_addr = init_mmap(fd, map_size)
+            os.close(fd)
+            return mmap_manager.MmapInfo(
+                socket_path=socket_path,
+                fd=fd,
+                base_addr=base_addr,
+                map_size=map_size,
+                refcount=1,
+                socket=sock,
+            )
+
+        mmap_manager.ClientV6dMmapManager._create_mmap = _create_mmap_without_srpc
+        mmap_manager.ClientV6dMmapManager._sglang_simulator_cpu_mmap_hook = True
+
+    if getattr(VineyardPeer, "_sglang_simulator_cpu_ipc_hook", False):
+        return
+
+    original_init = VineyardPeer.__init__
+
+    def _patched_init(
+        self,
+        argc=0,
+        argv=None,
+        tracker_url=None,
+        tracker_key_prefix=None,
+        lazy_load=True,
+    ):
+        patched_argv = list(argv) if argv is not None else None
+        if patched_argv is not None:
+            has_rpc_flag = any(
+                arg.startswith("-rpc=") or arg.startswith("--rpc=")
+                for arg in patched_argv
+            )
+            if not has_rpc_flag:
+                patched_argv.append("-rpc=false")
+                argc = len(patched_argv)
+        return original_init(
+            self,
+            argc,
+            patched_argv,
+            tracker_url,
+            tracker_key_prefix,
+            lazy_load,
+        )
+
+    VineyardPeer.__init__ = _patched_init
+    VineyardPeer._sglang_simulator_cpu_ipc_hook = True
+
+    try:
+        from dashllm.utils import vineyard as dashllm_vineyard
+    except Exception:
+        return
+
+    if getattr(dashllm_vineyard, "_sglang_simulator_launch_v6d_hook", False):
+        return
+
+    original_launch_v6d = dashllm_vineyard.launch_v6d
+
+    def _patched_launch_v6d(*args, **kwargs):
+        envs_to_update = dict(kwargs.get("envs_to_update") or {})
+        envs_to_update["SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK"] = "1"
+        kwargs["envs_to_update"] = envs_to_update
+        return original_launch_v6d(*args, **kwargs)
+
+    dashllm_vineyard.launch_v6d = _patched_launch_v6d
+    dashllm_vineyard._sglang_simulator_launch_v6d_hook = True
+    _install_dashllm_kv_transfer_hook(original_launch_v6d)
 
 # Native V6D control-plane mode keeps the real vLLM connector stack
 # (HybridConnector -> V6dObjectKVTBackend -> V6dObjectBackend/PBackend ->
@@ -105,6 +375,13 @@ def init_hook(force: bool = False):
         return False
 
     import logging
+
+    if _env_enabled(
+        "SGLANG_SIMULATOR_ENABLE_HOOK",
+        "SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK",
+    ):
+        _install_v6d_ipc_hook()
+    _install_dashllm_kv_transfer_hook()
 
     import sglang_simulator.hook as sglang_simulator_hook
     from sglang_simulator.simulation.vllm import (
