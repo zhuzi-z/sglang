@@ -9,6 +9,8 @@ V6D-aware simulation strategy (merged from feat/vllm-pai + V6D additions):
 - Mock execute_model output with KV connector lifecycle
 """
 
+import os
+
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils import get_logger
 
@@ -142,7 +144,7 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     if layer_types is None:
         # Pure MHA model - use layer name format matching vLLM convention
         return {
-            f"model.layers.{i}": full_attn_spec
+            f"model.layers.{i}.self_attn.attn": full_attn_spec
             for i in range(num_hidden_layers)
         }
 
@@ -173,21 +175,27 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     mamba_spec = MambaSpec(**mamba_kwargs)
 
     kv_cache_spec: dict = {}
+    full_attention_layers = 0
+    linear_attention_layers = 0
     for i, layer_type in enumerate(layer_types):
-        layer_name = f"model.layers.{i}"
         if layer_type == "full_attention":
-            kv_cache_spec[layer_name] = full_attn_spec
+            kv_cache_spec[f"model.layers.{i}.self_attn.attn"] = full_attn_spec
+            full_attention_layers += 1
         elif layer_type == "linear_attention":
-            kv_cache_spec[layer_name] = mamba_spec
+            kv_cache_spec[f"model.layers.{i}.linear_attn"] = mamba_spec
+            linear_attention_layers += 1
         else:
-            kv_cache_spec[layer_name] = full_attn_spec
+            kv_cache_spec[f"model.layers.{i}.self_attn.attn"] = full_attn_spec
+            full_attention_layers += 1
 
     logger.info(
-        "[V6D Hijack] Built KV cache spec: %d layers, "
+        "[V6D Hijack] Built KV cache spec: %d layers "
+        "(full_attention=%d, linear_attention=%d), "
         "num_kv_heads=%d (total=%d, tp=%d), head_size=%d, block_size=%d, "
         "page_size=%d bytes",
-        len(kv_cache_spec), num_kv_heads, total_num_kv_heads, tp_size,
-        head_size, block_size, attn_page_size,
+        len(kv_cache_spec), full_attention_layers, linear_attention_layers,
+        num_kv_heads, total_num_kv_heads, tp_size, head_size, block_size,
+        attn_page_size,
     )
     return kv_cache_spec
 
@@ -347,11 +355,23 @@ class C_VLLMWorkerHook(BaseHook):
             self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
             num_blocks = kv_cache_config.num_blocks
 
-            # Skip worker_init (hybrid_connector) which requires CUDA
+            native_v6d_control_plane = os.environ.get(
+                "SGLANG_SIMULATOR_NATIVE_V6D_CONTROL_PLANE", ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
+
             try:
                 import vllm.v1.hybrid_connector.engine_proxy as _engine_proxy
-                _orig_worker_init = _engine_proxy.worker_init
-                _engine_proxy.worker_init = lambda *a, **kw: None
+                if native_v6d_control_plane:
+                    _orig_worker_init = _engine_proxy.worker_init
+                    if getattr(_engine_proxy, "_g_worker_loop", None) is None:
+                        _orig_worker_init(self.vllm_config, self.local_rank)
+                        logger.info(
+                            "[vLLM Hijack] Native V6D: initialized hybrid worker loop"
+                        )
+                    _engine_proxy.worker_init = lambda *a, **kw: None
+                else:
+                    _orig_worker_init = _engine_proxy.worker_init
+                    _engine_proxy.worker_init = lambda *a, **kw: None
             except (ImportError, AttributeError):
                 _orig_worker_init = None
 
@@ -375,11 +395,15 @@ class C_VLLMWorkerHook(BaseHook):
             if hasattr(kv_cache_config, "kv_cache_tensors") and \
                     kv_cache_config.kv_cache_tensors:
                 for kv_tensor in kv_cache_config.kv_cache_tensors:
-                    # Allocate only 1 page instead of full size
-                    minimal_size = min(kv_tensor.size, 4096)
-                    tensor = torch.zeros(
-                        minimal_size, dtype=torch.int8, device="cpu"
-                    )
+                    if native_v6d_control_plane:
+                        tensor = torch.empty(
+                            kv_tensor.size, dtype=torch.int8, device="cpu"
+                        )
+                    else:
+                        minimal_size = min(kv_tensor.size, 4096)
+                        tensor = torch.zeros(
+                            minimal_size, dtype=torch.int8, device="cpu"
+                        )
                     for layer_name in kv_tensor.shared_by:
                         kv_caches[layer_name] = tensor
                 logger.info(
@@ -391,11 +415,15 @@ class C_VLLMWorkerHook(BaseHook):
             else:
                 kv_spec = self.model_runner.get_kv_cache_spec()
                 for layer_name, spec in kv_spec.items():
-                    # Allocate only 1 page instead of num_blocks * page_size
-                    minimal_size = min(spec.page_size_bytes, 4096)
-                    tensor = torch.zeros(
-                        minimal_size, dtype=torch.int8, device="cpu"
-                    )
+                    if native_v6d_control_plane:
+                        tensor = torch.empty(
+                            spec.page_size_bytes, dtype=torch.int8, device="cpu"
+                        )
+                    else:
+                        minimal_size = min(spec.page_size_bytes, 4096)
+                        tensor = torch.zeros(
+                            minimal_size, dtype=torch.int8, device="cpu"
+                        )
                     kv_caches[layer_name] = tensor
                 logger.info(
                     "[vLLM Hijack] Allocated %d MINIMAL CPU KV cache tensors "

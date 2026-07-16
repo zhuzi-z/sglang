@@ -1,6 +1,30 @@
 """
 V6D Object Manager Hook - Implements RPC bypass for cross-node simulation.
 
+STATUS NOTE (current scope):
+This module contains TWO unrelated things with different fates:
+
+1. ACTIVE / STILL USED:
+   `set_active_worker_id()` / `get_active_worker_id()` — simple env-var
+   helpers around `_SIM_V6D_ACTIVE_WORKER_ID`. These ARE used by
+   `vllm_worker.py` and read by `MockHybridConnector` in `kv_connector.py`
+   (the actual functional path: MockHybridConnector + V6DCacheStorage/etcd).
+   Do NOT remove these two functions.
+
+2. DEPRECATED — NOT part of current functional scope:
+   `C_V6dObjectManagerHook`, `V6dBlockOwnershipTracker`, and
+   `set_manager_worker_id()` all operate on the REAL vLLM `V6dObjectManager`
+   class (via real V6dObjectConnector), which is never instantiated because
+   `kv_connector.C_KVConnectorFactoryHook` unconditionally returns
+   MockHybridConnector. This hook is NOT registered in startup.py's
+   init_hook() anymore. Cross-node ownership tracking for the current
+   functional path is instead done via `V6DCacheStorage` (etcd), not via
+   this file's `/dev/shm` tracker. Safe to delete the deprecated parts
+   entirely unless a future task explicitly requires validating the real
+   V6D/vineyard daemon path.
+
+Original docstring below is kept for reference only.
+---
 In a multi-node V6D cluster with real GPUs, cross-node KV cache sharing
 works via RPC (SRPC over GPU DMA). In CPU-only simulation, we bypass RPC
 by tracking block ownership at the simulation level:
@@ -42,8 +66,14 @@ _LOCK_FILE = os.path.join(_TRACKER_DIR, ".lock")
 
 
 class V6dBlockOwnershipTracker:
-    """Cross-process tracker for block ownership across all workers.
+    """DEPRECATED — not part of current functional scope.
 
+    File-backed (/dev/shm) ownership tracker designed to pair with the real
+    V6dObjectManager hook below. The current functional path uses
+    V6DCacheStorage (etcd) for cross-node ownership instead. Kept only for
+    reference; safe to delete along with C_V6dObjectManagerHook.
+
+    Cross-process tracker for block ownership across all workers.
     Uses file-backed storage under /dev/shm/ (tmpfs) so that data
     persists across forked subprocesses. File locking ensures atomicity.
     """
@@ -87,8 +117,24 @@ class V6dBlockOwnershipTracker:
         cls._ensure_dir()
 
     @classmethod
+    def _storage(cls):
+        try:
+            from sglang_simulator.simulation.vllm.v6d_cache_storage import (
+                V6DCacheStorage,
+            )
+            storage = V6DCacheStorage.get_instance()
+            if storage.connected:
+                return storage
+        except Exception:
+            logger.debug("[V6D RPC Bypass] etcd tracker unavailable", exc_info=True)
+        return None
+
+    @classmethod
     def record_seal(cls, key: str, worker_id: str) -> None:
-        """Record that worker_id sealed (owns) the given block key."""
+        """Record that worker_id sealed the given block key."""
+        storage = cls._storage()
+        if storage is not None and storage.register_block(key, worker_id):
+            return
         lock = cls._lock()
         try:
             data = cls._read_json(_OWNERSHIP_FILE)
@@ -100,6 +146,11 @@ class V6dBlockOwnershipTracker:
     @classmethod
     def get_owner(cls, key: str) -> str | None:
         """Get the owner worker_id of a block key, or None if unknown."""
+        storage = cls._storage()
+        if storage is not None:
+            owner = storage.lookup_block(key)
+            if owner is not None:
+                return owner
         lock = cls._lock()
         try:
             data = cls._read_json(_OWNERSHIP_FILE)
@@ -170,7 +221,18 @@ class V6dBlockOwnershipTracker:
 # ---------------------------------------------------------------------------
 
 class C_V6dObjectManagerHook(BaseHook):
-    """Hook V6dObjectManager to track block ownership and classify hits.
+    """DEPRECATED — real V6D IPC component hook, NOT part of current scope.
+
+    Hooks the REAL vLLM V6dObjectManager class, which is only instantiated
+    inside a real V6dObjectConnector. Since
+    kv_connector.C_KVConnectorFactoryHook unconditionally returns
+    MockHybridConnector, this class is never instantiated in the current CPU
+    simulation path, and this hook is NOT registered in startup.py's
+    init_hook() (see startup.py comment). Safe to delete entirely unless a
+    future task explicitly requires validating the real V6D/vineyard daemon
+    path.
+
+    Hook V6dObjectManager to track block ownership and classify hits.
 
     Intercepts seal() and _process_lookup() to implement RPC bypass:
     - seal(): records which worker owns each block
@@ -185,6 +247,19 @@ class C_V6dObjectManagerHook(BaseHook):
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
+
+        def override_async_connect(self) -> None:
+            """Skip scheduler-side v6d client SRPC transport initialization."""
+            self.client = None
+            logger.info(
+                "[V6D RPC Bypass] Manager group=%d skipped v6d client "
+                "SRPC connect (CPU mode)",
+                self._group_id,
+            )
+            if self._v6d_backend is not None:
+                self._v6d_backend.mark_manager_connected(self._group_id)
+
+        target._async_connect = override_async_connect
 
         def override_init(self, *args, **kwargs):
             """Tag manager with active worker_id from environment."""
@@ -207,18 +282,18 @@ class C_V6dObjectManagerHook(BaseHook):
         original_seal = target.seal
 
         def override_seal(self, block_hashes: Iterable, request_id=None):
-            """Seal blocks and record ownership in the tracker."""
+            """Record sealed block ownership without v6d client data-plane."""
             block_hashes_list = list(block_hashes)
-            original_seal(self, block_hashes_list, request_id=request_id)
-
             worker_id = getattr(self, "_sim_worker_id", None)
             if worker_id:
                 for h in block_hashes_list:
                     key = self._make_key(h)
                     V6dBlockOwnershipTracker.record_seal(key, worker_id)
-                logger.debug(
+                logger.info(
                     f"[V6D RPC Bypass] seal: {len(block_hashes_list)} blocks "
-                    f"by {worker_id}")
+                    f"by {worker_id} group={self._group_id}")
+            for h in block_hashes_list:
+                self._pending_objs.pop(h, None)
 
         target.seal = override_seal
 
@@ -232,30 +307,30 @@ class C_V6dObjectManagerHook(BaseHook):
             request_id: str | None,
             unfetched_objs: dict[str, Any] | None = None,
         ) -> int:
-            """Process lookup and classify hits as local/remote."""
-            hits = original_process_lookup(
-                self, block_hashes, got_objs, request_id,
-                unfetched_objs=unfetched_objs)
-
+            """Process lookup using file-backed ownership tracker."""
             worker_id = getattr(self, "_sim_worker_id", None)
+            hits = 0
+            local_count = 0
+            remote_count = 0
+            unknown_count = 0
+
+            for h in block_hashes:
+                key = self._make_key(h)
+                owner = V6dBlockOwnershipTracker.get_owner(key)
+                if owner is None:
+                    break
+                hits += 1
+                self._cached_objs[key] = key
+                if request_id is not None:
+                    self._hold_key_for_req(key, request_id)
+                if worker_id is None:
+                    unknown_count += 1
+                elif owner == worker_id:
+                    local_count += 1
+                else:
+                    remote_count += 1
+
             if worker_id and hits > 0:
-                local_count = 0
-                remote_count = 0
-                unknown_count = 0
-
-                for i, h in enumerate(block_hashes):
-                    if i >= hits:
-                        break
-                    key = self._make_key(h)
-                    hit_type = V6dBlockOwnershipTracker.classify_hit(
-                        key, worker_id)
-                    if hit_type == "local":
-                        local_count += 1
-                    elif hit_type == "remote":
-                        remote_count += 1
-                    else:
-                        unknown_count += 1
-
                 if local_count:
                     V6dBlockOwnershipTracker.record_hit(
                         worker_id, "local", local_count)
@@ -266,17 +341,54 @@ class C_V6dObjectManagerHook(BaseHook):
                     V6dBlockOwnershipTracker.record_hit(
                         worker_id, "unknown", unknown_count)
 
+                logger.info(
+                    f"[V6D RPC Bypass] Worker {worker_id}: lookup group={self._group_id} "
+                    f"hits={hits} local={local_count} remote={remote_count} "
+                    f"unknown={unknown_count} (v6d client bypassed)")
                 if remote_count > 0:
                     logger.info(
                         f"[V6D RPC Bypass] Worker {worker_id}: "
-                        f"cross-node hit! "
-                        f"local={local_count} remote={remote_count} "
-                        f"unknown={unknown_count} "
-                        f"(RPC bypassed)")
+                        f"cross-node hit! local={local_count} remote={remote_count} "
+                        f"unknown={unknown_count} (RPC bypassed)")
 
             return hits
 
         target._process_lookup = override_process_lookup
+
+        def override_lookup(self, block_hashes, request_id=None,
+                            unfetched_objs=None):
+            return self._process_lookup(
+                list(block_hashes), {}, request_id,
+                unfetched_objs=unfetched_objs)
+
+        async def override_async_lookup(self, block_hashes, request_id=None,
+                                        unfetched_objs=None):
+            return self._process_lookup(
+                list(block_hashes), {}, request_id,
+                unfetched_objs=unfetched_objs)
+
+        def override_get_key(self, block_hash, request_id=None):
+            key = self._make_key(block_hash)
+            if V6dBlockOwnershipTracker.get_owner(key) is None:
+                return None
+            self._cached_objs[key] = key
+            if request_id is not None:
+                self._hold_key_for_req(key, request_id)
+            return key
+
+        async def override_async_get_key(self, block_hash, request_id=None):
+            return override_get_key(self, block_hash, request_id=request_id)
+
+        def override_reset(self):
+            self._cached_objs.clear()
+            self._cached_objs_reqs.clear()
+            self._pending_objs.clear()
+
+        target.lookup = override_lookup
+        target.async_lookup = override_async_lookup
+        target.get_key = override_get_key
+        target.async_get_key = override_async_get_key
+        target.reset = override_reset
 
         # ---- Override batch_allocate to record ownership ----
         if hasattr(target, 'batch_allocate'):
@@ -284,21 +396,67 @@ class C_V6dObjectManagerHook(BaseHook):
 
             def override_batch_allocate(self, block_hashes, size, shape,
                                         dtype, request_id=None):
-                """Batch allocate and record ownership."""
-                result = original_batch_allocate(
-                    self, block_hashes, size, shape, dtype,
-                    request_id=request_id)
+                """Allocate simulated V6D keys without v6d client data-plane."""
+                result = {}
                 worker_id = getattr(self, "_sim_worker_id", None)
-                if worker_id and result:
-                    for h in block_hashes:
-                        key = self._make_key(h)
+                for h in block_hashes:
+                    key = self._make_key(h)
+                    self._pending_objs[h] = key
+                    result[h] = key
+                    if worker_id:
                         V6dBlockOwnershipTracker.record_seal(key, worker_id)
+                logger.info(
+                    f"[V6D RPC Bypass] batch_allocate: {len(result)} blocks "
+                    f"group={self._group_id} req={request_id} owner={worker_id}")
                 return result
 
             target.batch_allocate = override_batch_allocate
 
         logger.info("[V6D Hijack] V6dObjectManager hook installed "
                     "(RPC bypass + ownership tracking)")
+
+
+class C_V6dObjectConnectorSchedulerHook(BaseHook):
+    """Hook scheduler cross-group allocation to avoid real v6d client.create."""
+
+    HOOK_CLASS_NAME = "V6dObjectConnectorScheduler"
+    HOOK_MODULE_NAME = (
+        "vllm.distributed.kv_transfer.kv_connector.v1.v6d_object_connector"
+    )
+
+    @classmethod
+    def hook(cls, target):
+        def override_cross_group_batch_allocate(
+            self,
+            group_candidates,
+            request_id=None,
+        ):
+            result = {}
+            for group_id, candidate_hashes in group_candidates.items():
+                if not candidate_hashes:
+                    continue
+                manager = self.managers[group_id]
+                block_bytes, block_shape = self._group_block_bytes[group_id]
+                torch_dtype = self._group_torch_dtype[group_id]
+                result[group_id] = manager.batch_allocate(
+                    candidate_hashes,
+                    block_bytes,
+                    block_shape,
+                    torch_dtype,
+                    request_id=request_id,
+                )
+            logger.info(
+                "[V6D RPC Bypass] cross_group_batch_allocate: groups=%s req=%s",
+                sorted(result),
+                request_id,
+            )
+            return result
+
+        target._cross_group_batch_allocate = override_cross_group_batch_allocate
+        logger.info(
+            "[V6D Hijack] V6dObjectConnectorScheduler hook installed "
+            "(cross-group allocation bypass)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +485,10 @@ def get_active_worker_id() -> str | None:
 
 
 def set_manager_worker_id(connector, worker_id: str) -> None:
-    """Set the worker_id on all V6dObjectManager instances in a connector."""
+    """DEPRECATED — pairs with C_V6dObjectManagerHook (unused, dead code).
+
+    Set the worker_id on all V6dObjectManager instances in a connector.
+    """
     if hasattr(connector, 'managers'):
         for gid, manager in connector.managers.items():
             manager._sim_worker_id = worker_id

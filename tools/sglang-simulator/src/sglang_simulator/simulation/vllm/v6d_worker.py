@@ -1,4 +1,18 @@
 """
+DEPRECATED — real V6D IPC component hook, NOT part of current functional scope.
+
+Hooks V6dObjectConnectorWorker, a REAL vLLM class that only gets instantiated
+if a real V6dObjectConnector is created. Since
+kv_connector.C_KVConnectorFactoryHook unconditionally returns
+MockHybridConnector, this class is never instantiated in the current CPU
+simulation path, and this hook is NOT registered in startup.py's init_hook()
+(see startup.py comment). Current scope only requires scheduling-behavior
+parity via MockHybridConnector; real V6D daemon / vineyard IPC connection is
+not required. Safe to delete entirely unless a future task explicitly
+requires validating the real V6D/vineyard daemon path.
+
+Original docstring below is kept for reference only.
+---
 V6D ObjectConnectorWorker Hook - Skips CUDA-specific initialization.
 
 Preserves:
@@ -53,21 +67,14 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
         original_start_async = target._start_async_v6d_init
 
         def override_start_async_v6d_init(self):
-            """Connect to V6D without CUDA device setup."""
-            from vllm.distributed.kv_transfer.kv_connector.v1.v6d_object_connector import (
-                _connect_v6d_with_retry,
-            )
-
-            # Skip VLLM_V6D_ASYNC_REGISTER branch - do sync connect
-            # This avoids torch.cuda.current_device() in the async path
+            """Skip worker-side V6D RPC/SRPC data channel initialization."""
             self._device = torch.device("cpu")
-            self.client = _connect_v6d_with_retry(self.v6d_url)
-            # Skip _register_v6d_host_memory (already overridden to no-op)
-            self._ensure_handlers()
-            self._setup_handler_kv_caches()
+            self.client = None
+            self._load_handler = None
+            self._store_handler = None
             logger.info(
-                "[V6D Hijack] _start_async_v6d_init: connected to %s (CPU mode)",
-                self.v6d_url,
+                "[V6D Hijack] _start_async_v6d_init: skipped worker "
+                "V6D RPC/SRPC data channel initialization (CPU mode)"
             )
 
         target._start_async_v6d_init = override_start_async_v6d_init
@@ -76,16 +83,47 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
         original_register = target.register_kv_caches
 
         def override_register_kv_caches(self, kv_caches):
-            """Register KV caches - they are already on CPU (from worker hook)."""
-            # The original register_kv_caches builds raw_views from tensor storage.
-            # With head_dim=1 and device=cpu, this works as-is since the tensors
-            # are already CPU tensors. Just call original.
-            original_register(self, kv_caches)
+            """Register KV cache metadata without starting SRPC data channels."""
+            self.kv_caches = kv_caches
+            self._start_async_v6d_init()
             logger.info(
-                "[V6D Hijack] register_kv_caches: registered %d tensors (CPU)",
+                "[V6D Hijack] register_kv_caches: registered %d tensors "
+                "and skipped worker-side V6D/SRPC transport (CPU)",
                 len(kv_caches),
             )
 
         target.register_kv_caches = override_register_kv_caches
+
+        def override_start_load_kv(self, metadata):
+            return None
+
+        def override_start_store_kv(self, metadata):
+            return None
+
+        async def _completed_v6d_task():
+            return None
+
+        def override_async_start_load_kv(self, metadata):
+            import asyncio
+            return {
+                req_id: asyncio.create_task(_completed_v6d_task())
+                for req_id in metadata.reqs_to_load
+            }
+
+        def override_async_start_store_kv(self, metadata):
+            import asyncio
+            return {
+                req_id: asyncio.create_task(_completed_v6d_task())
+                for req_id in metadata.reqs_to_store
+            }
+
+        def override_get_finished(self, finished_req_ids):
+            return set(), set()
+
+        target.start_load_kv = override_start_load_kv
+        target.start_store_kv = override_start_store_kv
+        target.async_start_load_kv = override_async_start_load_kv
+        target.async_start_store_kv = override_async_start_store_kv
+        target.get_finished = override_get_finished
 
         logger.info("[V6D Hijack] V6dObjectConnectorWorker hook installed")
