@@ -9,8 +9,6 @@ V6D-aware simulation strategy (merged from feat/vllm-pai + V6D additions):
 - Mock execute_model output with KV connector lifecycle
 """
 
-import os
-
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils import get_logger
 
@@ -144,7 +142,7 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     if layer_types is None:
         # Pure MHA model - use layer name format matching vLLM convention
         return {
-            f"model.layers.{i}.self_attn.attn": full_attn_spec
+            f"model.layers.{i}": full_attn_spec
             for i in range(num_hidden_layers)
         }
 
@@ -175,27 +173,21 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     mamba_spec = MambaSpec(**mamba_kwargs)
 
     kv_cache_spec: dict = {}
-    full_attention_layers = 0
-    linear_attention_layers = 0
     for i, layer_type in enumerate(layer_types):
+        layer_name = f"model.layers.{i}"
         if layer_type == "full_attention":
-            kv_cache_spec[f"model.layers.{i}.self_attn.attn"] = full_attn_spec
-            full_attention_layers += 1
+            kv_cache_spec[layer_name] = full_attn_spec
         elif layer_type == "linear_attention":
-            kv_cache_spec[f"model.layers.{i}.linear_attn"] = mamba_spec
-            linear_attention_layers += 1
+            kv_cache_spec[layer_name] = mamba_spec
         else:
-            kv_cache_spec[f"model.layers.{i}.self_attn.attn"] = full_attn_spec
-            full_attention_layers += 1
+            kv_cache_spec[layer_name] = full_attn_spec
 
     logger.info(
-        "[V6D Hijack] Built KV cache spec: %d layers "
-        "(full_attention=%d, linear_attention=%d), "
+        "[V6D Hijack] Built KV cache spec: %d layers, "
         "num_kv_heads=%d (total=%d, tp=%d), head_size=%d, block_size=%d, "
         "page_size=%d bytes",
-        len(kv_cache_spec), full_attention_layers, linear_attention_layers,
-        num_kv_heads, total_num_kv_heads, tp_size, head_size, block_size,
-        attn_page_size,
+        len(kv_cache_spec), num_kv_heads, total_num_kv_heads, tp_size,
+        head_size, block_size, attn_page_size,
     )
     return kv_cache_spec
 
@@ -355,23 +347,43 @@ class C_VLLMWorkerHook(BaseHook):
             self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
             num_blocks = kv_cache_config.num_blocks
 
-            native_v6d_control_plane = os.environ.get(
-                "SGLANG_SIMULATOR_NATIVE_V6D_CONTROL_PLANE", ""
-            ).strip().lower() in {"1", "true", "yes", "on"}
-
+            # Initialize the hybrid worker loop without touching source files.
+            # Native HybridConnector expects engine_proxy._g_worker_loop to exist
+            # during connector construction.  In CPU simulation we avoid the full
+            # worker_init path because it validates GPU-oriented HybridWorker group
+            # layouts before our no-op data-plane hooks can take over.
             try:
+                import asyncio
+                import threading
                 import vllm.v1.hybrid_connector.engine_proxy as _engine_proxy
-                if native_v6d_control_plane:
-                    _orig_worker_init = _engine_proxy.worker_init
-                    if getattr(_engine_proxy, "_g_worker_loop", None) is None:
-                        _orig_worker_init(self.vllm_config, self.local_rank)
-                        logger.info(
-                            "[vLLM Hijack] Native V6D: initialized hybrid worker loop"
-                        )
-                    _engine_proxy.worker_init = lambda *a, **kw: None
-                else:
-                    _orig_worker_init = _engine_proxy.worker_init
-                    _engine_proxy.worker_init = lambda *a, **kw: None
+                _orig_worker_init = _engine_proxy.worker_init
+
+                def _ensure_cpu_worker_loop():
+                    if getattr(_engine_proxy, "_g_worker_loop", None) is not None:
+                        return
+                    loop = asyncio.new_event_loop()
+
+                    def _run_loop():
+                        asyncio.set_event_loop(loop)
+                        loop.run_forever()
+
+                    thread = threading.Thread(
+                        target=_run_loop,
+                        name="hybridworker-cpu-loop",
+                        daemon=True,
+                    )
+                    thread.start()
+                    _engine_proxy._g_worker_loop = loop
+                    logger.info(
+                        "[vLLM Hijack] installed CPU hybrid worker loop"
+                    )
+
+                def _cpu_worker_init(vllm_config, local_rank):
+                    _ensure_cpu_worker_loop()
+                    return None
+
+                _ensure_cpu_worker_loop()
+                _engine_proxy.worker_init = _cpu_worker_init
             except (ImportError, AttributeError):
                 _orig_worker_init = None
 
@@ -395,15 +407,11 @@ class C_VLLMWorkerHook(BaseHook):
             if hasattr(kv_cache_config, "kv_cache_tensors") and \
                     kv_cache_config.kv_cache_tensors:
                 for kv_tensor in kv_cache_config.kv_cache_tensors:
-                    if native_v6d_control_plane:
-                        tensor = torch.empty(
-                            kv_tensor.size, dtype=torch.int8, device="cpu"
-                        )
-                    else:
-                        minimal_size = min(kv_tensor.size, 4096)
-                        tensor = torch.zeros(
-                            minimal_size, dtype=torch.int8, device="cpu"
-                        )
+                    # Allocate only 1 page instead of full size
+                    minimal_size = min(kv_tensor.size, 4096)
+                    tensor = torch.zeros(
+                        minimal_size, dtype=torch.int8, device="cpu"
+                    )
                     for layer_name in kv_tensor.shared_by:
                         kv_caches[layer_name] = tensor
                 logger.info(
@@ -415,15 +423,11 @@ class C_VLLMWorkerHook(BaseHook):
             else:
                 kv_spec = self.model_runner.get_kv_cache_spec()
                 for layer_name, spec in kv_spec.items():
-                    if native_v6d_control_plane:
-                        tensor = torch.empty(
-                            spec.page_size_bytes, dtype=torch.int8, device="cpu"
-                        )
-                    else:
-                        minimal_size = min(spec.page_size_bytes, 4096)
-                        tensor = torch.zeros(
-                            minimal_size, dtype=torch.int8, device="cpu"
-                        )
+                    # Allocate only 1 page instead of num_blocks * page_size
+                    minimal_size = min(spec.page_size_bytes, 4096)
+                    tensor = torch.zeros(
+                        minimal_size, dtype=torch.int8, device="cpu"
+                    )
                     kv_caches[layer_name] = tensor
                 logger.info(
                     "[vLLM Hijack] Allocated %d MINIMAL CPU KV cache tensors "
@@ -466,40 +470,34 @@ class C_VLLMWorkerHook(BaseHook):
                 if _has_kv_transfer_group and _has_kv_transfer_group():
                     kv_connector = _get_kv_transfer_group()
                     kv_connector_metadata = scheduler_output.kv_connector_metadata
+                    logger.info(
+                        "[V6D Hijack] execute_model: kv_connector=%s metadata=%s",
+                        type(kv_connector).__name__,
+                        type(kv_connector_metadata).__name__
+                        if kv_connector_metadata is not None else None,
+                    )
                     if kv_connector_metadata is not None:
-                        kv_connector.handle_preemptions(kv_connector_metadata)
+                        if hasattr(kv_connector, "handle_preemptions"):
+                            kv_connector.handle_preemptions(kv_connector_metadata)
                         kv_connector.bind_connector_metadata(kv_connector_metadata)
+                        kv_connector.start_load_kv(None)
+                else:
+                    logger.info(
+                        "[V6D Hijack] execute_model: no kv_transfer_group"
+                    )
             except Exception:
+                logger.exception(
+                    "[V6D Hijack] execute_model: KV pre-forward lifecycle failed"
+                )
                 kv_connector = None
 
             # Build mock output
             req_ids = list(num_scheduled_tokens.keys()) if num_scheduled_tokens else []
-
-            # Determine which requests are still in prefill (chunked prefill).
-            # During prefill, the model runner must return empty sampled_token_ids
-            # so the scheduler does not prematurely finish the request.
-            # NOTE: _update_after_schedule has already advanced each request's
-            # num_computed_tokens before execute_model is called, but the values
-            # captured in scheduler_output are pre-advance.
-            prefill_req_ids = set()
-            for new_req in scheduler_output.scheduled_new_reqs:
-                sched = num_scheduled_tokens.get(new_req.req_id, 0)
-                prompt_len = len(new_req.prompt_token_ids) if new_req.prompt_token_ids else 0
-                if new_req.num_computed_tokens + sched < prompt_len:
-                    prefill_req_ids.add(new_req.req_id)
-            cached_reqs = scheduler_output.scheduled_cached_reqs
-            if cached_reqs and cached_reqs.num_prefill_tokens:
-                for i, req_id in enumerate(cached_reqs.req_ids):
-                    sched = num_scheduled_tokens.get(req_id, 0)
-                    prompt_len = cached_reqs.num_prefill_tokens[i]
-                    if cached_reqs.num_computed_tokens[i] + sched < prompt_len:
-                        prefill_req_ids.add(req_id)
-
             import dataclasses as _dc
             mro_kwargs = dict(
                 req_ids=req_ids,
                 req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
-                sampled_token_ids=[[] if rid in prefill_req_ids else [1] for rid in req_ids],
+                sampled_token_ids=[[1] for _ in req_ids],
                 logprobs=None,
                 prompt_logprobs_dict={},
             )
@@ -512,16 +510,29 @@ class C_VLLMWorkerHook(BaseHook):
 
             # KV connector post-forward
             if kv_connector is not None and _KVConnectorOutput is not None:
-                kv_output = _KVConnectorOutput()
-                finished_req_ids = getattr(scheduler_output, "finished_req_ids", set())
-                kv_output.finished_sending, kv_output.finished_recving = (
-                    kv_connector.get_finished(finished_req_ids)
-                )
-                kv_output.kv_connector_worker_meta = (
-                    kv_connector.build_connector_worker_meta()
-                )
-                kv_connector.clear_connector_metadata()
-                output.kv_connector_output = kv_output
+                try:
+                    kv_connector.wait_for_save()
+                    kv_output = _KVConnectorOutput()
+                    finished_req_ids = getattr(scheduler_output, "finished_req_ids", set())
+                    kv_output.finished_sending, kv_output.finished_recving = (
+                        kv_connector.get_finished(finished_req_ids)
+                    )
+                    logger.info(
+                        "[V6D Hijack] execute_model: finished_sending=%s "
+                        "finished_recving=%s",
+                        sorted(kv_output.finished_sending or []),
+                        sorted(kv_output.finished_recving or []),
+                    )
+                    if hasattr(kv_connector, "build_connector_worker_meta"):
+                        kv_output.kv_connector_worker_meta = (
+                            kv_connector.build_connector_worker_meta()
+                        )
+                    kv_connector.clear_connector_metadata()
+                    output.kv_connector_output = kv_output
+                except Exception:
+                    logger.exception(
+                        "[V6D Hijack] execute_model: KV post-forward lifecycle failed"
+                    )
 
             self._last_model_output = output
             return output

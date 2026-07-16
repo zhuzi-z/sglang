@@ -383,6 +383,156 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
+        import sys
+
+        module = sys.modules.get(target.__module__)
+        block_hash_list_with_block_size = getattr(
+            module, "BlockHashListWithBlockSize", None
+        )
+
+        def _group_block_hashes(self, block_hashes, group_block_size):
+            if group_block_size == self.hash_block_size:
+                return block_hashes
+            if block_hash_list_with_block_size is None:
+                return block_hashes
+            return block_hash_list_with_block_size(
+                block_hashes, self.hash_block_size, group_block_size
+            )
+
+        def _num_hash_blocks(self, request):
+            spec_cfg = getattr(self.vllm_config, "speculative_config", None)
+            use_eagle = bool(spec_cfg and spec_cfg.use_eagle())
+            if getattr(self, "_is_hybrid_backend", False) or use_eagle:
+                return max((request.num_tokens - 1) // self.hash_block_size, 0)
+            return max(request.num_tokens // self.hash_block_size, 0)
+
+        def _all_group_ids(self):
+            return sorted(
+                set(getattr(self, "full_attention_group_ids", set()))
+                | set(getattr(self, "mamba_group_ids", set()))
+            )
+
+        def _finalize_hit(self, request, num_computed_tokens, num_hash_blocks,
+                          hit_length):
+            lcm_block_size = getattr(self, "lcm_block_size", self.hash_block_size)
+            if lcm_block_size > 0:
+                hit_length = hit_length // lcm_block_size * lcm_block_size
+            if hit_length <= 0:
+                return 0, False
+            if hasattr(self, "_to_load_token_idx"):
+                self._to_load_token_idx[request.request_id] = num_computed_tokens
+            if hasattr(self, "_hit_stats"):
+                self._hit_stats.record(
+                    total_tokens=num_hash_blocks * self.hash_block_size,
+                    hit_tokens=hit_length,
+                )
+            logger.info(
+                "[V6D RPC Bypass] Request %s: scheduler lookup hit %d "
+                "tokens from num_computed_tokens=%d",
+                request.request_id,
+                hit_length,
+                num_computed_tokens,
+            )
+            return hit_length, True
+
+        def override_get_num_new_matched_tokens(
+            self, request, num_computed_tokens
+        ):
+            num_hash_blocks = _num_hash_blocks(self, request)
+            block_hashes = request.block_hashes[:num_hash_blocks]
+            if not block_hashes:
+                return 0, False
+
+            hit_length = num_hash_blocks * self.hash_block_size
+            for group_id in _all_group_ids(self):
+                manager = self.managers[group_id]
+                group_block_size = self.group_block_sizes[group_id]
+                group_hashes = _group_block_hashes(
+                    self, block_hashes, group_block_size
+                )
+                start_block_idx = num_computed_tokens // group_block_size
+                group_hits = manager.lookup(
+                    group_hashes[start_block_idx:],
+                    request_id=request.request_id,
+                    unfetched_objs={},
+                )
+                hit_length = min(hit_length, group_hits * group_block_size)
+            return _finalize_hit(
+                self, request, num_computed_tokens, num_hash_blocks, hit_length
+            )
+
+        async def override_async_get_num_new_matched_tokens(
+            self, request, num_computed_tokens
+        ):
+            num_hash_blocks = _num_hash_blocks(self, request)
+            block_hashes = request.block_hashes[:num_hash_blocks]
+            if not block_hashes:
+                return 0, False
+
+            hit_length = num_hash_blocks * self.hash_block_size
+            for group_id in _all_group_ids(self):
+                manager = self.managers[group_id]
+                group_block_size = self.group_block_sizes[group_id]
+                group_hashes = _group_block_hashes(
+                    self, block_hashes, group_block_size
+                )
+                start_block_idx = num_computed_tokens // group_block_size
+                group_hits = await manager.async_lookup(
+                    group_hashes[start_block_idx:],
+                    request_id=request.request_id,
+                    unfetched_objs={},
+                )
+                hit_length = min(hit_length, group_hits * group_block_size)
+            return _finalize_hit(
+                self, request, num_computed_tokens, num_hash_blocks, hit_length
+            )
+
+        target.get_num_new_matched_tokens = override_get_num_new_matched_tokens
+        target.async_get_num_new_matched_tokens = override_async_get_num_new_matched_tokens
+
+        original_request_finished = getattr(target, "request_finished", None)
+        original_request_finished_all_groups = getattr(
+            target, "request_finished_all_groups", None
+        )
+
+        def _complete_cpu_store_noop(self, req_id):
+            if hasattr(self, "_pending_store_reqs"):
+                self._pending_store_reqs.discard(req_id)
+            if hasattr(self, "_finished_pending_store_reqs"):
+                self._finished_pending_store_reqs.discard(req_id)
+            if hasattr(self, "_storing_block_hashes"):
+                self._storing_block_hashes.pop(req_id, None)
+            if hasattr(self, "_release_protected_blocks"):
+                self._release_protected_blocks(req_id)
+            logger.info(
+                "[V6D RPC Bypass] Request %s: completed scheduler-side "
+                "CPU no-op store without async wait",
+                req_id,
+            )
+
+        def override_request_finished(self, request, block_ids):
+            if original_request_finished is None:
+                return False, None
+            should_wait, params = original_request_finished(self, request, block_ids)
+            if should_wait:
+                _complete_cpu_store_noop(self, request.request_id)
+                return False, params
+            return should_wait, params
+
+        def override_request_finished_all_groups(self, request, block_ids):
+            if original_request_finished_all_groups is None:
+                return False, None
+            should_wait, params = original_request_finished_all_groups(
+                self, request, block_ids
+            )
+            if should_wait:
+                _complete_cpu_store_noop(self, request.request_id)
+                return False, params
+            return should_wait, params
+
+        target.request_finished = override_request_finished
+        target.request_finished_all_groups = override_request_finished_all_groups
+
         def override_cross_group_batch_allocate(
             self,
             group_candidates,

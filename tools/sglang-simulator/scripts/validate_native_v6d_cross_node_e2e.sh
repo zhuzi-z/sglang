@@ -37,7 +37,12 @@ log() {
 ssh_node() {
   local node="$1"
   shift
-  ssh -o ServerAliveInterval=15 "$node" "$@"
+  ssh -S none \
+    -o ControlMaster=no \
+    -o ControlPath=none \
+    -o ConnectTimeout=30 \
+    -o ServerAliveInterval=15 \
+    "$node" "$@"
 }
 
 git_head() {
@@ -81,7 +86,7 @@ check_log_contains() {
   local node="$1"
   local log_path="$2"
   local pattern="$3"
-  ssh_node "$node" "test -f '${log_path}' && grep -F '${pattern}' '${log_path}' | tail -5"
+  ssh_node "$node" "set -o pipefail; test -f '${log_path}' && grep -aF '${pattern}' '${log_path}' | tail -5"
 }
 
 log "checking simulator checksums"

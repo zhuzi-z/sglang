@@ -162,6 +162,8 @@ def init_hook(force: bool = False):
             'keeping real KVConnectorFactory and installing V6D CUDA-bypass hooks')
         hooks.extend([
             v6d_swap.C_V6dSwapHandlerHook,
+            v6d_backend.C_HybridBackendHook,
+            v6d_backend.C_HybridConnectorHook,
             v6d_worker.C_V6dObjectConnectorWorkerHook,
             v6d_backend.C_V6dObjectBackendHook,
             v6d_backend.C_KVTPBackendHook,

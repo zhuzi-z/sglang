@@ -19,6 +19,115 @@ from sglang_simulator.utils import get_logger
 logger = get_logger()
 
 
+class C_HybridBackendHook(BaseHook):
+    """Bypass GPU-oriented HybridBackend group layout validation on CPU."""
+
+    HOOK_CLASS_NAME = "HybridBackend"
+    HOOK_MODULE_NAME = "vllm.v1.hybrid_connector"
+
+    @classmethod
+    def hook(cls, target):
+        def override_validate_group_ordering(self):
+            logger.info(
+                "[V6D Hijack] HybridBackend._validate_group_ordering: "
+                "skipped CPU native control-plane validation"
+            )
+            return None
+
+        target._validate_group_ordering = override_validate_group_ordering
+        logger.info("[V6D Hijack] HybridBackend hook installed")
+
+
+class C_HybridConnectorHook(BaseHook):
+    """Report HybridConnector CPU no-op save/load completions."""
+
+    HOOK_CLASS_NAME = "HybridConnector"
+    HOOK_MODULE_NAME = "vllm.v1.hybrid_connector"
+
+    @classmethod
+    def hook(cls, target):
+        original_bind = target.bind_connector_metadata
+        original_clear = target.clear_connector_metadata
+
+        def _collect_req_ids(obj, attr_name, seen=None):
+            if obj is None:
+                return set()
+            if seen is None:
+                seen = set()
+            obj_id = id(obj)
+            if obj_id in seen:
+                return set()
+            seen.add(obj_id)
+            if isinstance(obj, dict):
+                ids = set()
+                for value in obj.values():
+                    ids.update(_collect_req_ids(value, attr_name, seen))
+                return ids
+            if isinstance(obj, (list, tuple, set)):
+                ids = set()
+                for value in obj:
+                    ids.update(_collect_req_ids(value, attr_name, seen))
+                return ids
+            value = getattr(obj, attr_name, None)
+            if isinstance(value, dict):
+                return set(value)
+            ids = set()
+            for value in vars(obj).values() if hasattr(obj, "__dict__") else ():
+                ids.update(_collect_req_ids(value, attr_name, seen))
+            return ids
+
+        def override_bind_connector_metadata(self, metadata):
+            original_bind(self, metadata)
+            store_reqs = _collect_req_ids(metadata, "reqs_to_store")
+            load_reqs = _collect_req_ids(metadata, "reqs_to_load")
+            self._sim_finished_store_reqs = (
+                getattr(self, "_sim_finished_store_reqs", set()) | store_reqs
+            )
+            self._sim_finished_load_reqs = (
+                getattr(self, "_sim_finished_load_reqs", set()) | load_reqs
+            )
+            if store_reqs or load_reqs:
+                logger.info(
+                    "[V6D Hijack] HybridConnector bind metadata: "
+                    "store=%s load=%s",
+                    sorted(store_reqs),
+                    sorted(load_reqs),
+                )
+
+        def override_wait_for_save(self):
+            return None
+
+        def override_get_finished(self, finished_req_ids):
+            store_reqs = set(getattr(self, "_sim_finished_store_reqs", set()))
+            load_reqs = set(getattr(self, "_sim_finished_load_reqs", set()))
+            self._sim_finished_store_reqs = set()
+            self._sim_finished_load_reqs = set()
+            if store_reqs or load_reqs:
+                logger.info(
+                    "[V6D Hijack] get_finished: store=%s load=%s "
+                    "finished_req_ids=%s",
+                    sorted(store_reqs),
+                    sorted(load_reqs),
+                    sorted(finished_req_ids or []),
+                )
+            return set(), set()
+
+        def override_clear_connector_metadata(self):
+            logger.info(
+                "[V6D Hijack] HybridConnector.clear_connector_metadata: "
+                "skipped CUDA backend clear in CPU mode"
+            )
+            if getattr(self, "_worker", None) is not None:
+                setattr(self._worker, "_meta", None)
+            return None
+
+        target.bind_connector_metadata = override_bind_connector_metadata
+        target.wait_for_save = override_wait_for_save
+        target.get_finished = override_get_finished
+        target.clear_connector_metadata = override_clear_connector_metadata
+        logger.info("[V6D Hijack] HybridConnector hook installed")
+
+
 class C_V6dObjectBackendHook(BaseHook):
     """Hook V6dObjectBackend to replace CUDA Event pool.
 
