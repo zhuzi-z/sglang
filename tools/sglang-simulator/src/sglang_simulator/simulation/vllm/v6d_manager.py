@@ -1,46 +1,20 @@
 """
-V6D Object Manager Hook - Implements RPC bypass for cross-node simulation.
+V6D Object Manager hooks for native control-plane ownership simulation.
 
-STATUS NOTE (current scope):
-This module contains TWO unrelated things with different fates:
+In native V6D control-plane mode this module keeps the real vLLM
+V6dObjectManager/V6dObjectConnectorScheduler classes in the request path, but
+bypasses the unavailable CPU-only data plane:
 
-1. ACTIVE / STILL USED:
-   `set_active_worker_id()` / `get_active_worker_id()` — simple env-var
-   helpers around `_SIM_V6D_ACTIVE_WORKER_ID`. These ARE used by
-   `vllm_worker.py` and read by `MockHybridConnector` in `kv_connector.py`
-   (the actual functional path: MockHybridConnector + V6DCacheStorage/etcd).
-   Do NOT remove these two functions.
+1. Tag each manager with `_SIM_V6D_ACTIVE_WORKER_ID`.
+2. Register allocated/sealed block ownership in the shared V6DCacheStorage
+   metadata store when CPU data transfer is skipped.
+3. Resolve lookup hits through the same shared metadata store and classify
+   local vs remote ownership.
+4. Bypass scheduler-side `client.create()` while preserving cross-group
+   allocation semantics.
 
-2. DEPRECATED — NOT part of current functional scope:
-   `C_V6dObjectManagerHook`, `V6dBlockOwnershipTracker`, and
-   `set_manager_worker_id()` all operate on the REAL vLLM `V6dObjectManager`
-   class (via real V6dObjectConnector), which is never instantiated because
-   `kv_connector.C_KVConnectorFactoryHook` unconditionally returns
-   MockHybridConnector. This hook is NOT registered in startup.py's
-   init_hook() anymore. Cross-node ownership tracking for the current
-   functional path is instead done via `V6DCacheStorage` (etcd), not via
-   this file's `/dev/shm` tracker. Safe to delete the deprecated parts
-   entirely unless a future task explicitly requires validating the real
-   V6D/vineyard daemon path.
-
-Original docstring below is kept for reference only.
----
-In a multi-node V6D cluster with real GPUs, cross-node KV cache sharing
-works via RPC (SRPC over GPU DMA). In CPU-only simulation, we bypass RPC
-by tracking block ownership at the simulation level:
-
-1. Each V6dObjectManager instance is tagged with a worker_id (node identity)
-2. On seal(): record which worker owns each block_hash key
-3. On lookup(): detect cross-node hits (owner != current worker)
-4. Remote data access works via shared vineyardd IPC (no RPC needed)
-
-This preserves the full V6D query/match semantics while accurately
-distinguishing local hits from cross-node hits for metrics reporting.
-
-CROSS-PROCESS DESIGN:
-Since vLLM runs EngineCore in subprocesses, we use file-backed storage
-under /dev/shm/ (tmpfs) for cross-process state sharing. File locking
-ensures correctness under concurrent access.
+The fallback `/dev/shm` tracker is retained only for local development when
+etcd is unavailable; dual-node validation should use the shared metastore.
 """
 
 from __future__ import annotations
@@ -66,16 +40,11 @@ _LOCK_FILE = os.path.join(_TRACKER_DIR, ".lock")
 
 
 class V6dBlockOwnershipTracker:
-    """DEPRECATED — not part of current functional scope.
+    """Ownership tracker used by the native V6D CPU bypass.
 
-    File-backed (/dev/shm) ownership tracker designed to pair with the real
-    V6dObjectManager hook below. The current functional path uses
-    V6DCacheStorage (etcd) for cross-node ownership instead. Kept only for
-    reference; safe to delete along with C_V6dObjectManagerHook.
-
-    Cross-process tracker for block ownership across all workers.
-    Uses file-backed storage under /dev/shm/ (tmpfs) so that data
-    persists across forked subprocesses. File locking ensures atomicity.
+    The preferred storage is shared V6DCacheStorage(etcd), which provides
+    physical cross-node visibility between node1 and node2.  The file-backed
+    `/dev/shm` fallback is used only when that shared store is unavailable.
     """
 
     @classmethod
@@ -221,22 +190,10 @@ class V6dBlockOwnershipTracker:
 # ---------------------------------------------------------------------------
 
 class C_V6dObjectManagerHook(BaseHook):
-    """DEPRECATED — real V6D IPC component hook, NOT part of current scope.
+    """Hook the real V6dObjectManager for CPU native control-plane mode.
 
-    Hooks the REAL vLLM V6dObjectManager class, which is only instantiated
-    inside a real V6dObjectConnector. Since
-    kv_connector.C_KVConnectorFactoryHook unconditionally returns
-    MockHybridConnector, this class is never instantiated in the current CPU
-    simulation path, and this hook is NOT registered in startup.py's
-    init_hook() (see startup.py comment). Safe to delete entirely unless a
-    future task explicitly requires validating the real V6D/vineyard daemon
-    path.
-
-    Hook V6dObjectManager to track block ownership and classify hits.
-
-    Intercepts seal() and _process_lookup() to implement RPC bypass:
-    - seal(): records which worker owns each block
-    - _process_lookup(): classifies hits as local vs remote (cross-node)
+    The hook preserves lookup/allocation ownership semantics while bypassing
+    scheduler-side v6d client data-plane calls that require SRPC/CUDA.
     """
 
     HOOK_CLASS_NAME = "V6dObjectManager"
@@ -485,10 +442,8 @@ def get_active_worker_id() -> str | None:
 
 
 def set_manager_worker_id(connector, worker_id: str) -> None:
-    """DEPRECATED — pairs with C_V6dObjectManagerHook (unused, dead code).
+    """Set the worker_id on all V6dObjectManager instances in a connector."""
 
-    Set the worker_id on all V6dObjectManager instances in a connector.
-    """
     if hasattr(connector, 'managers'):
         for gid, manager in connector.managers.items():
             manager._sim_worker_id = worker_id

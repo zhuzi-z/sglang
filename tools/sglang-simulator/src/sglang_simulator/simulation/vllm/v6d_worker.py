@@ -1,30 +1,10 @@
 """
-DEPRECATED — real V6D IPC component hook, NOT part of current functional scope.
+Worker-side hooks for native V6D control-plane simulation on CPU.
 
-Hooks V6dObjectConnectorWorker, a REAL vLLM class that only gets instantiated
-if a real V6dObjectConnector is created. Since
-kv_connector.C_KVConnectorFactoryHook unconditionally returns
-MockHybridConnector, this class is never instantiated in the current CPU
-simulation path, and this hook is NOT registered in startup.py's init_hook()
-(see startup.py comment). Current scope only requires scheduling-behavior
-parity via MockHybridConnector; real V6D daemon / vineyard IPC connection is
-not required. Safe to delete entirely unless a future task explicitly
-requires validating the real V6D/vineyard daemon path.
-
-Original docstring below is kept for reference only.
----
-V6D ObjectConnectorWorker Hook - Skips CUDA-specific initialization.
-
-Preserves:
-- V6D client connection (real V6D daemon)
-- Handler creation and KV cache setup
-- Async load/store logic
-
-Mocks:
-- _register_v6d_host_memory() → No-op (CPU can access mmap directly)
-- torch.cuda.current_device() → cpu device
-- torch.cuda.set_device() → No-op
-- pin_memory → False (no CUDA pinning needed)
+The real V6dObjectConnectorWorker class is preserved so scheduler/worker
+metadata flow remains native, while CUDA/SRPC data-plane operations are
+converted to deterministic no-op completions.  This lets CPU-only dual-node
+validation exercise the real control plane without transferring full KV data.
 """
 
 import torch
@@ -95,9 +75,19 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
         target.register_kv_caches = override_register_kv_caches
 
         def override_start_load_kv(self, metadata):
+            self._sim_finished_load_reqs = set(metadata.reqs_to_load)
+            logger.info(
+                "[V6D Hijack] start_load_kv: completed CPU no-op loads %s",
+                sorted(self._sim_finished_load_reqs),
+            )
             return None
 
         def override_start_store_kv(self, metadata):
+            self._sim_finished_store_reqs = set(metadata.reqs_to_store)
+            logger.info(
+                "[V6D Hijack] start_store_kv: completed CPU no-op stores %s",
+                sorted(self._sim_finished_store_reqs),
+            )
             return None
 
         async def _completed_v6d_task():
@@ -105,20 +95,48 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
 
         def override_async_start_load_kv(self, metadata):
             import asyncio
+            req_ids = set(metadata.reqs_to_load)
+            self._sim_finished_load_reqs = (
+                getattr(self, "_sim_finished_load_reqs", set()) | req_ids
+            )
+            logger.info(
+                "[V6D Hijack] async_start_load_kv: completed CPU no-op loads %s",
+                sorted(req_ids),
+            )
             return {
                 req_id: asyncio.create_task(_completed_v6d_task())
-                for req_id in metadata.reqs_to_load
+                for req_id in req_ids
             }
 
         def override_async_start_store_kv(self, metadata):
             import asyncio
+            req_ids = set(metadata.reqs_to_store)
+            self._sim_finished_store_reqs = (
+                getattr(self, "_sim_finished_store_reqs", set()) | req_ids
+            )
+            logger.info(
+                "[V6D Hijack] async_start_store_kv: completed CPU no-op stores %s",
+                sorted(req_ids),
+            )
             return {
                 req_id: asyncio.create_task(_completed_v6d_task())
-                for req_id in metadata.reqs_to_store
+                for req_id in req_ids
             }
 
         def override_get_finished(self, finished_req_ids):
-            return set(), set()
+            load_reqs = set(getattr(self, "_sim_finished_load_reqs", set()))
+            store_reqs = set(getattr(self, "_sim_finished_store_reqs", set()))
+            self._sim_finished_load_reqs = set()
+            self._sim_finished_store_reqs = set()
+            if load_reqs or store_reqs:
+                logger.info(
+                    "[V6D Hijack] get_finished: store=%s load=%s "
+                    "finished_req_ids=%s",
+                    sorted(store_reqs),
+                    sorted(load_reqs),
+                    sorted(finished_req_ids or []),
+                )
+            return store_reqs, load_reqs
 
         target.start_load_kv = override_start_load_kv
         target.start_store_kv = override_start_store_kv

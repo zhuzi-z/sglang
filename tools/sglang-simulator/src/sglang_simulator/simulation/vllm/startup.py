@@ -14,19 +14,15 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 def _env_enabled(*names: str) -> bool:
     return any(os.environ.get(name, "").strip().lower() in _TRUE_VALUES for name in names)
 
-# NOTE(DEPRECATED - real V6D IPC path):
-# v6d_backend / v6d_swap / v6d_worker hook the REAL vLLM V6D component classes
-# (V6dObjectBackend / V6dSwapHandler / V6dObjectConnectorWorker). Since
-# kv_connector.C_KVConnectorFactoryHook unconditionally returns
-# MockHybridConnector, none of those real classes are ever instantiated in
-# the current CPU simulation path. Current scope only requires scheduling
-# behavior parity (cross-node prefix match / hit rate) via MockHybridConnector
-# + V6DCacheStorage(etcd); real V6D/vineyard daemon component validation is
-# NOT part of current scope. These three modules are kept only as deprecated
-# reference code — safe to delete along with their hook registrations below.
-# v6d_manager is still imported because set_active_worker_id/get_active_worker_id
-# (env var helpers) are used by vllm_worker.py; its C_V6dObjectManagerHook /
-# V6dBlockOwnershipTracker are equally deprecated (see v6d_manager.py).
+# Native V6D control-plane mode keeps the real vLLM connector stack
+# (HybridConnector -> V6dObjectKVTBackend -> V6dObjectBackend/PBackend ->
+# V6dObjectConnectorScheduler/V6dObjectManager) and installs only runtime
+# hijack hooks for CPU-only execution.  The default CPU simulation mode still
+# uses MockHybridConnector + V6DCacheStorage(etcd) for scheduling parity.
+#
+# This file must not patch DashServing/vLLM source files on disk.  All behavior
+# changes are installed through class hooks, sitecustomize, and monkey patches
+# gated by explicit environment variables.
 
 
 def _patch_triton_for_cpu():
@@ -124,9 +120,9 @@ def init_hook(force: bool = False):
         worker,
     )
 
-    # Keep v6d_manager imported: set_active_worker_id/get_active_worker_id env
-    # helpers are used by vllm_worker.py even though its deprecated hook class is
-    # not registered below.
+    # Keep v6d_manager imported: in native V6D mode its hooks tag managers with
+    # the active worker id and publish/lookup cross-node ownership; in default
+    # MockHybridConnector mode the env helpers remain useful for worker identity.
     _ = v6d_manager
 
     # Ensure deterministic block hashes across nodes for cross-node cache sharing.

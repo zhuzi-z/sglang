@@ -1,28 +1,15 @@
 """
-DEPRECATED — real V6D IPC component hook, NOT part of current functional scope.
+Runtime hooks for native V6D/KVT control-plane simulation on CPU.
 
-Hooks V6dObjectBackend, a REAL vLLM class that only gets instantiated as part
-of a real V6dObjectConnector. Since kv_connector.C_KVConnectorFactoryHook
-unconditionally returns MockHybridConnector, this class is never instantiated
-in the current CPU simulation path, and this hook is NOT registered in
-startup.py's init_hook() (see startup.py comment). Safe to delete entirely
-unless a future task explicitly requires validating the real V6D/vineyard
-daemon path.
+These hooks are active only when native V6D control-plane mode is enabled.
+They keep the real vLLM V6D/KVT control-plane classes in use while replacing
+CUDA-only synchronization and transport pieces with no-op CPU shims:
 
-Original docstring below is kept for reference only.
----
-V6D ObjectBackend Hook - Replaces CUDA Event pool with DummyEvent.
+- V6dObjectBackend keeps scheduling/save/load decisions but uses DummyEvent.
+- PBackend keeps operation selection but bypasses blade_kvt GPU transport.
 
-The V6dObjectBackend manages the async save/load pipeline and uses
-torch.cuda.Event for synchronization. In simulation, these become no-ops.
-
-Preserves:
-- V6D object lifecycle (create, seal, get, delete)
-- Backend scheduling logic
-
-Mocks:
-- torch.cuda.Event() → DummyEvent
-- event.record(torch.cuda.current_stream()) → No-op
+No DashServing/vLLM source file is modified on disk; all changes are installed
+through class monkey-patches at interpreter startup.
 """
 
 from sglang_simulator.hook import BaseHook
