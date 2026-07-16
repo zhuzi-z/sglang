@@ -40,9 +40,14 @@ ssh_node() {
   ssh -o ServerAliveInterval=15 "$node" "$@"
 }
 
+git_head() {
+  local node="$1"
+  ssh_node "$node" "cd '${REPO}' && git rev-parse --short HEAD"
+}
+
 checksum_simulator() {
   local node="$1"
-  ssh_node "$node" "cd '${REPO}' && git rev-parse HEAD && find tools/sglang-simulator -type f \
+  ssh_node "$node" "cd '${REPO}' && find tools/sglang-simulator -type f \
     ! -name '._*' ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum | sha256sum"
 }
 
@@ -80,12 +85,16 @@ check_log_contains() {
 }
 
 log "checking simulator checksums"
+NODE1_HEAD="$(git_head "$NODE1")"
+NODE2_HEAD="$(git_head "$NODE2")"
 NODE1_SUM="$(checksum_simulator "$NODE1")"
 NODE2_SUM="$(checksum_simulator "$NODE2")"
-echo "NODE1_SUM=${NODE1_SUM}"
-echo "NODE2_SUM=${NODE2_SUM}"
+echo "NODE1_HEAD=${NODE1_HEAD}"
+echo "NODE2_HEAD=${NODE2_HEAD}"
+echo "NODE1_TREE_SUM=${NODE1_SUM}"
+echo "NODE2_TREE_SUM=${NODE2_SUM}"
 if [[ "$NODE1_SUM" != "$NODE2_SUM" ]]; then
-  echo "[ERROR] simulator code differs between nodes" >&2
+  echo "[ERROR] simulator file tree differs between nodes" >&2
   exit 2
 fi
 
@@ -111,4 +120,4 @@ if [[ -n "${NODE2_LOG:-}" ]]; then
 fi
 
 log "validation finished"
-log "acceptance: same checksum, no request_id hot patch, explicit kv params probe succeeds, node2 log has cross-node hit and completion when log paths are supplied"
+log "acceptance: same simulator file-tree checksum, no request_id hot patch, explicit kv params probe succeeds, node2 log has cross-node hit and completion when log paths are supplied"
