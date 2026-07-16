@@ -84,18 +84,27 @@ class C_VLLMSchedulerHook(BaseHook):
             self._sim_req_created_time = {}
 
             original_init(self, vllm_config, *args, **kwargs)
-            # Ensure connector is created even without kv_transfer_config
-            # (simulation always uses MockHybridConnector for cross-node cache)
-            if self.connector is None:
-                try:
-                    from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
-                    kv_cache_config = None
-                    if hasattr(self, 'kv_cache_config'):
-                        kv_cache_config = self.kv_cache_config
+            # Ensure the simulator always owns the scheduler connector.
+            # PAI-vLLM may eagerly create a native HybridConnector before the
+            # factory hook is reached; in CPU simulation that path will not
+            # produce MockHybridConnector request-level ownership logs.  Replace
+            # any non-Mock connector so request_finished/get_num_new_matched_tokens
+            # consistently go through V6DCacheStorage(etcd).
+            try:
+                from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
+                kv_cache_config = None
+                if hasattr(self, 'kv_cache_config'):
+                    kv_cache_config = self.kv_cache_config
+                if not isinstance(self.connector, MockHybridConnector):
+                    original_connector = type(self.connector).__name__ if self.connector is not None else None
                     self.connector = MockHybridConnector(vllm_config, None, kv_cache_config)
-                    logger.info('[Scheduler Hook] Force-created MockHybridConnector (no kv_transfer_config)')
-                except Exception as e:
-                    logger.warning('[Scheduler Hook] Failed to create connector: %s', e)
+                    logger.info(
+                        '[Scheduler Hook] Installed MockHybridConnector '
+                        '(replaced connector=%s)',
+                        original_connector,
+                    )
+            except Exception as e:
+                logger.warning('[Scheduler Hook] Failed to install MockHybridConnector: %s', e)
 
             # Always register MockHybridConnector with SupportsHMA regardless
             # of how the connector was created (factory hook or fallback above).
