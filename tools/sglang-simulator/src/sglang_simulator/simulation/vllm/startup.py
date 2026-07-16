@@ -368,20 +368,24 @@ def init_hook(force: bool = False):
     avoids installing global .pth files or affecting normal vLLM users sharing
     the same Python environment.
     """
-    if not force and not _env_enabled(
+    enable_vllm = _env_enabled(
         "SGLANG_SIMULATOR_ENABLE_HOOK",
         "SGLANG_SIMULATOR_ENABLE_VLLM_HOOK",
-    ):
+    )
+    enable_v6d_ipc = _env_enabled(
+        "SGLANG_SIMULATOR_ENABLE_HOOK",
+        "SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK",
+    )
+    if not force and not (enable_vllm or enable_v6d_ipc):
         return False
 
     import logging
 
-    if _env_enabled(
-        "SGLANG_SIMULATOR_ENABLE_HOOK",
-        "SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK",
-    ):
+    if enable_v6d_ipc:
         _install_v6d_ipc_hook()
     _install_dashllm_kv_transfer_hook()
+    if not force and not enable_vllm:
+        return True
 
     import sglang_simulator.hook as sglang_simulator_hook
     from sglang_simulator.simulation.vllm import (
