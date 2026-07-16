@@ -383,7 +383,6 @@ def init_hook(force: bool = False):
 
     if enable_v6d_ipc:
         _install_v6d_ipc_hook()
-    _install_dashllm_kv_transfer_hook()
     if not force and not enable_vllm:
         return True
 
@@ -457,4 +456,5 @@ def init_hook(force: bool = False):
         hooks.append(kv_connector.C_KVConnectorFactoryHook)
 
     sglang_simulator_hook.install_class_hooks(hooks)
+    _install_dashllm_kv_transfer_hook()
     return True
