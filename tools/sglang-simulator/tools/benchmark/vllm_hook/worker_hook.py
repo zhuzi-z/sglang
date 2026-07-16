@@ -3,7 +3,6 @@ import time
 import torch
 import json
 from typing import Optional
-from types import MethodType
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 
@@ -157,46 +156,9 @@ class C_SchedulerHook(BaseHook):
     @classmethod
     def hook(cls, target) -> None:
 
-        original_init = target.__init__
         original_add_request = target.add_request
         original_schedule = target.schedule
         original_free_request = target._free_request
-
-        def wrapped_init(self, *args, **kwargs):
-            original_init(self, *args, **kwargs)
-
-            original_kv_cache_manager_get_computed_blocks = (
-                self.kv_cache_manager.get_computed_blocks
-            )
-            if self.connector is not None:
-                original_connector_get_num_new_matched_tokens = (
-                    self.connector.get_num_new_matched_tokens
-                )
-
-            def wrapped_get_computed_blocks(kv_self, request):
-                ret = original_kv_cache_manager_get_computed_blocks(request)
-                num_local_computed = ret[1]
-                req_info = REQUEST_INFOS[request.request_id]
-                req_info.local_kv_hit_len = num_local_computed
-                # req_info.final_device_hit_len = num_local_computed
-                return ret
-
-            def wrapped_get_num_new_matched_tokens(
-                conn_self, request, num_new_local_computed_tokens
-            ):
-                ret = original_connector_get_num_new_matched_tokens(
-                    request, num_new_local_computed_tokens
-                )
-                REQUEST_INFOS[request.request_id].ext_kv_hit_len = ret[0]
-                return ret
-
-            self.kv_cache_manager.get_computed_blocks = MethodType(
-                wrapped_get_computed_blocks, self.kv_cache_manager
-            )
-            if self.connector is not None:
-                self.connector.get_num_new_matched_tokens = MethodType(
-                    wrapped_get_num_new_matched_tokens, self.connector
-                )
 
         def wrapped_add_request(self, request):
             recv_time = time.time()
@@ -222,7 +184,17 @@ class C_SchedulerHook(BaseHook):
                         req_info.queue_end = prefill_timestamp
                         req_info.input_length = request.num_prompt_tokens
                         req_info.output_length = request.max_tokens
-                        req_info.final_device_hit_len = request.num_cached_tokens
+
+                        req_info.final_device_hit_len = (
+                            request.num_cached_tokens
+                        )
+                        req_info.ext_kv_hit_len = (
+                            request.num_external_computed_tokens
+                        )
+                        req_info.local_kv_hit_len = (
+                            request.num_cached_tokens
+                            - request.num_external_computed_tokens
+                        )
 
             return scheduler_output
 
@@ -237,7 +209,6 @@ class C_SchedulerHook(BaseHook):
                 req_info.output_ids = list(request.output_token_ids)
             return original_free_request(self, request)
 
-        target.__init__ = wrapped_init
         target.add_request = wrapped_add_request
         target.schedule = wrapped_schedule
         target._free_request = wrapped_free_request
