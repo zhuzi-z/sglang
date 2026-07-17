@@ -138,6 +138,29 @@ def _install_dashllm_kv_transfer_hook(original_launch_v6d=None) -> None:
         backend_cls.generate = _patched_generate
         backend_cls._sglang_simulator_kv_transfer_params_hook = True
 
+    if backend_cls is not None and not getattr(
+        backend_cls,
+        "_sglang_simulator_cpu_native_load_hook",
+        False,
+    ):
+        original_load = backend_cls._load
+
+        def _patched_load(self):
+            if _env_enabled("SGLANG_SIMULATOR_ENABLE_VLLM_HOOK"):
+                logger.info(
+                    '[init_hook] forcing dashllm vLLM backend tensor_parallel_size=1 '
+                    'for CPU simulation')
+                self._backend_tensor_parallel_size = 1
+                backend_config = getattr(self, '_backend_config', None)
+                framework_config = getattr(backend_config, 'framework_config', None)
+                if isinstance(framework_config, dict):
+                    framework_config['tensor_parallel_size'] = 1
+                    framework_config['distributed_executor_backend'] = 'mp'
+            return original_load(self)
+
+        backend_cls._load = _patched_load
+        backend_cls._sglang_simulator_cpu_native_load_hook = True
+
     try:
         import dashllm.core.backend.engine._vllm_v1 as vllm_v1
         logger.info('[init_hook] imported dashllm.core.backend.engine._vllm_v1')
