@@ -44,19 +44,67 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
         target._register_v6d_host_memory = noop_register_v6d_host_memory
 
         # Override _start_async_v6d_init to avoid torch.cuda.current_device()
-        original_start_async = target._start_async_v6d_init
+        def override_async_v6d_init_and_notify(self) -> None:
+            """Notify scheduler that V6D is ready without CUDA/SRPC init."""
+            self._device = torch.device("cpu")
+            self.client = None
+            try:
+                import asyncio
+                import time
+                from vllm.v1.hybrid_connector import IoDoneReqs, hybridworker
+                from vllm.v1.hybrid_connector.engine_proxy import get_hybrid_worker_loop
+                from vllm.v1.hybrid_connector.utils import kill_me_if_exception
+                from vllm.v1.hybrid_connector.v6d_object_backend import (
+                    _V6D_READY_REQ,
+                    _V6D_READY_RESP,
+                )
+
+                @kill_me_if_exception
+                async def _send_v6d_ready():
+                    last_log_time = 0.0
+                    while True:
+                        try:
+                            await hybridworker().io_done_rpc(
+                                IoDoneReqs(worker_tprank=self._rank_id, reqids=[]),
+                                _V6D_READY_REQ,
+                                _V6D_READY_RESP,
+                            )
+                            logger.info(
+                                "[V6D Hijack] sent CPU v6d ready notification "
+                                "for tprank=%s",
+                                self._rank_id,
+                            )
+                            return
+                        except Exception as e:
+                            if isinstance(e, AssertionError):
+                                raise
+                            if time.time() - last_log_time > 10:
+                                logger.warning(
+                                    "[V6D Hijack] send CPU v6d ready failed "
+                                    "for tprank=%s, retrying: %s",
+                                    self._rank_id,
+                                    e,
+                                )
+                                last_log_time = time.time()
+                            await asyncio.sleep(0.5)
+
+                asyncio.run_coroutine_threadsafe(
+                    _send_v6d_ready(), get_hybrid_worker_loop())
+            except Exception:
+                logger.exception(
+                    "[V6D Hijack] failed to schedule CPU v6d ready notification")
 
         def override_start_async_v6d_init(self):
             """Skip worker-side V6D RPC/SRPC data channel initialization."""
-            self._device = torch.device("cpu")
-            self.client = None
             self._load_handler = None
             self._store_handler = None
+            override_async_v6d_init_and_notify(self)
             logger.info(
                 "[V6D Hijack] _start_async_v6d_init: skipped worker "
                 "V6D RPC/SRPC data channel initialization (CPU mode)"
             )
 
+        target._async_v6d_init_and_notify = override_async_v6d_init_and_notify
         target._start_async_v6d_init = override_start_async_v6d_init
 
         # Override register_kv_caches to allocate on CPU instead of GPU
