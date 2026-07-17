@@ -286,10 +286,19 @@ def _install_v6d_ipc_hook() -> None:
     original_launch_v6d = dashllm_vineyard.launch_v6d
 
     def _patched_launch_v6d(*args, **kwargs):
+        logger.info(
+            '[init_hook] dashllm launch_v6d called: args=%d kwargs=%s',
+            len(args), sorted(kwargs.keys()))
         envs_to_update = dict(kwargs.get("envs_to_update") or {})
         envs_to_update["SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK"] = "1"
         kwargs["envs_to_update"] = envs_to_update
-        return original_launch_v6d(*args, **kwargs)
+        try:
+            result = original_launch_v6d(*args, **kwargs)
+            logger.info('[init_hook] dashllm launch_v6d returned')
+            return result
+        except Exception:
+            logger.exception('[init_hook] dashllm launch_v6d failed')
+            raise
 
     dashllm_vineyard.launch_v6d = _patched_launch_v6d
     dashllm_vineyard._sglang_simulator_launch_v6d_hook = True
