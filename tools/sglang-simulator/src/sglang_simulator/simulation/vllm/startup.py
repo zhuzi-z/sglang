@@ -6,6 +6,7 @@ IMPORTANT: init_hook() must be called BEFORE any `import vllm.*` statement.
 """
 
 import json
+import logging
 import os
 
 
