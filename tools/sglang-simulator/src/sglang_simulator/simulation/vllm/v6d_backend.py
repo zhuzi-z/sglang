@@ -79,6 +79,27 @@ class C_HybridConnectorHook(BaseHook):
         def override_bind_connector_metadata(self, metadata):
             original_bind(self, metadata)
             reqs_to_store = getattr(metadata, "reqs_to_store", None) or {}
+            noop_store_reqs = {
+                req_id
+                for req_id, (groups_data, _is_last_save) in reqs_to_store.items()
+                if not groups_data
+            }
+            if noop_store_reqs:
+                try:
+                    from vllm.v1.hybrid_connector import mark_backend_save_done
+                    for req_id in sorted(noop_store_reqs):
+                        req = self.get_request(req_id)
+                        if req is not None:
+                            mark_backend_save_done(req)
+                    logger.info(
+                        "[V6D Hijack] completed noop last_save via mark_backend_save_done: %s",
+                        sorted(noop_store_reqs),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[V6D Hijack] failed to complete noop last_save: %s",
+                        sorted(noop_store_reqs),
+                    )
             store_reqs = {
                 req_id
                 for req_id, (groups_data, _is_last_save) in reqs_to_store.items()
