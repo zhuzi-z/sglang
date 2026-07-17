@@ -78,7 +78,11 @@ class C_HybridConnectorHook(BaseHook):
 
         def override_bind_connector_metadata(self, metadata):
             original_bind(self, metadata)
-            reqs_to_store = getattr(metadata, "reqs_to_store", None) or {}
+            backend_meta = getattr(metadata, "reqs", None)
+            reqs_to_store = getattr(metadata, "reqs_to_store", None)
+            if reqs_to_store is None and backend_meta is not None:
+                reqs_to_store = getattr(backend_meta, "reqs_to_store", None)
+            reqs_to_store = reqs_to_store or {}
             noop_store_reqs = {
                 req_id
                 for req_id, (groups_data, _is_last_save) in reqs_to_store.items()
