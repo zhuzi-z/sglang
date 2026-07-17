@@ -45,10 +45,6 @@ class C_VLLMSchedulerHook(BaseHook):
     #   gen_token_latencies, last_event_time, created_time
     REQUEST_STATS: dict[str, dict] = {}
 
-    # Per-iteration stats collected during simulation.
-    # Each entry: {iteration, forward_mode, request_infos, iter_latency, forward_latency}
-    ITERATION_STATS: list[dict] = []
-
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
@@ -87,19 +83,19 @@ class C_VLLMSchedulerHook(BaseHook):
             native_v6d_control_plane = os.environ.get(
                 'SGLANG_SIMULATOR_NATIVE_V6D_CONTROL_PLANE', ''
             ).strip().lower() in {'1', 'true', 'yes', 'on'}
-            enable_mock_connector = os.environ.get(
-                'SGLANG_SIMULATOR_ENABLE_MOCK_HYBRID_CONNECTOR', ''
-            ).strip().lower() in {'1', 'true', 'yes', 'on'}
             if native_v6d_control_plane:
                 logger.info(
                     '[Scheduler Hook] Native V6D control-plane mode: '
                     'keeping connector=%s',
                     type(self.connector).__name__ if self.connector is not None else None,
                 )
-            elif enable_mock_connector:
-                logger.warning(
-                    '[Scheduler Hook] DEPRECATED MockHybridConnector path explicitly enabled'
-                )
+            else:
+                # Ensure the simulator always owns the scheduler connector.
+                # PAI-vLLM may eagerly create a native HybridConnector before the
+                # factory hook is reached; in CPU simulation that path will not
+                # produce MockHybridConnector request-level ownership logs.  Replace
+                # any non-Mock connector so request_finished/get_num_new_matched_tokens
+                # consistently go through V6DCacheStorage(etcd).
                 try:
                     from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
                     kv_cache_config = None
@@ -115,24 +111,23 @@ class C_VLLMSchedulerHook(BaseHook):
                         )
                 except Exception as e:
                     logger.warning('[Scheduler Hook] Failed to install MockHybridConnector: %s', e)
-            else:
-                logger.info(
-                    '[Scheduler Hook] MockHybridConnector path disabled; keeping connector=%s',
-                    type(self.connector).__name__ if self.connector is not None else None,
-                )
 
-            if enable_mock_connector:
-                try:
-                    from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
-                    from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
-                    SupportsHMA.register(MockHybridConnector)
-                except Exception:
-                    pass
-                try:
-                    from sglang_simulator.simulation.vllm.kv_connector import set_scheduler_ref
-                    set_scheduler_ref(self)
-                except Exception:
-                    pass
+            # Always register MockHybridConnector with SupportsHMA regardless
+            # of how the connector was created (factory hook or fallback above).
+            # This ensures _connector_finished uses request_finished_all_groups
+            # on hybrid models with multiple kv_cache_groups (e.g. Qwen3.5).
+            try:
+                from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
+                from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
+                SupportsHMA.register(MockHybridConnector)
+            except Exception:
+                pass
+            # Share scheduler reference with MockHybridConnector
+            try:
+                from sglang_simulator.simulation.vllm.kv_connector import set_scheduler_ref
+                set_scheduler_ref(self)
+            except Exception:
+                pass
             # Patch _mamba_block_aligned_split to allow external computed tokens
             # Required for MockHybridConnector v2 (uses scheduler's
             # get_num_new_matched_tokens -> WAITING_FOR_REMOTE_KVS path)
@@ -239,7 +234,6 @@ class C_VLLMSchedulerHook(BaseHook):
                 # Check if all requests have been received
                 if seq_counter >= total_expected:
                     all_received = True
-                    StateManager.set_last_real_time_ts(time.time())
                     logger.info(
                         "All %d requests received. Starting simulation.",
                         total_expected,
@@ -295,55 +289,66 @@ class C_VLLMSchedulerHook(BaseHook):
                 if cls.SIM_MODE == SimulationMode.BLOCKING
                 else StateManager.get_global_clock()
             )
-
-            for req in scheduler_output.scheduled_new_reqs:
-                rid = req.req_id
-
-                req_obj = self.requests.get(rid)
-                input_length = (
-                    req_obj.num_prompt_tokens if req_obj is not None else 0
-                )
-                cls.REQUEST_STATS[rid].update(
-                    {
-                        "queue_end": queue_end_time,
-                        "final_device_hit_len": req.num_computed_tokens,
-                        "input_length": input_length,
-                    }
-                )
-
-            request_infos = {}
-            for req_id, sched_token in scheduler_output.num_scheduled_tokens.items():
-                request_infos[req_id] = {"extend_input_len": sched_token}
-
-            for req_id, completed_token in zip(
-                scheduler_output.scheduled_cached_reqs.req_ids, 
-                scheduler_output.scheduled_cached_reqs.num_computed_tokens
-            ):
-                request_infos[req_id]["kv_cache_len"] = completed_token
-            
-            for req in scheduler_output.scheduled_new_reqs:
-                request_infos[req.req_id]["kv_cache_len"] = req.num_computed_tokens
+            for req_id, num_tokens in num_scheduled_tokens.items():
+                _inst_first = getattr(self, "_sim_req_first_scheduled", req_first_scheduled)
+                if req_id not in _inst_first:
+                    _inst_first.add(req_id)
+                    if req_id in cls.REQUEST_STATS:
+                        cls.REQUEST_STATS[req_id]["queue_end"] = queue_end_time
+                    # Track prefix cache hit: final_device_hit_len = total reused (L1+L2),
+                    # final_host_hit_len = L2 portion. Metric layer subtracts for per-level ratios.
+                    request = self.requests.get(req_id)
+                    if request is not None:
+                        total_hit_len = request.num_computed_tokens - num_tokens
+                        host_hit_len = 0
+                        # Try prefill_stats (public vLLM) or num_external_computed_tokens (modified vLLM)
+                        if (
+                            hasattr(request, "prefill_stats")
+                            and request.prefill_stats is not None
+                        ):
+                            host_hit_len = (
+                                getattr(
+                                    request.prefill_stats,
+                                    "num_external_cached_tokens",
+                                    0,
+                                )
+                                or 0
+                            )
+                        if host_hit_len == 0:
+                            host_hit_len = getattr(
+                                request, "num_external_computed_tokens", 0
+                            ) or 0
+                        if total_hit_len > 0 and req_id in cls.REQUEST_STATS:
+                            cls.REQUEST_STATS[req_id]["final_device_hit_len"] = (
+                                total_hit_len
+                            )
+                        if host_hit_len > 0 and req_id in cls.REQUEST_STATS:
+                            cls.REQUEST_STATS[req_id]["final_host_hit_len"] = (
+                                host_hit_len
+                            )
 
             simulation_batch = ScheduleBatch(reqs=[])
-            for req_info in request_infos.values():
+            for req_id, num_tokens in num_scheduled_tokens.items():
+                request = self.requests.get(req_id)
+                if request is None:
+                    continue
+                # _update_after_schedule() already advanced num_computed_tokens,
+                # so past_kv_length = num_computed_tokens - num_tokens.
+                # extend_length = num_tokens directly (prefill > 1, decode == 1).
+                past_kv_length = request.num_computed_tokens - num_tokens
                 simulation_batch.reqs.append(
                     ScheduleRequest(
-                        extend_length=req_info["extend_input_len"],
-                        past_kv_length=req_info.get("kv_cache_len", 0),
+                        extend_length=num_tokens,
+                        past_kv_length=max(0, past_kv_length),
                     )
                 )
-            
-            now = time.time()
-            last_real_ts = StateManager.get_last_real_time_ts()
-            cpu_overhead = (now - last_real_ts) if last_real_ts > 0 else 0
-            StateManager.set_last_real_time_ts(now)
 
             if not simulation_batch.is_empty():
                 StateManager.inc_iteration()
                 if cls.INFERENCE_PREDICTOR is not None:
-                    predicted_latency = abs(float(
+                    predicted_latency = float(
                         cls.INFERENCE_PREDICTOR.predict_infer_time(simulation_batch)
-                    ))
+                    )
                 else:
                     predicted_latency = 0.001  # fallback: 1ms per step
 
@@ -352,38 +357,17 @@ class C_VLLMSchedulerHook(BaseHook):
                     event_time = time.time()
                 else:
                     StateManager.set_current_inference_dur(predicted_latency)
-                    StateManager.step_global_clock(predicted_latency + cpu_overhead)
+                    StateManager.step_global_clock(predicted_latency)
                     event_time = StateManager.get_global_clock()
 
+                # Record per-token latency for all scheduled requests
                 for req_id in num_scheduled_tokens:
                     st = cls.REQUEST_STATS.get(req_id)
                     if st is not None:
-                        req_obj = self.requests.get(req_id)
-                        if req_obj is not None:
-                            kv_cache_len = request_infos[req_id].get(
-                                "kv_cache_len", 0
-                            )
-                             # Skip if the request is still running with chunked prefill.
-                            is_decode = (
-                                kv_cache_len + num_scheduled_tokens[req_id]
-                                >= req_obj.num_prompt_tokens
-                            )
-                        else:
-                            is_decode = True  # fallback: treat as decode
-
-                        if is_decode:
-                            st["gen_token_latencies"].append(
-                                event_time - st["last_event_time"]
-                            )
-                            st["last_event_time"] = event_time
-
-                cls.ITERATION_STATS.append(
-                    {
-                        "requests": simulation_batch.request_info(),
-                        "forward_latency": predicted_latency,
-                        "cpu_overhead": cpu_overhead,
-                    }
-                )
+                        st["gen_token_latencies"].append(
+                            event_time - st["last_event_time"]
+                        )
+                        st["last_event_time"] = event_time
 
             return scheduler_output
 

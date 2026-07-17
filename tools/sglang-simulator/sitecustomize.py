@@ -221,11 +221,11 @@ def _install_v6d_ipc_hook() -> None:
     """Patch v6d startup so CPU-only environments can expose vineyard IPC."""
     try:
         import v6d.common.transfer as transfer
-        from v6d.server.peers.vineyard.peer import VineyardPeer
-    except Exception:
+    except Exception as exc:
+        print(f"[sglang-simulator] import v6d.common.transfer failed: {exc}", flush=True)
         return
 
-    def _skip_srpc_init(base_addr: int, size: int, *args, **kwargs) -> None:
+    def _skip_srpc_init(base_addr: int = 0, size: int = 0, *args, **kwargs) -> None:
         print(
             "[sglang-simulator] skip v6d SRPC init "
             f"base_addr={base_addr} size={size}",
@@ -239,7 +239,8 @@ def _install_v6d_ipc_hook() -> None:
         transfer.init_srpc_ = _skip_srpc_init
 
     if hasattr(transfer, "init_mmap") and hasattr(
-        transfer, "init_transfer_engine_client"
+        transfer,
+        "init_transfer_engine_client",
     ):
         def _init_transfer_engine_client_without_srpc(fd: int, size: int) -> int:
             addr = transfer.init_mmap(fd, size)
@@ -254,7 +255,11 @@ def _install_v6d_ipc_hook() -> None:
 
     try:
         import v6d.lite.common.transfer_engine as transfer_engine
-    except Exception:
+    except Exception as exc:
+        print(
+            f"[sglang-simulator] import lite transfer_engine skipped: {exc}",
+            flush=True,
+        )
         transfer_engine = None
 
     if transfer_engine is not None:
@@ -265,108 +270,153 @@ def _install_v6d_ipc_hook() -> None:
         if hasattr(transfer_engine, "init_srpc_transfer"):
             transfer_engine.init_srpc_transfer = _skip_srpc_init
 
-    try:
-        from v6d.client.peers.vineyard import mmap_manager
-    except Exception:
-        mmap_manager = None
-
-    if mmap_manager is not None and not getattr(
-        mmap_manager.ClientV6dMmapManager,
-        "_sglang_simulator_cpu_mmap_hook",
-        False,
-    ):
-        def _create_mmap_without_srpc(self, socket_path: str, is_lazy_strategy: bool):
-            from v6d.common.transfer import _vineyard_connect
-            from v6d.lite.common.transfer_engine import init_mmap
-
-            fd, map_size, offset, sock = _vineyard_connect(socket_path)
-            base_addr = init_mmap(fd, map_size)
-            os.close(fd)
+    if _enabled("SGLANG_SIMULATOR_V6D_IPC_PATCH_MMAP_MANAGER"):
+        try:
+            from v6d.client.peers.vineyard import mmap_manager
+        except Exception as exc:
             print(
-                "[sglang-simulator] create client v6d mmap without SRPC "
-                f"socket={socket_path} base_addr={base_addr} size={map_size} "
-                f"lazy={is_lazy_strategy}",
+                f"[sglang-simulator] import mmap_manager skipped: {exc}",
                 flush=True,
             )
-            return mmap_manager.MmapInfo(
-                socket_path=socket_path,
-                fd=fd,
-                base_addr=base_addr,
-                map_size=map_size,
-                refcount=1,
-                socket=sock,
-            )
+            mmap_manager = None
 
-        mmap_manager.ClientV6dMmapManager._create_mmap = _create_mmap_without_srpc
-        mmap_manager.ClientV6dMmapManager._sglang_simulator_cpu_mmap_hook = True
+        if mmap_manager is not None and not getattr(
+            mmap_manager.ClientV6dMmapManager,
+            "_sglang_simulator_cpu_mmap_hook",
+            False,
+        ):
+            def _create_mmap_without_srpc(
+                self,
+                socket_path: str,
+                is_lazy_strategy: bool,
+            ):
+                from v6d.common.transfer import _vineyard_connect
+                from v6d.lite.common.transfer_engine import init_mmap
 
-    if getattr(VineyardPeer, "_sglang_simulator_cpu_ipc_hook", False):
-        return
+                fd, map_size, offset, sock = _vineyard_connect(socket_path)
+                base_addr = init_mmap(fd, map_size)
+                os.close(fd)
+                print(
+                    "[sglang-simulator] create client v6d mmap without SRPC "
+                    f"socket={socket_path} base_addr={base_addr} size={map_size} "
+                    f"lazy={is_lazy_strategy}",
+                    flush=True,
+                )
+                return mmap_manager.MmapInfo(
+                    socket_path=socket_path,
+                    fd=fd,
+                    base_addr=base_addr,
+                    map_size=map_size,
+                    refcount=1,
+                    socket=sock,
+                )
 
-    original_init = VineyardPeer.__init__
-
-    def _patched_init(
-        self,
-        argc=0,
-        argv=None,
-        tracker_url=None,
-        tracker_key_prefix=None,
-        lazy_load=True,
-    ):
-        patched_argv = list(argv) if argv is not None else None
-        if patched_argv is not None:
-            has_rpc_flag = any(
-                arg.startswith("-rpc=") or arg.startswith("--rpc=")
-                for arg in patched_argv
-            )
-            if not has_rpc_flag:
-                patched_argv.append("-rpc=false")
-                argc = len(patched_argv)
-        return original_init(
-            self,
-            argc,
-            patched_argv,
-            tracker_url,
-            tracker_key_prefix,
-            lazy_load,
-        )
-
-    VineyardPeer.__init__ = _patched_init
-    VineyardPeer._sglang_simulator_cpu_ipc_hook = True
-
-    try:
-        from dashllm.utils import vineyard as dashllm_vineyard
-    except Exception:
-        return
-
-    if getattr(dashllm_vineyard, "_sglang_simulator_launch_v6d_hook", False):
-        return
-
-    original_launch_v6d = dashllm_vineyard.launch_v6d
-
-    def _patched_launch_v6d(*args, **kwargs):
-        envs_to_update = dict(kwargs.get("envs_to_update") or {})
-        current_pythonpath = os.environ.get("PYTHONPATH", "")
-        if current_pythonpath:
-            existing_pythonpath = envs_to_update.get("PYTHONPATH", "")
-            envs_to_update["PYTHONPATH"] = (
-                current_pythonpath
-                if not existing_pythonpath
-                else f"{current_pythonpath}:{existing_pythonpath}"
-            )
-        envs_to_update["SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK"] = "1"
-        kwargs["envs_to_update"] = envs_to_update
+            mmap_manager.ClientV6dMmapManager._create_mmap = _create_mmap_without_srpc
+            mmap_manager.ClientV6dMmapManager._sglang_simulator_cpu_mmap_hook = True
+    else:
         print(
-            "[sglang-simulator] patch dashllm launch_v6d envs: "
-            f"{sorted(envs_to_update)}",
+            "[sglang-simulator] mmap_manager patch disabled; "
+            "enable SGLANG_SIMULATOR_V6D_IPC_PATCH_MMAP_MANAGER=1 to test it",
             flush=True,
         )
-        return original_launch_v6d(*args, **kwargs)
 
-    dashllm_vineyard.launch_v6d = _patched_launch_v6d
-    dashllm_vineyard._sglang_simulator_launch_v6d_hook = True
+    if not os.environ.get(
+        "SGLANG_SIMULATOR_V6D_IPC_PATCH_VINEYARD_PEER",
+        "1",
+    ).strip().lower() in {"0", "false", "no", "off"}:
+        try:
+            from v6d.server.peers.vineyard.peer import VineyardPeer
+        except Exception as exc:
+            print(
+                f"[sglang-simulator] import VineyardPeer skipped: {exc}",
+                flush=True,
+            )
+            VineyardPeer = None
 
-    _install_dashllm_kv_transfer_hook(original_launch_v6d)
+        if VineyardPeer is not None and not getattr(
+            VineyardPeer,
+            "_sglang_simulator_cpu_ipc_hook",
+            False,
+        ):
+            original_init = VineyardPeer.__init__
+
+            def _patched_init(
+                self,
+                argc=0,
+                argv=None,
+                tracker_url=None,
+                tracker_key_prefix=None,
+                lazy_load=True,
+            ):
+                patched_argv = list(argv) if argv is not None else None
+                if patched_argv is not None:
+                    has_rpc_flag = any(
+                        arg.startswith("-rpc=") or arg.startswith("--rpc=")
+                        for arg in patched_argv
+                    )
+                    if not has_rpc_flag:
+                        patched_argv.append("-rpc=false")
+                        argc = len(patched_argv)
+                return original_init(
+                    self,
+                    argc,
+                    patched_argv,
+                    tracker_url,
+                    tracker_key_prefix,
+                    lazy_load,
+                )
+
+            VineyardPeer.__init__ = _patched_init
+            VineyardPeer._sglang_simulator_cpu_ipc_hook = True
+            print("[sglang-simulator] patch VineyardPeer.__init__ rpc=false", flush=True)
+    else:
+        print("[sglang-simulator] VineyardPeer patch disabled by env", flush=True)
+
+    if _enabled("SGLANG_SIMULATOR_V6D_IPC_PATCH_DASHLLM_LAUNCH"):
+        try:
+            from dashllm.utils import vineyard as dashllm_vineyard
+        except Exception as exc:
+            print(
+                f"[sglang-simulator] import dashllm.utils.vineyard skipped: {exc}",
+                flush=True,
+            )
+            dashllm_vineyard = None
+
+        if dashllm_vineyard is not None and not getattr(
+            dashllm_vineyard,
+            "_sglang_simulator_launch_v6d_hook",
+            False,
+        ):
+            original_launch_v6d = dashllm_vineyard.launch_v6d
+
+            def _patched_launch_v6d(*args, **kwargs):
+                envs_to_update = dict(kwargs.get("envs_to_update") or {})
+                current_pythonpath = os.environ.get("PYTHONPATH", "")
+                if current_pythonpath:
+                    existing_pythonpath = envs_to_update.get("PYTHONPATH", "")
+                    envs_to_update["PYTHONPATH"] = (
+                        current_pythonpath
+                        if not existing_pythonpath
+                        else f"{current_pythonpath}:{existing_pythonpath}"
+                    )
+                envs_to_update["SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK"] = "1"
+                kwargs["envs_to_update"] = envs_to_update
+                print(
+                    "[sglang-simulator] patch dashllm launch_v6d envs: "
+                    f"{sorted(envs_to_update)}",
+                    flush=True,
+                )
+                return original_launch_v6d(*args, **kwargs)
+
+            dashllm_vineyard.launch_v6d = _patched_launch_v6d
+            dashllm_vineyard._sglang_simulator_launch_v6d_hook = True
+            _install_dashllm_kv_transfer_hook(original_launch_v6d)
+    else:
+        print(
+            "[sglang-simulator] dashllm launch_v6d patch disabled; "
+            "enable SGLANG_SIMULATOR_V6D_IPC_PATCH_DASHLLM_LAUNCH=1 to test it",
+            flush=True,
+        )
 
 
 def _call_init_hook(init_hook) -> None:
