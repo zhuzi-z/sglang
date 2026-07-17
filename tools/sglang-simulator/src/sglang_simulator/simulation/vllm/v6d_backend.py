@@ -110,7 +110,7 @@ class C_HybridConnectorHook(BaseHook):
                     sorted(load_reqs),
                     sorted(finished_req_ids or []),
                 )
-            return set(), set()
+            return store_reqs, load_reqs
 
         def override_clear_connector_metadata(self):
             logger.info(
