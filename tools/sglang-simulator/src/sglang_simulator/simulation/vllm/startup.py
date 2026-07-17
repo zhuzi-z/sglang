@@ -103,10 +103,14 @@ def _merge_kv_params_into_sampling_params(kwargs: dict) -> dict:
 
 def _install_dashllm_kv_transfer_hook(original_launch_v6d=None) -> None:
     """Install non-invasive DashServing/vLLM kv_transfer_params passthrough."""
+    logger = logging.getLogger('sglang_simulator')
+    logger.info('[init_hook] installing dashllm kv-transfer passthrough hook')
     try:
         import dashllm.core.backend._backend_vllm as backend_vllm
-    except Exception:
+    except Exception as e:
+        logger.info('[init_hook] skip dashllm backend kv hook: %s', e)
         return
+    logger.info('[init_hook] imported dashllm.core.backend._backend_vllm')
 
     if (
         original_launch_v6d is not None
@@ -135,7 +139,9 @@ def _install_dashllm_kv_transfer_hook(original_launch_v6d=None) -> None:
 
     try:
         import dashllm.core.backend.engine._vllm_v1 as vllm_v1
-    except Exception:
+        logger.info('[init_hook] imported dashllm.core.backend.engine._vllm_v1')
+    except Exception as e:
+        logger.info('[init_hook] skip dashllm _vllm_v1 kv hook: %s', e)
         vllm_v1 = None
 
     engine_cls = getattr(vllm_v1, "vLLMEngine", None) if vllm_v1 else None
@@ -165,11 +171,15 @@ def _install_dashllm_kv_transfer_hook(original_launch_v6d=None) -> None:
 
 def _install_v6d_ipc_hook() -> None:
     """Patch v6d startup so CPU-only package/PTH deployments can expose IPC."""
+    logger = logging.getLogger('sglang_simulator')
+    logger.info('[init_hook] installing V6D IPC CPU hook')
     try:
         import v6d.common.transfer as transfer
         from v6d.server.peers.vineyard.peer import VineyardPeer
-    except Exception:
+    except Exception as e:
+        logger.info('[init_hook] skip V6D IPC CPU hook: %s', e)
         return
+    logger.info('[init_hook] imported v6d transfer and VineyardPeer')
 
     def _skip_srpc_init(base_addr: int, size: int, *args, **kwargs) -> None:
         return None
@@ -459,6 +469,10 @@ def init_hook(force: bool = False):
             logging.getLogger('sglang_simulator').info(
                 '[init_hook] MockHybridConnector path disabled; keeping real KVConnectorFactory')
 
+    logging.getLogger('sglang_simulator').info(
+        '[init_hook] installing %d class hooks', len(hooks))
     sglang_simulator_hook.install_class_hooks(hooks)
+    logging.getLogger('sglang_simulator').info('[init_hook] class hooks installed')
     _install_dashllm_kv_transfer_hook()
+    logging.getLogger('sglang_simulator').info('[init_hook] init_hook completed')
     return True
