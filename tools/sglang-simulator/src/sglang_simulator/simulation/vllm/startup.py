@@ -451,9 +451,13 @@ def init_hook(force: bool = False):
             v6d_manager.C_V6dObjectManagerHook,
         ])
     else:
-        # Default CPU simulation path: replace HybridConnector with
-        # MockHybridConnector + V6DCacheStorage(etcd) for scheduling parity.
-        hooks.append(kv_connector.C_KVConnectorFactoryHook)
+        if _env_enabled("SGLANG_SIMULATOR_ENABLE_MOCK_HYBRID_CONNECTOR"):
+            logging.getLogger('sglang_simulator').warning(
+                '[init_hook] DEPRECATED MockHybridConnector path explicitly enabled')
+            hooks.append(kv_connector.C_KVConnectorFactoryHook)
+        else:
+            logging.getLogger('sglang_simulator').info(
+                '[init_hook] MockHybridConnector path disabled; keeping real KVConnectorFactory')
 
     sglang_simulator_hook.install_class_hooks(hooks)
     _install_dashllm_kv_transfer_hook()

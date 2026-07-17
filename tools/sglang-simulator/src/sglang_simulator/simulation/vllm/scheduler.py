@@ -87,19 +87,19 @@ class C_VLLMSchedulerHook(BaseHook):
             native_v6d_control_plane = os.environ.get(
                 'SGLANG_SIMULATOR_NATIVE_V6D_CONTROL_PLANE', ''
             ).strip().lower() in {'1', 'true', 'yes', 'on'}
+            enable_mock_connector = os.environ.get(
+                'SGLANG_SIMULATOR_ENABLE_MOCK_HYBRID_CONNECTOR', ''
+            ).strip().lower() in {'1', 'true', 'yes', 'on'}
             if native_v6d_control_plane:
                 logger.info(
                     '[Scheduler Hook] Native V6D control-plane mode: '
                     'keeping connector=%s',
                     type(self.connector).__name__ if self.connector is not None else None,
                 )
-            else:
-                # Ensure the simulator always owns the scheduler connector.
-                # PAI-vLLM may eagerly create a native HybridConnector before the
-                # factory hook is reached; in CPU simulation that path will not
-                # produce MockHybridConnector request-level ownership logs.  Replace
-                # any non-Mock connector so request_finished/get_num_new_matched_tokens
-                # consistently go through V6DCacheStorage(etcd).
+            elif enable_mock_connector:
+                logger.warning(
+                    '[Scheduler Hook] DEPRECATED MockHybridConnector path explicitly enabled'
+                )
                 try:
                     from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
                     kv_cache_config = None
@@ -115,23 +115,24 @@ class C_VLLMSchedulerHook(BaseHook):
                         )
                 except Exception as e:
                     logger.warning('[Scheduler Hook] Failed to install MockHybridConnector: %s', e)
+            else:
+                logger.info(
+                    '[Scheduler Hook] MockHybridConnector path disabled; keeping connector=%s',
+                    type(self.connector).__name__ if self.connector is not None else None,
+                )
 
-            # Always register MockHybridConnector with SupportsHMA regardless
-            # of how the connector was created (factory hook or fallback above).
-            # This ensures _connector_finished uses request_finished_all_groups
-            # on hybrid models with multiple kv_cache_groups (e.g. Qwen3.5).
-            try:
-                from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
-                from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
-                SupportsHMA.register(MockHybridConnector)
-            except Exception:
-                pass
-            # Share scheduler reference with MockHybridConnector
-            try:
-                from sglang_simulator.simulation.vllm.kv_connector import set_scheduler_ref
-                set_scheduler_ref(self)
-            except Exception:
-                pass
+            if enable_mock_connector:
+                try:
+                    from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
+                    from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
+                    SupportsHMA.register(MockHybridConnector)
+                except Exception:
+                    pass
+                try:
+                    from sglang_simulator.simulation.vllm.kv_connector import set_scheduler_ref
+                    set_scheduler_ref(self)
+                except Exception:
+                    pass
             # Patch _mamba_block_aligned_split to allow external computed tokens
             # Required for MockHybridConnector v2 (uses scheduler's
             # get_num_new_matched_tokens -> WAITING_FOR_REMOTE_KVS path)
