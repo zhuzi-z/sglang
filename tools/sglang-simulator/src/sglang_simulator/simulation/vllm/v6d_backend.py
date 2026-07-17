@@ -78,7 +78,12 @@ class C_HybridConnectorHook(BaseHook):
 
         def override_bind_connector_metadata(self, metadata):
             original_bind(self, metadata)
-            store_reqs = _collect_req_ids(metadata, "reqs_to_store")
+            reqs_to_store = getattr(metadata, "reqs_to_store", None) or {}
+            store_reqs = {
+                req_id
+                for req_id, (groups_data, _is_last_save) in reqs_to_store.items()
+                if groups_data
+            }
             load_reqs = _collect_req_ids(metadata, "reqs_to_load")
             self._sim_finished_store_reqs = (
                 getattr(self, "_sim_finished_store_reqs", set()) | store_reqs
