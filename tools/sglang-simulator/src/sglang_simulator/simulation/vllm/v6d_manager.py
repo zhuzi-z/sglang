@@ -541,15 +541,18 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
             reqs_to_store = original_get_reqs_to_store(self, scheduler_output)
             noop_req_ids = [
                 req_id
-                for req_id, (groups_data, _is_last_save) in reqs_to_store.items()
-                if not groups_data
+                for req_id, (groups_data, is_last_save) in reqs_to_store.items()
+                if not groups_data or is_last_save
             ]
             if noop_req_ids:
                 try:
-                    from vllm.v1.hybrid_connector import mark_backend_save_done
+                    from vllm.v1.hybrid_connector import (
+                        mark_backend_save_done,
+                        sched_get_req,
+                    )
                     completed = []
                     for req_id in noop_req_ids:
-                        req = self.get_request(req_id)
+                        req = sched_get_req(req_id)
                         if req is not None:
                             mark_backend_save_done(req)
                             completed.append(req_id)
@@ -577,15 +580,18 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
             reqs_to_store = getattr(meta, "reqs_to_store", None) or {}
             noop_req_ids = [
                 req_id
-                for req_id, (groups_data, _is_last_save) in reqs_to_store.items()
-                if not groups_data
+                for req_id, (groups_data, is_last_save) in reqs_to_store.items()
+                if not groups_data or is_last_save
             ]
             if noop_req_ids:
                 try:
-                    from vllm.v1.hybrid_connector import mark_backend_save_done
+                    from vllm.v1.hybrid_connector import (
+                        mark_backend_save_done,
+                        sched_get_req,
+                    )
                     completed = []
                     for req_id in noop_req_ids:
-                        req = self.get_request(req_id)
+                        req = sched_get_req(req_id)
                         if req is not None:
                             mark_backend_save_done(req)
                             completed.append(req_id)
