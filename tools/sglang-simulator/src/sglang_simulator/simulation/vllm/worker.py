@@ -470,7 +470,7 @@ class C_VLLMWorkerHook(BaseHook):
                 if _has_kv_transfer_group and _has_kv_transfer_group():
                     kv_connector = _get_kv_transfer_group()
                     kv_connector_metadata = scheduler_output.kv_connector_metadata
-                    logger.info(
+                    logger.debug(
                         "[V6D Hijack] execute_model: kv_connector=%s metadata=%s",
                         type(kv_connector).__name__,
                         type(kv_connector_metadata).__name__
@@ -482,7 +482,7 @@ class C_VLLMWorkerHook(BaseHook):
                         kv_connector.bind_connector_metadata(kv_connector_metadata)
                         kv_connector.start_load_kv(None)
                 else:
-                    logger.info(
+                    logger.debug(
                         "[V6D Hijack] execute_model: no kv_transfer_group"
                     )
             except Exception:
@@ -517,12 +517,18 @@ class C_VLLMWorkerHook(BaseHook):
                     kv_output.finished_sending, kv_output.finished_recving = (
                         kv_connector.get_finished(finished_req_ids)
                     )
-                    logger.info(
-                        "[V6D Hijack] execute_model: finished_sending=%s "
-                        "finished_recving=%s",
-                        sorted(kv_output.finished_sending or []),
-                        sorted(kv_output.finished_recving or []),
-                    )
+                    if kv_output.finished_sending or kv_output.finished_recving:
+                        logger.info(
+                            "[V6D Hijack] execute_model: finished_sending=%s "
+                            "finished_recving=%s",
+                            sorted(kv_output.finished_sending or []),
+                            sorted(kv_output.finished_recving or []),
+                        )
+                    else:
+                        logger.debug(
+                            "[V6D Hijack] execute_model: finished_sending=[] "
+                            "finished_recving=[]"
+                        )
                     if hasattr(kv_connector, "build_connector_worker_meta"):
                         kv_output.kv_connector_worker_meta = (
                             kv_connector.build_connector_worker_meta()

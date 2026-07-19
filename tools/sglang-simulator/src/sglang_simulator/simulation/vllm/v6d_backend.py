@@ -143,7 +143,7 @@ class C_HybridConnectorHook(BaseHook):
             return set(), set()
 
         def override_clear_connector_metadata(self):
-            logger.info(
+            logger.debug(
                 "[V6D Hijack] HybridConnector.clear_connector_metadata: "
                 "skipped CUDA backend clear in CPU mode"
             )
