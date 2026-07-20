@@ -205,6 +205,14 @@ class V6DCacheStorage:
         if not self._connected:
             return False
 
+        existing_owner = self.lookup_block(block_hash)
+        if existing_owner is not None:
+            logger.debug(
+                "[V6DCacheStorage] keep existing owner for %s: %s (skip %s)",
+                block_hash, existing_owner, worker_id,
+            )
+            return True
+
         key = f"{_BLOCK_REGISTRY_PREFIX}/{block_hash}"
         value = json.dumps({"owner_worker_id": worker_id, "block_hash": block_hash})
         return _etcd_put(self._etcd_endpoint, key, value)
