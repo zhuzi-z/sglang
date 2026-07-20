@@ -443,8 +443,13 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
             if not block_hashes:
                 return 0, False
 
+            # Only take min across full attention groups.
+            # Mamba state is per-request (1 block), not per-sequence-length.
+            # Taking min with mamba hits would incorrectly limit hit_length to 1 block.
+            fa_group_ids = sorted(
+                getattr(self, "full_attention_group_ids", set()))
             hit_length = num_hash_blocks * self.hash_block_size
-            for group_id in _all_group_ids(self):
+            for group_id in fa_group_ids:
                 manager = self.managers[group_id]
                 group_block_size = self.group_block_sizes[group_id]
                 group_hashes = _group_block_hashes(
@@ -469,8 +474,11 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
             if not block_hashes:
                 return 0, False
 
+            # Only take min across full attention groups (same as sync version).
+            fa_group_ids = sorted(
+                getattr(self, "full_attention_group_ids", set()))
             hit_length = num_hash_blocks * self.hash_block_size
-            for group_id in _all_group_ids(self):
+            for group_id in fa_group_ids:
                 manager = self.managers[group_id]
                 group_block_size = self.group_block_sizes[group_id]
                 group_hashes = _group_block_hashes(
@@ -532,83 +540,6 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
 
         target.request_finished = override_request_finished
         target.request_finished_all_groups = override_request_finished_all_groups
-
-        original_get_reqs_to_store = getattr(target, "_get_reqs_to_store", None)
-
-        def override_get_reqs_to_store(self, scheduler_output):
-            if original_get_reqs_to_store is None:
-                return {}
-            reqs_to_store = original_get_reqs_to_store(self, scheduler_output)
-            noop_req_ids = [
-                req_id
-                for req_id, (groups_data, is_last_save) in reqs_to_store.items()
-                if not groups_data or is_last_save
-            ]
-            if noop_req_ids:
-                try:
-                    from vllm.v1.hybrid_connector import (
-                        mark_backend_save_done,
-                        sched_get_req,
-                    )
-                    completed = []
-                    for req_id in noop_req_ids:
-                        req = sched_get_req(req_id)
-                        if req is not None:
-                            mark_backend_save_done(req)
-                            completed.append(req_id)
-                    logger.info(
-                        "[V6D RPC Bypass] completed noop last_save via "
-                        "mark_backend_save_done: %s",
-                        completed,
-                    )
-                except Exception:
-                    logger.exception(
-                        "[V6D RPC Bypass] failed to complete noop last_save: %s",
-                        noop_req_ids,
-                    )
-            return reqs_to_store
-
-        if original_get_reqs_to_store is not None:
-            target._get_reqs_to_store = override_get_reqs_to_store
-
-        original_build_connector_meta = getattr(target, "build_connector_meta", None)
-
-        def override_build_connector_meta(self, scheduler_output):
-            if original_build_connector_meta is None:
-                return None
-            meta = original_build_connector_meta(self, scheduler_output)
-            reqs_to_store = getattr(meta, "reqs_to_store", None) or {}
-            noop_req_ids = [
-                req_id
-                for req_id, (groups_data, is_last_save) in reqs_to_store.items()
-                if not groups_data or is_last_save
-            ]
-            if noop_req_ids:
-                try:
-                    from vllm.v1.hybrid_connector import (
-                        mark_backend_save_done,
-                        sched_get_req,
-                    )
-                    completed = []
-                    for req_id in noop_req_ids:
-                        req = sched_get_req(req_id)
-                        if req is not None:
-                            mark_backend_save_done(req)
-                            completed.append(req_id)
-                    logger.info(
-                        "[V6D RPC Bypass] completed noop last_save via "
-                        "mark_backend_save_done: %s",
-                        completed,
-                    )
-                except Exception:
-                    logger.exception(
-                        "[V6D RPC Bypass] failed to complete noop last_save: %s",
-                        noop_req_ids,
-                    )
-            return meta
-
-        if original_build_connector_meta is not None:
-            target.build_connector_meta = override_build_connector_meta
 
         def override_cross_group_batch_allocate(
             self,
