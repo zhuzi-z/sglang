@@ -339,11 +339,10 @@ def _install_v6d_ipc_hook() -> None:
     logger.info("[v6d_ipc_hook] completed")
 
 # Native V6D control-plane mode keeps the real vLLM connector stack
-# (HybridConnector -> V6dObjectBackend -> V6dObjectConnectorScheduler/
-# V6dObjectManager) and installs only runtime hijack hooks for CPU-only
-# execution.  This is the mainline path for backend="v6d_object" parity.
-# The MockHybridConnector + V6DCacheStorage(etcd) path is legacy/debug only
-# and must not be enabled when validating native V6D control-plane behavior.
+# (HybridConnector -> V6dObjectKVTBackend -> V6dObjectBackend/PBackend ->
+# V6dObjectConnectorScheduler/V6dObjectManager) and installs only runtime
+# hijack hooks for CPU-only execution.  The default CPU simulation mode still
+# uses MockHybridConnector + V6DCacheStorage(etcd) for scheduling parity.
 #
 # This file must not patch DashServing/vLLM source files on disk.  All behavior
 # changes are installed through class hooks, sitecustomize, and monkey patches
@@ -504,13 +503,10 @@ def init_hook(force: bool = False):
             v6d_backend.C_KVTPBackendHook,
             v6d_manager.C_V6dObjectConnectorSchedulerHook,
             v6d_manager.C_V6dObjectManagerHook,
-            v6d_manager.C_HybridSchedulerHook,
         ])
     else:
-        # Legacy CPU simulation path: replace HybridConnector with
-        # MockHybridConnector + V6DCacheStorage(etcd).  Kept only for
-        # historical debugging; native V6D validation should set
-        # SGLANG_SIMULATOR_NATIVE_V6D_CONTROL_PLANE=1 instead.
+        # Default CPU simulation path: replace HybridConnector with
+        # MockHybridConnector + V6DCacheStorage(etcd) for scheduling parity.
         hooks.append(kv_connector.C_KVConnectorFactoryHook)
 
     sglang_simulator_hook.install_class_hooks(hooks)
