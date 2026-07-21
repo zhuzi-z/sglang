@@ -503,6 +503,7 @@ def init_hook(force: bool = False):
             v6d_backend.C_KVTPBackendHook,
             v6d_manager.C_V6dObjectConnectorSchedulerHook,
             v6d_manager.C_V6dObjectManagerHook,
+            v6d_manager.C_HybridSchedulerHook,
         ])
     else:
         # Default CPU simulation path: replace HybridConnector with

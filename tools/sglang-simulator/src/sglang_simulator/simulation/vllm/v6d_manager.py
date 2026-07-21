@@ -744,3 +744,45 @@ def set_manager_worker_id(connector, worker_id: str) -> None:
             logger.info(
                 f"[V6D RPC Bypass] Manager group={gid} tagged with "
                 f"worker_id={worker_id}")
+
+
+class C_HybridSchedulerHook(BaseHook):
+    """Hook HybridScheduler.step() to flush _saving into _saved.
+
+    In CPU simulation, start_store_kv is a no-op and never sends
+    _SAVE_DONE_REQ RPC.  As a result, _step_saved() has an empty _saved
+    deque and never clears _saving, causing block exhaustion.
+
+    This hook flushes all _saving keys into _saved before each step(),
+    so _step_saved() processes them naturally (releases blocks + clears
+    _saving).  This is safe because all saves are no-ops in CPU mode.
+    """
+
+    HOOK_CLASS_NAME = "HybridScheduler"
+    HOOK_MODULE_NAME = "vllm.v1.hybrid_connector"
+
+    @classmethod
+    def hook(cls, target):
+        original_step = target.step
+
+        def override_step(self):
+            saving = getattr(self, "_saving", None)
+            saved = getattr(self, "_saved", None)
+            if saving and saved is not None:
+                flushed = []
+                for req_id in list(saving.keys()):
+                    if req_id not in saved:
+                        saved.append(req_id)
+                        flushed.append(req_id)
+                if flushed:
+                    logger.info(
+                        "[V6D Hijack] Flushed %d saving entries into _saved "
+                        "for _step_saved processing: %s",
+                        len(flushed), flushed,
+                    )
+            return original_step(self)
+
+        target.step = override_step
+        logger.info(
+            "[V6D Hijack] HybridScheduler.step hook installed "
+            "(_saving flush for CPU no-op store)")
