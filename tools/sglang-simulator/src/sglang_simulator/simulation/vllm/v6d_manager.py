@@ -228,8 +228,12 @@ class C_V6dObjectManagerHook(BaseHook):
                 self.client = None
                 self._sim_fallback_mode = True
                 logger.warning(
-                    "[V6D P2P] Manager group=%d cannot connect to daemon "
-                    "at %s: %s. Falling back to etcd.",
+                    "[V6D P2P] *** FALLBACK TO ETCD MODE *** "
+                    "Manager group=%d cannot connect to v6d daemon at %s: %s. "
+                    "Cross-node ownership queries will use etcd HTTP API "
+                    "instead of real v6d P2P discovery (redis tracker). "
+                    "This path DIFFERS from production and may not reproduce "
+                    "all inflight/prefill issues.",
                     self._group_id, getattr(self, "_v6d_url", "?"), e,
                 )
                 if self._v6d_backend is not None:
