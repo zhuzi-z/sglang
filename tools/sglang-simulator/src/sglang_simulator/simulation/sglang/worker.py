@@ -38,13 +38,24 @@ class SGLangWorker(BaseWorker):
         self._engine = Engine(server_args=server_args)
         self.output_dir: str = None
 
+    def _get_handle_loop(self):
+        """Return the event loop where the tokenizer manager's handle_loop runs.
+
+        During benchmark, ``auto_create_handle_loop`` registers ``handle_loop``
+        on the *running* loop (the runner's loop) via ``get_or_create_event_loop``.
+        Using ``engine.loop`` afterwards hangs because the ZMQ response is never
+        received — ``handle_loop`` is on a different loop.
+        """
+        tm = self._engine.tokenizer_manager
+        return tm.event_loop or self._engine.loop
+
     def flush_cache(self):
-        self._engine.flush_cache()
+        tm = self._engine.tokenizer_manager
+        self._get_handle_loop().run_until_complete(tm.flush_cache())
 
     def clear_hicache_storage(self):
-        self._engine.loop.run_until_complete(
-            self._engine.tokenizer_manager.clear_hicache_storage()
-        )
+        tm = self._engine.tokenizer_manager
+        self._get_handle_loop().run_until_complete(tm.clear_hicache_storage())
 
     async def async_generate(self, req: GenericRequest):
         simulation_params = {}
