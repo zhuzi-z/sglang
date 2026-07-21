@@ -435,6 +435,53 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
             )
             return hit_length, True
 
+        def _mamba_validate(self, block_hashes, num_computed_tokens, fa_hit_length):
+            """Validate mamba state at aligned boundaries.
+
+            Mirrors the original V6dObjectConnectorScheduler logic:
+            search aligned boundaries from right to left, find the first
+            boundary where ALL mamba groups have a matching block in etcd.
+            If no boundary matches, return 0.
+            """
+            mamba_group_ids = sorted(getattr(self, "mamba_group_ids", set()))
+            if not mamba_group_ids:
+                return fa_hit_length
+
+            lcm_block_size = getattr(self, "lcm_block_size", self.hash_block_size)
+            if lcm_block_size <= 0:
+                return fa_hit_length
+
+            max_mamba_hit_length = (
+                fa_hit_length // lcm_block_size * lcm_block_size)
+            if max_mamba_hit_length <= 0:
+                return 0
+
+            aligned_hit_lengths = list(range(
+                max_mamba_hit_length, 0, -lcm_block_size))
+
+            for aligned_hit_length in aligned_hit_lengths:
+                all_match = True
+                for group_id in mamba_group_ids:
+                    manager = self.managers[group_id]
+                    group_block_size = self.group_block_sizes[group_id]
+                    group_hashes = _group_block_hashes(
+                        self, block_hashes, group_block_size)
+                    abs_idx = (
+                        (num_computed_tokens + aligned_hit_length)
+                        // group_block_size - 1
+                    )
+                    if abs_idx < 0 or abs_idx >= len(group_hashes):
+                        all_match = False
+                        break
+                    key = manager._make_key(group_hashes[abs_idx])
+                    if V6dBlockOwnershipTracker.get_owner(key) is None:
+                        all_match = False
+                        break
+                if all_match:
+                    return aligned_hit_length
+
+            return 0
+
         def override_get_num_new_matched_tokens(
             self, request, num_computed_tokens
         ):
@@ -443,9 +490,7 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
             if not block_hashes:
                 return 0, False
 
-            # Only take min across full attention groups.
-            # Mamba state is per-request (1 block), not per-sequence-length.
-            # Taking min with mamba hits would incorrectly limit hit_length to 1 block.
+            # Step 1: full attention groups — take min
             fa_group_ids = sorted(
                 getattr(self, "full_attention_group_ids", set()))
             hit_length = num_hash_blocks * self.hash_block_size
@@ -462,6 +507,11 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                     unfetched_objs={},
                 )
                 hit_length = min(hit_length, group_hits * group_block_size)
+
+            # Step 2: mamba aligned boundary validation (matches original vLLM)
+            hit_length = _mamba_validate(
+                self, block_hashes, num_computed_tokens, hit_length)
+
             return _finalize_hit(
                 self, request, num_computed_tokens, num_hash_blocks, hit_length
             )
@@ -474,7 +524,7 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
             if not block_hashes:
                 return 0, False
 
-            # Only take min across full attention groups (same as sync version).
+            # Step 1: full attention groups — take min
             fa_group_ids = sorted(
                 getattr(self, "full_attention_group_ids", set()))
             hit_length = num_hash_blocks * self.hash_block_size
@@ -491,6 +541,11 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                     unfetched_objs={},
                 )
                 hit_length = min(hit_length, group_hits * group_block_size)
+
+            # Step 2: mamba aligned boundary validation (matches original vLLM)
+            hit_length = _mamba_validate(
+                self, block_hashes, num_computed_tokens, hit_length)
+
             return _finalize_hit(
                 self, request, num_computed_tokens, num_hash_blocks, hit_length
             )
