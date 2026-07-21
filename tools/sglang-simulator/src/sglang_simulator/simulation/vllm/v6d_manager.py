@@ -206,13 +206,37 @@ class C_V6dObjectManagerHook(BaseHook):
         original_init = target.__init__
 
         def override_async_connect(self) -> None:
-            """Skip scheduler-side v6d client SRPC transport initialization."""
-            self.client = None
-            logger.info(
-                "[V6D RPC Bypass] Manager group=%d skipped v6d client "
-                "SRPC connect (CPU mode)",
-                self._group_id,
-            )
+            """Connect to real v6d daemon for P2P discovery.
+
+            IPC hook patches transfer.init_srpc_transfer to no-op,
+            so SRPC BAREX init is skipped and client connects without CUDA.
+            """
+            try:
+                import sys as _sys
+                _mod = _sys.modules.get(target.__module__)
+                _fn = getattr(_mod, "_connect_v6d_with_retry", None)
+                if _fn is None:
+                    raise RuntimeError("_connect_v6d_with_retry not found")
+                self.client = _fn(self._v6d_url)
+                self._sim_fallback_mode = False
+                logger.info(
+                    "[V6D P2P] Manager group=%d connected to v6d daemon "
+                    "at %s (real P2P path)",
+                    self._group_id, self._v6d_url,
+                )
+            except Exception as e:
+                self.client = None
+                self._sim_fallback_mode = True
+                logger.warning(
+                    "[V6D P2P] Manager group=%d cannot connect to daemon "
+                    "at %s: %s. Falling back to etcd.",
+                    self._group_id, getattr(self, "_v6d_url", "?"), e,
+                )
+                if self._v6d_backend is not None:
+                    self._v6d_backend.mark_manager_connected(self._group_id)
+                return
+            # Skip _on_connected: it starts schedrpcserver which conflicts
+            # with LAZY_INITIALIZE_KV_TRANSFER_OUTSIDE_VLLM mechanism
             if self._v6d_backend is not None:
                 self._v6d_backend.mark_manager_connected(self._group_id)
 
@@ -232,6 +256,7 @@ class C_V6dObjectManagerHook(BaseHook):
                 logger.debug(
                     f"[V6D RPC Bypass] Manager group={self._group_id} "
                     f"no active worker_id")
+            self._sim_fallback_mode = False
 
         target.__init__ = override_init
 
@@ -240,6 +265,8 @@ class C_V6dObjectManagerHook(BaseHook):
 
         def override_seal(self, block_hashes: Iterable, request_id=None):
             """Record sealed block ownership without v6d client data-plane."""
+            if not getattr(self, "_sim_fallback_mode", False):
+                return original_seal(self, block_hashes, request_id=request_id)
             block_hashes_list = list(block_hashes)
             worker_id = getattr(self, "_sim_worker_id", None)
             if worker_id:
@@ -265,6 +292,10 @@ class C_V6dObjectManagerHook(BaseHook):
             unfetched_objs: dict[str, Any] | None = None,
         ) -> int:
             """Process lookup using file-backed ownership tracker."""
+            if not getattr(self, "_sim_fallback_mode", False):
+                return original_process_lookup(
+                    self, block_hashes, got_objs, request_id,
+                    unfetched_objs=unfetched_objs)
             worker_id = getattr(self, "_sim_worker_id", None)
             hits = 0
             local_count = 0
@@ -314,17 +345,26 @@ class C_V6dObjectManagerHook(BaseHook):
 
         def override_lookup(self, block_hashes, request_id=None,
                             unfetched_objs=None):
+            if not getattr(self, "_sim_fallback_mode", False):
+                return original_lookup(self, block_hashes, request_id=request_id,
+                                       unfetched_objs=unfetched_objs)
             return self._process_lookup(
                 list(block_hashes), {}, request_id,
                 unfetched_objs=unfetched_objs)
 
         async def override_async_lookup(self, block_hashes, request_id=None,
                                         unfetched_objs=None):
+            if not getattr(self, "_sim_fallback_mode", False):
+                return await original_async_lookup(
+                    self, block_hashes, request_id=request_id,
+                    unfetched_objs=unfetched_objs)
             return self._process_lookup(
                 list(block_hashes), {}, request_id,
                 unfetched_objs=unfetched_objs)
 
         def override_get_key(self, block_hash, request_id=None):
+            if not getattr(self, "_sim_fallback_mode", False):
+                return original_get_key(self, block_hash, request_id=request_id)
             key = self._make_key(block_hash)
             if V6dBlockOwnershipTracker.get_owner(key) is None:
                 return None
@@ -337,10 +377,17 @@ class C_V6dObjectManagerHook(BaseHook):
             return override_get_key(self, block_hash, request_id=request_id)
 
         def override_reset(self):
+            if not getattr(self, "_sim_fallback_mode", False):
+                return original_reset(self)
             self._cached_objs.clear()
             self._cached_objs_reqs.clear()
             self._pending_objs.clear()
 
+        original_lookup = target.lookup
+        original_async_lookup = target.async_lookup
+        original_get_key = target.get_key
+        original_async_get_key = target.async_get_key
+        original_reset = target.reset
         target.lookup = override_lookup
         target.async_lookup = override_async_lookup
         target.get_key = override_get_key
@@ -354,6 +401,10 @@ class C_V6dObjectManagerHook(BaseHook):
             def override_batch_allocate(self, block_hashes, size, shape,
                                         dtype, request_id=None):
                 """Allocate simulated V6D keys without v6d client data-plane."""
+                if not getattr(self, "_sim_fallback_mode", False):
+                    return original_batch_allocate(
+                        self, block_hashes, size, shape, dtype,
+                        request_id=request_id)
                 result = {}
                 worker_id = getattr(self, "_sim_worker_id", None)
                 for h in block_hashes:
@@ -370,7 +421,7 @@ class C_V6dObjectManagerHook(BaseHook):
             target.batch_allocate = override_batch_allocate
 
         logger.info("[V6D Hijack] V6dObjectManager hook installed "
-                    "(RPC bypass + ownership tracking)")
+                    "(real v6d P2P + etcd fallback)")
 
 
 class C_V6dObjectConnectorSchedulerHook(BaseHook):
@@ -565,6 +616,15 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                 self._finished_pending_store_reqs.discard(req_id)
             if hasattr(self, "_storing_block_hashes"):
                 self._storing_block_hashes.pop(req_id, None)
+            try:
+                from vllm.v1.hybrid_connector import (
+                    mark_backend_save_done, sched_get_req,
+                )
+                req = sched_get_req(req_id)
+                if req is not None:
+                    mark_backend_save_done(req)
+            except Exception:
+                pass
             if hasattr(self, "_release_protected_blocks"):
                 self._release_protected_blocks(req_id)
             logger.info(
@@ -577,6 +637,9 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
             if original_request_finished is None:
                 return False, None
             should_wait, params = original_request_finished(self, request, block_ids)
+            # Always clear _saving for CPU no-op store
+            if hasattr(self, "_saving"):
+                self._saving.pop(request.request_id, None)
             if should_wait:
                 _complete_cpu_store_noop(self, request.request_id)
                 return False, params
