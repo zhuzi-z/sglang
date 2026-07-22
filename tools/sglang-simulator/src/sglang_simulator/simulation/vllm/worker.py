@@ -462,12 +462,9 @@ class C_VLLMWorkerHook(BaseHook):
 
         def override_execute_model(self, scheduler_output):
             """Return mock ModelRunnerOutput with KV connector lifecycle."""
-            import sys as _dbg
-            print("[DBG_EXEC] override_execute_model CALLED", file=_dbg.stderr, flush=True)
             _has_kvt = _has_kv_transfer_group
             _kvt_result = _has_kvt() if _has_kvt else None
             _meta = getattr(scheduler_output, "kv_connector_metadata", None)
-            print(f"[DBG_EXEC] has_kvt={_has_kvt} kvt_result={_kvt_result} meta={type(_meta).__name__ if _meta is not None else None}", file=_dbg.stderr, flush=True)
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens
 
             # KV connector pre-forward
@@ -523,7 +520,6 @@ class C_VLLMWorkerHook(BaseHook):
                     kv_output.finished_sending, kv_output.finished_recving = (
                         kv_connector.get_finished(finished_req_ids)
                     )
-                    print(f"[DBG_EXEC] finished_sending={kv_output.finished_sending} finished_recving={kv_output.finished_recving}", file=_dbg.stderr, flush=True)
                     if kv_output.finished_sending or kv_output.finished_recving:
                         logger.info(
                             "[V6D Hijack] execute_model: finished_sending=%s "
@@ -542,7 +538,6 @@ class C_VLLMWorkerHook(BaseHook):
                         )
                     kv_connector.clear_connector_metadata()
                     output.kv_connector_output = kv_output
-                    print(f"[DBG_EXEC] kv_connector_output set: {output.kv_connector_output is not None}", file=_dbg.stderr, flush=True)
                 except Exception:
                     logger.exception(
                         "[V6D Hijack] execute_model: KV post-forward lifecycle failed"

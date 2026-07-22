@@ -167,8 +167,6 @@ class C_HybridConnectorHook(BaseHook):
         target.start_save_kv = override_start_save_kv
 
         def override_update_connector_output(self, connector_output):
-            import sys as _dbg4
-            print(f"[DBG_UCO] update_connector_output ENTERED self._sched={getattr(self, '_sched', None) is not None}", file=_dbg4.stderr, flush=True)
             # Delegate to scheduler-side backend (V6dObjectConnectorScheduler)
             sched = getattr(self, "_sched", None)
             if sched is not None:

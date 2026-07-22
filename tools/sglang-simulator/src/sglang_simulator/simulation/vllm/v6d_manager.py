@@ -729,9 +729,7 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
 
         original_update_output = target.update_connector_output
         def override_update_connector_output(self, connector_output):
-            import sys as _dbg2
             _fs = getattr(connector_output, "finished_sending", None)
-            print(f"[DBG_UPD] update_connector_output called finished_sending={_fs}", file=_dbg2.stderr, flush=True)
             return original_update_output(self, connector_output)
         target.update_connector_output = override_update_connector_output
         logger.info(
