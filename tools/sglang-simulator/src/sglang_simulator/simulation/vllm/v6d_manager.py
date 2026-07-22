@@ -349,22 +349,58 @@ class C_V6dObjectManagerHook(BaseHook):
 
         def override_lookup(self, block_hashes, request_id=None,
                             unfetched_objs=None):
-            if not getattr(self, "_sim_fallback_mode", False):
-                return original_lookup(self, block_hashes, request_id=request_id,
-                                       unfetched_objs=unfetched_objs)
-            return self._process_lookup(
-                list(block_hashes), {}, request_id,
-                unfetched_objs=unfetched_objs)
+            if getattr(self, "_sim_fallback_mode", True):
+                return self._process_lookup(
+                    list(block_hashes), {}, request_id,
+                    unfetched_objs=unfetched_objs)
+            if getattr(self, "client", None) is None:
+                return 0
+            hits = 0
+            for h in block_hashes:
+                key = self._make_key(h)
+                if key in self._cached_objs:
+                    hits += 1
+                    continue
+                try:
+                    if self.client.exists(key):
+                        self._cached_objs[key] = key
+                        if request_id is not None:
+                            self._hold_key_for_req(key, request_id)
+                        hits += 1
+                    else:
+                        break
+                except Exception:
+                    break
+            return hits * getattr(self, "_group_block_size", 1)
 
         async def override_async_lookup(self, block_hashes, request_id=None,
                                         unfetched_objs=None):
-            if not getattr(self, "_sim_fallback_mode", False):
-                return await original_async_lookup(
-                    self, block_hashes, request_id=request_id,
+            if getattr(self, "_sim_fallback_mode", True):
+                return self._process_lookup(
+                    list(block_hashes), {}, request_id,
                     unfetched_objs=unfetched_objs)
-            return self._process_lookup(
-                list(block_hashes), {}, request_id,
-                unfetched_objs=unfetched_objs)
+            if getattr(self, "client", None) is None:
+                return 0
+            import asyncio
+            loop = asyncio.get_event_loop()
+            hits = 0
+            for h in block_hashes:
+                key = self._make_key(h)
+                if key in self._cached_objs:
+                    hits += 1
+                    continue
+                try:
+                    exists = await loop.run_in_executor(None, self.client.exists, key)
+                    if exists:
+                        self._cached_objs[key] = key
+                        if request_id is not None:
+                            self._hold_key_for_req(key, request_id)
+                        hits += 1
+                    else:
+                        break
+                except Exception:
+                    break
+            return hits * getattr(self, "_group_block_size", 1)
 
         def override_get_key(self, block_hash, request_id=None):
             if not getattr(self, "_sim_fallback_mode", False):
@@ -690,6 +726,14 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
             return result
 
         target._cross_group_batch_allocate = override_cross_group_batch_allocate
+
+        original_update_output = target.update_connector_output
+        def override_update_connector_output(self, connector_output):
+            import sys as _dbg2
+            _fs = getattr(connector_output, "finished_sending", None)
+            print(f"[DBG_UPD] update_connector_output called finished_sending={_fs}", file=_dbg2.stderr, flush=True)
+            return original_update_output(self, connector_output)
+        target.update_connector_output = override_update_connector_output
         logger.info(
             "[V6D Hijack] V6dObjectConnectorScheduler hook installed "
             "(cross-group allocation bypass)"

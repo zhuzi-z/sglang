@@ -82,6 +82,10 @@ class C_HybridConnectorHook(BaseHook):
             reqs_to_store = getattr(metadata, "reqs_to_store", None)
             if reqs_to_store is None and backend_meta is not None:
                 reqs_to_store = getattr(backend_meta, "reqs_to_store", None)
+            if reqs_to_store is None and backend_meta is not None:
+                inner_meta = getattr(backend_meta, "inner", None)
+                if inner_meta is not None:
+                    reqs_to_store = getattr(inner_meta, "reqs_to_store", None)
             reqs_to_store = reqs_to_store or {}
             noop_store_reqs = {
                 req_id
@@ -140,7 +144,7 @@ class C_HybridConnectorHook(BaseHook):
                     sorted(load_reqs),
                     sorted(finished_req_ids or []),
                 )
-            return set(), set()
+            return store_reqs, load_reqs
 
         def override_clear_connector_metadata(self):
             logger.debug(
@@ -151,10 +155,30 @@ class C_HybridConnectorHook(BaseHook):
                 setattr(self._worker, "_meta", None)
             return None
 
+        def override_start_load_kv(self, forward_context=None, **kwargs):
+            pass
+        def override_start_save_kv(self, forward_context=None, **kwargs):
+            pass
         target.bind_connector_metadata = override_bind_connector_metadata
         target.wait_for_save = override_wait_for_save
         target.get_finished = override_get_finished
         target.clear_connector_metadata = override_clear_connector_metadata
+        target.start_load_kv = override_start_load_kv
+        target.start_save_kv = override_start_save_kv
+
+        def override_update_connector_output(self, connector_output):
+            import sys as _dbg4
+            print(f"[DBG_UCO] update_connector_output ENTERED self._sched={getattr(self, '_sched', None) is not None}", file=_dbg4.stderr, flush=True)
+            # Delegate to scheduler-side backend (V6dObjectConnectorScheduler)
+            sched = getattr(self, "_sched", None)
+            if sched is not None:
+                backend = getattr(sched, "_backend", None)
+                scheduler = getattr(backend, "_scheduler", None) if backend is not None else None
+                if scheduler is not None and hasattr(scheduler, "update_connector_output"):
+                    scheduler.update_connector_output(connector_output)
+                    logger.info("[V6D Hijack] update_connector_output delegated to backend: finished_sending=%s",
+                               getattr(connector_output, "finished_sending", None))
+        target.update_connector_output = override_update_connector_output
         logger.info("[V6D Hijack] HybridConnector hook installed")
 
 

@@ -1,0 +1,2 @@
+{"filename":"weight_utils.py","lineno":80,"message":"Import 'model_weight_service' wheel package error.","time":"2026-07-22 15:14:49.471"}
+{"filename":"qwen3_vl.py","lineno":922,"message":"The effective video max pixels (2147483648) computed from max_mm_len (1048576) differs from the processor config video_max_pixels (25165824). Using 25165824.","time":"2026-07-22 15:15:16.474"}

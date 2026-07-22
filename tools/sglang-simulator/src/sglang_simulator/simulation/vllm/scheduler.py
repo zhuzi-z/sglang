@@ -50,7 +50,15 @@ class C_VLLMSchedulerHook(BaseHook):
         original_init = target.__init__
         original_add_request = target.add_request
         original_schedule = target.schedule
+
+        def override_update_from_output(self, scheduler_output, model_output):
+            _kvo = getattr(model_output, "kv_connector_output", None)
+            _fs = getattr(_kvo, "finished_sending", None) if _kvo else None
+            import sys as _dbg3
+            print(f"[DBG_SCH] update_from_output kv_connector_output={_kvo is not None} finished_sending={_fs}", file=_dbg3.stderr, flush=True)
+            return original_update_from_output(self, scheduler_output, model_output)
         original_get_num_unfinished = target.get_num_unfinished_requests
+        original_update_from_output = target.update_from_output
 
         # Future queue: heap of (created_time, seq_no, request)
         # Requests are held here until global_clock >= created_time
@@ -379,4 +387,5 @@ class C_VLLMSchedulerHook(BaseHook):
         target.__init__ = wrapped_init
         target.add_request = wrapped_add_request
         target.schedule = wrapped_schedule
+        target.update_from_output = override_update_from_output
         target.get_num_unfinished_requests = wrapped_get_num_unfinished
