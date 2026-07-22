@@ -36,15 +36,16 @@ V6D_SOCKET = "/tmp/vineyard.sock_test"
 BASE_URL = f"http://{V6D_HOST}:{V6D_PORT}"
 
 MB = 1 << 20
-BLOB_SIZE = 2 << 20       # 2 MB per blob (hook fixed)
-VIRTUAL_CAP = 1 << 30      # 1 GB virtual capacity (hook fixed)
-MAX_BLOBS = VIRTUAL_CAP // BLOB_SIZE  # 512
+GB = 1 << 30
+BLOB_SIZE = 1 * GB       # 1 GB per blob (virtual size)
+VIRTUAL_CAP = 500 * GB   # 500 GB virtual capacity (from --vineyard-size=500G)
+MAX_BLOBS = VIRTUAL_CAP // BLOB_SIZE  # 500
 
-# Exact v6d serve CLI command (as specified by user)
+# Exact v6d serve CLI command
 V6D_ARGS = [
     V6D_BIN, "serve",
     "--peer=tiered_vineyard",
-    "--vineyard-size=256M",
+    "--vineyard-size=500G",
     "--port", str(V6D_PORT),
     "--vineyard-socket", V6D_SOCKET,
     "--vineyard-rpc-port", "21000",
@@ -165,7 +166,7 @@ def stop_v6d(proc: subprocess.Popen):
 # Tests
 # --------------------------------------------------------------------------
 
-def make_metas(count: int, size: int = 1024) -> list[dict]:
+def make_metas(count: int, size: int = BLOB_SIZE) -> list[dict]:
     """Create object_metas for acquire request."""
     return [{"size": size} for _ in range(count)]
 
@@ -184,8 +185,8 @@ def discard(lease_id: str) -> tuple[int, dict | None]:
 
 def main():
     print("=== V6D Capacity Control Integration Test ===")
-    print(f"Virtual capacity: {VIRTUAL_CAP // MB} MB")
-    print(f"Blob size: {BLOB_SIZE // MB} MB (fixed)")
+    print(f"Virtual capacity: {VIRTUAL_CAP} bytes ({VIRTUAL_CAP // GB} GB)")
+    print(f"Blob size: {BLOB_SIZE} bytes (virtual)")
     print(f"Max blobs: {MAX_BLOBS}")
     print()
 
@@ -240,21 +241,19 @@ def main():
               f"status={status}, objects={obj_count}")
 
         # ------------------------------------------------------------------
-        # Test 5: Fill to 512 blobs (virtual capacity) in one batch
-        # Already created 11 blobs (1 + 10). Need 501 more.
-        # But capacity-based eviction (default=100) may evict some.
-        # Instead, create 501 in one batch — total 512.
+        # Test 5: Fill to MAX_BLOBS (virtual capacity) in one batch
+        # Already created 11 blobs (1 + 10). Need 489 more.
         # ------------------------------------------------------------------
-        status, body = acquire(make_metas(501))
+        status, body = acquire(make_metas(MAX_BLOBS - 11))
+        fill_count = MAX_BLOBS - 11
         obj_count = len(body.get("objects", [])) if body else 0
-        check("t5_fill_to_512",
-              status == 200 and obj_count == 501,
+        check(f"t5_fill_to_{MAX_BLOBS}",
+              status == 200 and obj_count == fill_count,
               f"status={status}, objects={obj_count}")
 
         # ------------------------------------------------------------------
         # Test 6: One more object should trigger OOM
-        # Virtual used = 512 * 2MB = 1024MB = 1GB (full)
-        # 513th blob → try_allocate(513) → 513 * 2MB > 1GB → OOM
+        # Virtual used = MAX_BLOBS * BLOB_SIZE = VIRTUAL_CAP (full)
         # ------------------------------------------------------------------
         status, body = acquire(make_metas(1))
         is_oom = status == 500 and body and (
@@ -266,15 +265,15 @@ def main():
               f"status={status}, error={str(body)[:200] if body else 'N/A'}")
 
         # ------------------------------------------------------------------
-        # Test 7: Batch of 513 should also fail with OOM
+        # Test 7: Batch exceeding capacity should also fail with OOM
         # ------------------------------------------------------------------
-        status, body = acquire(make_metas(513))
+        status, body = acquire(make_metas(MAX_BLOBS + 1))
         is_oom2 = status == 500 and body and (
             "Not enough memory" in str(body) or
             "Virtual capacity" in str(body) or
             "not enough memory" in str(body).lower()
         )
-        check("t7_oom_batch_513", is_oom2,
+        check(f"t7_oom_batch_{MAX_BLOBS + 1}", is_oom2,
               f"status={status}, error={str(body)[:200] if body else 'N/A'}")
 
         # ------------------------------------------------------------------
@@ -289,7 +288,7 @@ def main():
 
         # After discard, virtual used should decrease.
         # The discard releases the lease, which triggers del_blob on the
-        # objects in that lease (10 blobs → -20MB).
+        # objects in that lease (10 blobs → -10 * BLOB_SIZE).
         # Now create 1 object — should succeed.
         status, body = acquire(make_metas(1))
         new_lease = body.get("lease", {}).get("lease_id", "") if body else ""

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """V6D P2P eviction test (memory_usage path).
 
-Starts Redis + two v6d servers with C_VineyardServerHook (virtual 1GB / 2MB
-per blob) and --memory-usage-max to trigger eviction via memory_usage path.
-Verifies evicted objects are removed from both local store and tracker.
+Starts Redis + two v6d servers with C_VineyardServerHook (virtual 500GB
+capacity, 1G blob size) and --memory-usage-max to trigger eviction
+via memory_usage path. Verifies evicted objects are removed from both
+local store and tracker.
 
 Run:
   python test/test_v6d_p2p_eviction.py
@@ -28,14 +29,14 @@ LIB_DIR = os.path.join(SIM_ROOT, "scripts")
 REDIS_PORT = 6379
 REDIS_URL = f"redis://127.0.0.1:{REDIS_PORT}"
 
-# Virtual capacity from C_VineyardServerHook: 1GB total, 2MB per blob
-# With --memory-usage-max=0.05, eviction triggers at ~5% = ~26 blobs
+# Virtual capacity: 500GB, blob size: 1GB (virtual)
+# With --memory-usage-max=0.05, eviction triggers at ~5% = ~25 blobs
 # With --memory-usage-emergency-min=0.08, force-wait at ~8% = ~41 blobs
 USAGE_MAX = 0.05
 USAGE_MIN = 0.02
 USAGE_EMERGENCY = 0.08
-BLOB_SIZE = 2 << 20       # 2 MB
-VIRTUAL_CAP = 1 << 30      # 1 GB
+BLOB_SIZE = 1 << 30       # 1 GB (virtual size per blob)
+VIRTUAL_CAP = 500 * (1 << 30)  # 500 GB virtual capacity (from --vineyard-size=500G)
 # Eviction triggers at: USAGE_MAX * VIRTUAL_CAP / BLOB_SIZE = ~26 blobs
 EVICT_THRESHOLD = int(USAGE_MAX * VIRTUAL_CAP / BLOB_SIZE)
 # Create enough objects to trigger eviction
@@ -147,7 +148,7 @@ def start_v6d(name, port, rpc_port, sock, peer_id):
     args = [
         V6D_BIN, "serve",
         "--peer=tiered_vineyard",
-        "--vineyard-size=256M",
+        "--vineyard-size=500G",
         "--memory-usage-max", str(USAGE_MAX),
         "--memory-usage-min", str(USAGE_MIN),
         "--memory-usage-emergency-min", str(USAGE_EMERGENCY),
@@ -195,7 +196,7 @@ def stop_proc(proc):
 # Object helpers
 # --------------------------------------------------------------------------
 
-def create_and_seal(base, key, size=1024):
+def create_and_seal(base, key, size=BLOB_SIZE):
     """Create + seal + release an object. Returns (success, lease_id)."""
     s, body = http_post(base, "/acquire", {
         "scope": "create",
@@ -231,7 +232,7 @@ def exists_on(base, key):
 
 def main():
     print("=== V6D P2P Eviction Test (memory_usage path) ===")
-    print(f"Virtual: {VIRTUAL_CAP//(1<<20)}MB cap, {BLOB_SIZE//(1<<20)}MB/blob, "
+    print(f"Virtual: {VIRTUAL_CAP} bytes cap, {BLOB_SIZE} bytes/blob, "
           f"usage_max={USAGE_MAX}")
     print(f"Eviction threshold: {EVICT_THRESHOLD} blobs")
     print()
@@ -275,29 +276,32 @@ def main():
         time.sleep(2)
 
         # ------------------------------------------------------------------
-        # Phase 1: Fill A below eviction threshold (EVICT_THRESHOLD objects)
+        # Phase 1: Fill A below eviction threshold
+        # Use EVICT_THRESHOLD - 1 to stay safely under usage_max
+        # (e.g. 24 blobs = 4.8% < 5% with 500G/1G)
         # ------------------------------------------------------------------
-        print(f"\n--- Phase 1: Fill A with {EVICT_THRESHOLD} objects "
+        n_phase1 = EVICT_THRESHOLD - 1
+        print(f"\n--- Phase 1: Fill A with {n_phase1} objects "
               f"(below eviction threshold) ---")
-        keys_phase1 = [f"evict_obj_{i:03d}" for i in range(EVICT_THRESHOLD)]
+        keys_phase1 = [f"evict_obj_{i:03d}" for i in range(n_phase1)]
         created = 0
         for key in keys_phase1:
             ok, _ = create_and_seal(URL_A, key)
             if ok:
                 created += 1
-        check("t1_fill_below_threshold", created == EVICT_THRESHOLD,
-              f"created={created}/{EVICT_THRESHOLD}")
+        check("t1_fill_below_threshold", created == n_phase1,
+              f"created={created}/{n_phase1}")
 
         # Verify all exist on A
         exist_count_a = sum(1 for k in keys_phase1 if exists_on(URL_A, k))
-        check("t1b_all_exist_on_a", exist_count_a == EVICT_THRESHOLD,
-              f"exists={exist_count_a}/{EVICT_THRESHOLD}")
+        check("t1b_all_exist_on_a", exist_count_a == n_phase1,
+              f"exists={exist_count_a}/{n_phase1}")
 
         # Verify B can discover them via tracker
         time.sleep(1)
         exist_count_b = sum(1 for k in keys_phase1 if exists_on(URL_B, k))
-        check("t1c_all_discoverable_on_b", exist_count_b == EVICT_THRESHOLD,
-              f"discoverable={exist_count_b}/{EVICT_THRESHOLD}")
+        check("t1c_all_discoverable_on_b", exist_count_b == n_phase1,
+              f"discoverable={exist_count_b}/{n_phase1}")
 
         # ------------------------------------------------------------------
         # Phase 2: Create 10 more objects to exceed memory_usage_max
@@ -355,7 +359,7 @@ def main():
         total_on_a = sum(1 for k in all_keys if exists_on(URL_A, k))
         evicted_keys = [k for k in keys_phase1 if not exists_on(URL_A, k)]
         surviving_keys = [k for k in keys_phase1 if exists_on(URL_A, k)]
-        print(f"  Virtual capacity: {VIRTUAL_CAP//(1<<20)}MB, blob={BLOB_SIZE//(1<<20)}MB")
+        print(f"  Virtual capacity: {VIRTUAL_CAP} bytes, blob={BLOB_SIZE} bytes")
         print(f"  usage_max={USAGE_MAX} → evict at {EVICT_THRESHOLD} blobs")
         print(f"  Created: {len(keys_phase1)} + {len(keys_phase2)} = {len(all_keys)}")
         print(f"  Evicted from A: {len(evicted_keys)} objects")
