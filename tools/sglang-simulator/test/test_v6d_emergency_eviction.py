@@ -30,8 +30,8 @@ LIB_DIR = os.path.join(SIM_ROOT, "scripts")
 REDIS_PORT = 6379
 REDIS_URL = f"redis://127.0.0.1:{REDIS_PORT}"
 
-BLOB_SIZE = 2 << 20       # 2 MB
-VIRTUAL_CAP = 1 << 30      # 1 GB
+BLOB_SIZE = 1 << 30       # 1 GB (virtual size per blob)
+VIRTUAL_CAP = 500 * (1 << 30)  # 500 GB virtual capacity (from --vineyard-size=500G)
 
 V6D_PORT = 7890
 V6D_RPC = 21000
@@ -139,7 +139,7 @@ def start_v6d(usage_max, usage_min, usage_emergency, log_suffix):
     args = [
         V6D_BIN, "serve",
         "--peer=tiered_vineyard",
-        "--vineyard-size=256M",
+        "--vineyard-size=500G",
         "--memory-usage-max", str(usage_max),
         "--memory-usage-min", str(usage_min),
         "--memory-usage-emergency-min", str(usage_emergency),
@@ -200,7 +200,7 @@ def grep_log(proc, pattern):
 # Object helpers
 # --------------------------------------------------------------------------
 
-def create_and_seal(base, key, size=1024):
+def create_and_seal(base, key, size=BLOB_SIZE):
     """Create + seal + release. Returns (success, lease_id)."""
     s, body = http_post(base, "/acquire", {
         "scope": "create",
@@ -222,7 +222,7 @@ def create_and_seal(base, key, size=1024):
     http_post(base, "/release", {"lease_id": lease_id})
     return True, lease_id
 
-def create_batch_and_seal(base, keys, size=1024):
+def create_batch_and_seal(base, keys, size=BLOB_SIZE):
     """Create + seal + release a batch of objects in one acquire."""
     s, body = http_post(base, "/acquire", {
         "scope": "create",
@@ -257,20 +257,19 @@ def exists_on(base, key):
 def test_blocking_eviction(redis_proc):
     """Test that exceeding USAGE_EMERGENCY triggers blocking eviction.
 
-    With max=3%, emergency=4%, min=1%:
-    - Create 21 objects in ONE batch (jumps past both max and emergency)
-      The pre-create check sees future_usage < max (needed_bytes are real
-      sizes ~1024B, not virtual 2MB), so no eviction signal.
-    - Create 1 more → used=21*2MB=4.1% >= emergency(4%) → [EVICT_FORCE]
+    With max=94%, emergency=60%, min=50%:
+    - Create 487 objects in ONE batch (95.1% of 512KB capacity)
+      Pre-create check: future_usage=95.1% >= critical(95%) → [EVICT_FORCE]
+      but used=0 → nothing to evict → create proceeds.
+    - Create 1 more → used=95.1% → [EVICT_FORCE] → evicts to min(50%)
     - Blocking eviction completes before create returns
     """
     print("\n=== Test 1: Blocking Eviction (USAGE_EMERGENCY) ===")
     # memory_usage_critical is hardcoded at 0.95 (no CLI flag).
     # USAGE_MAX must be <= critical so the pre-create check doesn't
     # return early before reaching the critical check.
-    # Create 487 blobs (95.1%) in one batch → no eviction signal
-    # (needed_bytes uses real sizes ~1024B, not virtual 2MB).
-    # Create 1 more → used=95.1% >= critical(95%) → [EVICT_FORCE]
+    # Create 487 blobs (95.1%) in one batch → [EVICT_FORCE] but nothing to evict
+    # Create 1 more → used=95.3% >= critical(95%) → [EVICT_FORCE] → evicts
     USAGE_MAX = 0.94
     USAGE_MIN = 0.50
     USAGE_EMERGENCY = 0.60
@@ -289,8 +288,8 @@ def test_blocking_eviction(redis_proc):
         time.sleep(1)
 
         # Phase A: Create critical_blobs+1 objects in ONE batch
-        # Pre-create check uses real sizes (1024B), so future_usage stays
-        # near 0% → no eviction signal → evictor doesn't run
+        # Pre-create check: future_usage=95.1% >= critical → [EVICT_FORCE]
+        # but used=0 → nothing to evict → create proceeds
         n_batch = critical_blobs + 1  # 487 blobs = 95.1%
         print(f"  Phase A: Create {n_batch} objects in one batch "
               f"({n_batch*BLOB_SIZE*100/VIRTUAL_CAP:.1f}%)...")
@@ -303,9 +302,9 @@ def test_blocking_eviction(redis_proc):
         check("t1b_all_exist_before_trigger", exist_a == n_batch,
               f"exists={exist_a}/{n_batch}")
 
-        # Phase B: Create 1 more → used=4.1% >= emergency(4%) → [EVICT_FORCE]
+        # Phase B: Create 1 more → used=95.3% >= critical(95%) → [EVICT_FORCE]
         print(f"  Phase B: Create 1 more (used={n_batch*BLOB_SIZE*100/VIRTUAL_CAP:.1f}% "
-              f">= emergency={USAGE_EMERGENCY*100:.0f}%)...")
+              f">= critical=95%)...")
         ok, _ = create_and_seal(URL_A, "blk_trigger")
         check("t1c_trigger_create", ok, f"success={ok}")
 
@@ -434,7 +433,7 @@ def test_oom_emergency_eviction(redis_proc):
 
 def main():
     print("=== V6D Emergency Eviction Test ===")
-    print(f"Virtual: {VIRTUAL_CAP//(1<<20)}MB cap, {BLOB_SIZE//(1<<20)}MB/blob")
+    print(f"Virtual: {VIRTUAL_CAP} bytes cap, {BLOB_SIZE} bytes/blob")
     print()
 
     redis_proc = None
