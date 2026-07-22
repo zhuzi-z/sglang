@@ -442,9 +442,15 @@ class C_V6dObjectManagerHook(BaseHook):
                                         dtype, request_id=None):
                 """Allocate simulated V6D keys without v6d client data-plane."""
                 if not getattr(self, "_sim_fallback_mode", False):
-                    return original_batch_allocate(
-                        self, block_hashes, size, shape, dtype,
-                        request_id=request_id)
+                    if getattr(self, "client", None) is not None:
+                        return original_batch_allocate(
+                            self, block_hashes, size, shape, dtype,
+                            request_id=request_id)
+                    logger.warning(
+                        "[V6D RPC Bypass] batch_allocate: client is None "
+                        "(daemon not connected), falling back to sim "
+                        "path. group=%s req=%s",
+                        self._group_id, request_id)
                 result = {}
                 worker_id = getattr(self, "_sim_worker_id", None)
                 for h in block_hashes:
