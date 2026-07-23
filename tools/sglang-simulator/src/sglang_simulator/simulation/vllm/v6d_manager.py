@@ -403,9 +403,26 @@ class C_V6dObjectManagerHook(BaseHook):
             return hits * getattr(self, "_group_block_size", 1)
 
         def override_get_key(self, block_hash, request_id=None):
-            if not getattr(self, "_sim_fallback_mode", False):
-                return original_get_key(self, block_hash, request_id=request_id)
             key = self._make_key(block_hash)
+            if key in self._cached_objs:
+                if request_id is not None:
+                    self._hold_key_for_req(key, request_id)
+                return key
+            if not getattr(self, "_sim_fallback_mode", False):
+                # P2P mode: use client.exists() to check tracker without
+                # attempting client.get() which fails under -rpc=false.
+                # Simulate "data transferred" by returning a fake key;
+                # actual KV data is not needed in CPU simulation.
+                try:
+                    if self.client is not None and self.client.exists(key):
+                        self._cached_objs[key] = key
+                        if request_id is not None:
+                            self._hold_key_for_req(key, request_id)
+                        return key
+                except Exception:
+                    pass
+                return None
+            # Fallback mode: use etcd ownership tracker
             if V6dBlockOwnershipTracker.get_owner(key) is None:
                 return None
             self._cached_objs[key] = key
