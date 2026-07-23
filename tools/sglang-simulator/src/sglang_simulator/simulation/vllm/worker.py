@@ -49,15 +49,20 @@ def _inject_head_dim(vllm_config):
     model_config = vllm_config.model_config
     hf_config = model_config.hf_text_config
 
-    original_head_dim = getattr(hf_config, "head_dim", None)
-    if original_head_dim is None:
-        original_head_dim = (
-            hf_config.hidden_size // hf_config.num_attention_heads
-        )
+    config_head_dim = getattr(hf_config, "head_dim", None)
+    computed_head_dim = (
+        hf_config.hidden_size // hf_config.num_attention_heads
+    )
+    # Use the larger value as effective head_dim for reduction ratio
+    original_head_dim = max(config_head_dim or 0, computed_head_dim)
 
     hf_config.head_dim = 1
     logger.info(
-        "[V6D Hijack] Injected head_dim=1 (original=%d, reduction=%dx)",
+        "[V6D Hijack] Injected head_dim=1 "
+        "(config_head_dim=%s, computed_head_dim=%d, "
+        "effective_original=%d, reduction=%dx)",
+        config_head_dim,
+        computed_head_dim,
         original_head_dim,
         original_head_dim,
     )
