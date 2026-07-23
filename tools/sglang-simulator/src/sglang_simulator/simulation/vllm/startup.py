@@ -413,8 +413,12 @@ def _patch_torch_cuda_for_cpu():
     torch.cuda._lazy_init = _mock_lazy_init
 
 
-def init_hook(force: bool = False):
+def init_hook(force: bool = False, mode: str = None):
     """Install all vLLM hooks. Must be called before importing vllm.
+
+    mode: "sim" (default) installs the CPU-simulation hook stack; "real" installs only
+    the observer collection hooks for a real-GPU deployment. Resolved from the
+    SGLANG_SIMULATOR_HOOK_MODE env var when not passed explicitly.
 
     The startup entry lives in the project working directory as sitecustomize.py.
     Python imports it only when that directory is added to PYTHONPATH, and hooks
@@ -441,6 +445,29 @@ def init_hook(force: bool = False):
         return True
 
     import sglang_simulator.hook as sglang_simulator_hook
+    from sglang_simulator.simulation.vllm import schedule_collector
+
+    mode = (mode or os.environ.get("SGLANG_SIMULATOR_HOOK_MODE", "sim")).strip().lower()
+    schedule_collector.set_mode(mode)
+
+    if mode == "real":
+        # Real-GPU deployment: observer-only hooks. Never install the CPU-sim mock
+        # worker/platform/engine_args hooks here, or the real server won't run on GPU.
+        from sglang_simulator.simulation.vllm import collect_real
+
+        real_hooks = [
+            collect_real.C_RealWorkerWrapperHook,        # per-iter GPU timing -> schedule_batch
+            collect_real.C_RealSchedulerHook,            # per-request stats -> requests
+            schedule_collector.C_WorkerProfileDumpHook,  # rank-0 dump schedule_batch (worker proc)
+            schedule_collector.C_EngineProfileDumpHook,  # dump requests (engine proc)
+        ]
+        sglang_simulator_hook.install_class_hooks(real_hooks)
+        logging.getLogger("sglang_simulator").info(
+            "[init_hook] real-GPU collection mode: installed %d observer hooks",
+            len(real_hooks),
+        )
+        return True
+
     from sglang_simulator.simulation.vllm import (
         engine_args,
         kv_connector,
@@ -508,6 +535,11 @@ def init_hook(force: bool = False):
         # Default CPU simulation path: replace HybridConnector with
         # MockHybridConnector + V6DCacheStorage(etcd) for scheduling parity.
         hooks.append(kv_connector.C_KVConnectorFactoryHook)
+
+    # CPU sim (single process, TP=1): dump schedule_batch + requests on /stop_profile.
+    # EngineCore is not otherwise hooked in sim, so a single hook here avoids clashing
+    # with the existing Worker/Scheduler hooks (only one hook per class is applied).
+    hooks.append(schedule_collector.C_EngineProfileDumpHook)
 
     sglang_simulator_hook.install_class_hooks(hooks)
     _install_dashllm_kv_transfer_hook()

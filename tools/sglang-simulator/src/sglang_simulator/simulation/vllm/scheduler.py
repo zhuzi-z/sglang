@@ -327,6 +327,38 @@ class C_VLLMSchedulerHook(BaseHook):
                                 host_hit_len
                             )
 
+                        # Mirror request-level stats into the shared collector so the
+                        # sim path also emits a populated requests.jsonl. Field names
+                        # match the real-GPU path (collect_real) for direct diffing.
+                        try:
+                            from sglang_simulator.simulation.vllm import (
+                                schedule_collector,
+                            )
+
+                            _stat = cls.REQUEST_STATS.get(req_id, {})
+                            _prompt_ids = getattr(request, "prompt_token_ids", None)
+                            schedule_collector.record_request(
+                                req_id,
+                                final_device_hit_len=max(0, total_hit_len),
+                                ext_kv_hit_len=max(0, host_hit_len),
+                                local_kv_hit_len=max(0, total_hit_len - host_hit_len),
+                                input_length=getattr(request, "num_prompt_tokens", 0),
+                                output_length=getattr(request, "max_tokens", 0),
+                                queue_start=_stat.get("queue_start"),
+                                queue_end=_stat.get("queue_end"),
+                                created_time=_stat.get("created_time"),
+                                # prompt is trace-determined and real in sim; output_ids
+                                # are mock here so intentionally not recorded.
+                                input_ids=list(_prompt_ids)
+                                if _prompt_ids is not None
+                                else [],
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[Scheduler Hook] record_request failed",
+                                exc_info=True,
+                            )
+
             simulation_batch = ScheduleBatch(reqs=[])
             for req_id, num_tokens in num_scheduled_tokens.items():
                 request = self.requests.get(req_id)
@@ -351,6 +383,27 @@ class C_VLLMSchedulerHook(BaseHook):
                     )
                 else:
                     predicted_latency = 0.001  # fallback: 1ms per step
+
+                # --- Collect per-iteration schedule_batch for sim-vs-real diff ---
+                # Same schema as the real-GPU path; iter_latency here is the PREDICTED
+                # latency (the object under validation), not a measured value.
+                try:
+                    from sglang_simulator.simulation.vllm import (
+                        schedule_collector,
+                    )
+
+                    _pairs = [
+                        (r.extend_length, r.past_kv_length)
+                        for r in simulation_batch.reqs
+                    ]
+                    _fmode = 2 if all(e == 1 for e, _ in _pairs) else 1
+                    schedule_collector.record_iteration(
+                        _pairs, _fmode, predicted_latency
+                    )
+                except Exception:
+                    logger.debug(
+                        "[Scheduler Hook] record_iteration failed", exc_info=True
+                    )
 
                 if cls.SIM_MODE == SimulationMode.BLOCKING:
                     time.sleep(abs(predicted_latency))
