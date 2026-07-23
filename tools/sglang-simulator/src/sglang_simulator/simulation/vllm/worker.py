@@ -493,11 +493,43 @@ class C_VLLMWorkerHook(BaseHook):
 
             # Build mock output
             req_ids = list(num_scheduled_tokens.keys()) if num_scheduled_tokens else []
+            # A chunked-prefill forward only produces a sampled token when the
+            # request has reached the end of its prompt.  Returning a token for
+            # every partial chunk makes max_tokens=1 requests finish after the
+            # first 8192-token chunk and silently skips the remaining prompt.
+            try:
+                from sglang_simulator.simulation.vllm.kv_connector import (
+                    get_scheduler_ref,
+                )
+
+                scheduler = get_scheduler_ref()
+            except Exception:
+                scheduler = None
+
+            if scheduler is None:
+                raise RuntimeError(
+                    "vLLM simulator scheduler reference is unavailable"
+                )
+
+            sampled_token_ids = []
+            for req_id in req_ids:
+                request = scheduler.requests.get(req_id)
+                if request is None:
+                    raise RuntimeError(
+                        f"scheduled request {req_id!r} is missing from scheduler"
+                    )
+                prompt_tokens = getattr(request, "num_prompt_tokens", None)
+                computed_tokens = getattr(request, "num_computed_tokens", 0)
+                prompt_complete = (
+                    prompt_tokens is None or computed_tokens >= prompt_tokens
+                )
+                sampled_token_ids.append([1] if prompt_complete else [])
+
             import dataclasses as _dc
             mro_kwargs = dict(
                 req_ids=req_ids,
                 req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
-                sampled_token_ids=[[1] for _ in req_ids],
+                sampled_token_ids=sampled_token_ids,
                 logprobs=None,
                 prompt_logprobs_dict={},
             )

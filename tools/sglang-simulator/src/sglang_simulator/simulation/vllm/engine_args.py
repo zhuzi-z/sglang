@@ -43,9 +43,12 @@ class C_VLLMEngineArgsHook(BaseHook):
             if hasattr(self, "enable_expert_parallel"):
                 self.enable_expert_parallel = False
 
-            # Force distributed executor backend to mp (single worker)
+            # Keep the only worker in this process.  A spawned ``mp`` worker
+            # starts a fresh interpreter before the simulator hooks are
+            # installed and therefore tries to construct/load the real GPU
+            # model.  ``uni`` preserves the hooked Worker class.
             if hasattr(self, "distributed_executor_backend"):
-                self.distributed_executor_backend = "mp"
+                self.distributed_executor_backend = "uni"
 
             original_post_init(self)
             logger.info(

@@ -27,7 +27,6 @@ init_hook()
 
 from vllm import LLM, SamplingParams  # noqa: E402
 from vllm.engine.arg_utils import EngineArgs  # noqa: E402
-from vllm.config import ProfilerConfig
 
 logger = get_logger("sglang_simulator")
 
@@ -116,13 +115,18 @@ class VLLMWorker(BaseWorker):
     # ------------------------------------------------------------------
 
     async def trigger_simulation(self, output_dir: str | None = None):
-        """Reset batch coordination state between benchmark rounds."""
+        """Reset batch coordination state between benchmark rounds.
+
+        Request and iteration statistics are collected directly by the
+        scheduler hook.  Do not call ``LLM.start_profile()`` here: this method
+        is invoked at both boundaries of a benchmark round, and the offline
+        dummy engine intentionally has no CUDA profiler configured.
+        """
         self._enqueue_count = 0
         self._batch_outputs = []
         self._batch_processed = False
         self._batch_prompts = []
         self._batch_sampling_params = []
-        self._llm.start_profile()
 
     async def pause_generation(self):
         """Called at the start of each benchmark round; clear previous stats."""
