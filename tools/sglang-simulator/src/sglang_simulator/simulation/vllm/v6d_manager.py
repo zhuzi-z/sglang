@@ -758,6 +758,13 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                 sorted(result),
                 request_id,
             )
+            for gid in sorted(result):
+                bb, _ = self._group_block_bytes[gid]
+                logger.info(
+                    "[V6D RPC Bypass] block_size group=%d: block_bytes=%d (%.1f KB), blobs=%d, total=%d bytes",
+                    gid, bb, bb / 1024.0,
+                    len(result[gid]), bb * len(result[gid]),
+                )
             return result
 
         target._cross_group_batch_allocate = override_cross_group_batch_allocate
