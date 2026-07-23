@@ -22,7 +22,16 @@ class C_ServerArgsHook(BaseHook):
             ]
             for attr in parallel_attrs:
                 setattr(self, attr, 1)
-            return original_post_init(self)
+            result = original_post_init(self)
+            if self.disaggregation_mode == "decode":
+                # No real KV transfer in simulation; forcing fake makes
+                # _is_fake_transfer True at all decode gates (add() fast path,
+                # metadata gate, room validation; see C_DecodeReceiverHook).
+                # Prefill is excluded: native asserts forbid fake+prefill and
+                # no fake bootstrap server exists, so the P side selects
+                # FakeKVSender via C_PrefillBootstrapQueueHook instead.
+                self.disaggregation_transfer_backend = "fake"
+            return result
         
         def wrapped_handle_model_specific_adjustments(self):
             if not torch.cuda.is_available():

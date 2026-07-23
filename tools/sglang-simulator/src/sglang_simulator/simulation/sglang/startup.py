@@ -42,5 +42,7 @@ def init_hook():
             mem_cache_allocator.C_PagedTokenToKVPoolAllocatorHook,
             mem_pool_host.C_HostKVCacheHook,
             disaggregation.C_DecodePreallocQueueHook,
+            disaggregation.C_PrefillBootstrapQueueHook,
+            disaggregation.C_DecodeReceiverHook,
         ]
     )

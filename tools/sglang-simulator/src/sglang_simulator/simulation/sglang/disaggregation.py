@@ -136,3 +136,79 @@ class C_DecodePreallocQueueHook(BaseHook):
         target._commit_transfer_to_req = wrapped_commit_transfer_to_req
         target._poll_with_metadata_gate = wrapped_poll_with_metadata_gate
         target._poll_with_staging = wrapped_poll_with_staging
+
+
+class C_PrefillBootstrapQueueHook(BaseHook):
+    """Force FakeKVSender on the prefill node.
+
+    Native FakeKVSender selection requires the FAKE_BOOTSTRAP_HOST marker,
+    which sets Req.skip_radix_cache_insert=True (warmup semantics) and breaks
+    KV-pool accounting. This hook selects it via a temporary host flip during
+    create_sender instead, leaving requests unmarked.
+    """
+
+    HOOK_CLASS_NAME = "PrefillBootstrapQueue"
+    HOOK_MODULE_NAME = "sglang.srt.disaggregation.prefill"
+
+    @classmethod
+    def hook(cls, target):
+        original_create_sender = target.create_sender
+
+        def wrapped_create_sender(self, req, *args, **kwargs):
+            from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+
+            original_host = req.bootstrap_host
+            if original_host != FAKE_BOOTSTRAP_HOST:
+                # Flip only during create_sender; runs after Req.__init__,
+                # so skip_radix_cache_insert stays False.
+                req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+            try:
+                return original_create_sender(self, req, *args, **kwargs)
+            finally:
+                req.bootstrap_host = original_host
+
+        target.create_sender = wrapped_create_sender
+
+
+class C_DecodeReceiverHook(BaseHook):
+    """Force FakeKVReceiver on the decode node.
+
+    C_ServerArgsHook forces decode-mode backend="fake", making
+    _is_fake_transfer True at all gates. Two remaining gaps are covered here:
+    1. _create_receiver_and_enqueue unconditionally builds a NetworkAddress
+       from req.bootstrap_host -> temporary flip supplies a valid string.
+    2. In server mode the router assigns a real bootstrap_host, defeating
+       _is_fake_transfer -> add() normalizes it to None (no real transfer
+       happens, so the address is never needed on decode).
+    """
+
+    HOOK_CLASS_NAME = "DecodePreallocQueue"
+    HOOK_MODULE_NAME = "sglang.srt.disaggregation.decode"
+
+    @classmethod
+    def hook(cls, target):
+        original_add = target.add
+        original_create_receiver = target._create_receiver_and_enqueue
+
+        def wrapped_add(self, req, *args, **kwargs):
+            from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+
+            # Real (router-assigned) hosts would bypass the fake fast path.
+            if req.bootstrap_host not in (None, FAKE_BOOTSTRAP_HOST):
+                req.bootstrap_host = None
+            return original_add(self, req, *args, **kwargs)
+
+        def wrapped_create_receiver(self, req, *args, **kwargs):
+            from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+
+            original_host = req.bootstrap_host
+            if original_host != FAKE_BOOTSTRAP_HOST:
+                # Flip only during creation so _bootstrap_addr() gets a string.
+                req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+            try:
+                return original_create_receiver(self, req, *args, **kwargs)
+            finally:
+                req.bootstrap_host = original_host
+
+        target.add = wrapped_add
+        target._create_receiver_and_enqueue = wrapped_create_receiver

@@ -85,7 +85,6 @@ class PDDisaggBenchmarkRunner(BaseBenchmarkRunner):
             self.worker_request_count[decode_worker.name] += 1
 
         req.extra_args.update({
-            "bootstrap_host": "2.2.2.2",   # fake bootstrap host
             "bootstrap_port": 30500,
             "bootstrap_room": random.randint(0, 2**63 - 1),
         })
@@ -185,6 +184,15 @@ class PDDisaggBenchmarkRunner(BaseBenchmarkRunner):
         benchmark_config: BenchmarkConfig,
         dataset: BaseDataset,
     ):
+        # Reset per-round state: benchmark() may be called multiple times on the
+        # same runner (e.g. sweeping slowdown factors). Without this, request
+        # counts accumulate and continue_generation(num_new_reqs=...) exceeds the
+        # actual number of requests, so the worker-side ReqDispatcher never
+        # releases the round's requests.
+        self.worker_request_count.clear()
+        self.lb_routing_records.clear()
+        self.request_stats.clear()
+
         for worker in self.all_workers:
             await worker.trigger_simulation()
             await worker.pause_generation()

@@ -33,6 +33,7 @@ class C_ModelRunnerHook(BaseHook):
             
             self.model = MockModel()
             self.dtype = self.model_config.dtype
+            self.weight_load_mem_usage = 0
 
             # Parse other args
             self.sliding_window_size = None
