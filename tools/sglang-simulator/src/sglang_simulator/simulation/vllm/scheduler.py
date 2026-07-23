@@ -44,6 +44,9 @@ class C_VLLMSchedulerHook(BaseHook):
     # Key: request_id, Value: dict with queue_start, queue_end,
     #   gen_token_latencies, last_event_time, created_time
     REQUEST_STATS: dict[str, dict] = {}
+    # One record per scheduler forward step.  Keep the schema aligned with the
+    # SGLang hook so step-level predictor validation can consume either backend.
+    ITERATION_STATS: list[dict] = []
 
     @classmethod
     def hook(cls, target):
@@ -81,6 +84,8 @@ class C_VLLMSchedulerHook(BaseHook):
             seq_counter = 0
             total_expected = float("inf")
             all_received = False
+            cls.REQUEST_STATS.clear()
+            cls.ITERATION_STATS.clear()
             req_created_time.clear()
             req_first_scheduled.clear()
             # Per-instance tracking to avoid cross-worker contamination
@@ -368,8 +373,32 @@ class C_VLLMSchedulerHook(BaseHook):
                     StateManager.step_global_clock(predicted_latency)
                     event_time = StateManager.get_global_clock()
 
+                cls.ITERATION_STATS.append(
+                    {
+                        "requests": simulation_batch.request_info(),
+                        "forward_latency": predicted_latency,
+                        "l2_load_latency": 0.0,
+                        "l2_backup_latency": 0.0,
+                    }
+                )
+
                 # Record per-token latency for all scheduled requests
                 for req_id in num_scheduled_tokens:
+                    request = self.requests.get(req_id)
+                    if request is not None:
+                        prompt_tokens = getattr(request, "num_prompt_tokens", None)
+                        computed_tokens = getattr(
+                            request, "num_computed_tokens", 0
+                        )
+                        # Intermediate chunked-prefill forwards do not emit a
+                        # token.  Keep last_event_time unchanged so the first
+                        # recorded latency is the complete TTFT across all
+                        # prompt chunks, matching the SGLang hook semantics.
+                        if (
+                            prompt_tokens is not None
+                            and computed_tokens < prompt_tokens
+                        ):
+                            continue
                     st = cls.REQUEST_STATS.get(req_id)
                     if st is not None:
                         st["gen_token_latencies"].append(
