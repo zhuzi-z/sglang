@@ -156,7 +156,11 @@ class C_HybridConnectorHook(BaseHook):
             return None
 
         def override_start_load_kv(self, forward_context=None, **kwargs):
-            pass
+            # Do not no-op: let HybridWorker.start_load_kv schedule _async_load_kv.
+            # V6dObjectBackend.async_load_kv is overridden to yield fake IoRet
+            # immediately (simulating instant load completion in CPU mode).
+            assert self._worker is not None
+            self._worker.start_load_kv()
         def override_start_save_kv(self, forward_context=None, **kwargs):
             pass
         target.bind_connector_metadata = override_bind_connector_metadata
@@ -234,6 +238,27 @@ class C_V6dObjectBackendHook(BaseHook):
 
         if hasattr(target, "_record_event"):
             target._record_event = override_record_event
+
+        # Override async_load_kv to simulate instant load completion.
+        # In CPU simulation, no actual KV data transfer is needed.
+        # The original async_load_kv calls self._worker.async_start_load_kv(meta)
+        # which requires real V6D data-plane operations (CUDA events, DMA, etc.).
+        # We bypass that and directly yield IoRet for each reqs_to_load entry.
+        original_async_load_kv = target.async_load_kv
+
+        async def override_async_load_kv(self, m):
+            from vllm.v1.hybrid_connector import IoRet
+            meta = m.inner
+            if not meta or not getattr(meta, "reqs_to_load", None):
+                return
+            for req_id in meta.reqs_to_load:
+                n = (m.external_tokens or {}).get(req_id, 0)
+                logger.info(
+                    "[V6D Hijack] async_load_kv: simulating instant load "
+                    "completion for req=%s n=%d", req_id, n)
+                yield IoRet(reqid=req_id, n=n)
+
+        target.async_load_kv = override_async_load_kv
 
         logger.info("[V6D Hijack] V6dObjectBackend hook installed")
 
