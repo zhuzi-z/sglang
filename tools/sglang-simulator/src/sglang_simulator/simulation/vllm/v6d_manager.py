@@ -588,9 +588,21 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                         all_match = False
                         break
                     key = manager._make_key(group_hashes[abs_idx])
-                    if V6dBlockOwnershipTracker.get_owner(key) is None:
-                        all_match = False
-                        break
+                    if getattr(self, "_sim_fallback_mode", False):
+                        # etcd fallback mode
+                        if V6dBlockOwnershipTracker.get_owner(key) is None:
+                            all_match = False
+                            break
+                    else:
+                        # P2P mode: use client.exists() to check Redis tracker
+                        try:
+                            client = getattr(manager, "client", None)
+                            if client is None or not client.exists(key):
+                                all_match = False
+                                break
+                        except Exception:
+                            all_match = False
+                            break
                 if all_match:
                     return aligned_hit_length
 
