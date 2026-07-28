@@ -1,188 +1,30 @@
 """
-V6D Object Manager hooks for native control-plane ownership simulation.
+V6D Object Manager hooks for native control-plane P2P ownership simulation.
 
 In native V6D control-plane mode this module keeps the real vLLM
 V6dObjectManager/V6dObjectConnectorScheduler classes in the request path, but
 bypasses the unavailable CPU-only data plane:
 
 1. Tag each manager with `_SIM_V6D_ACTIVE_WORKER_ID`.
-2. Register allocated/sealed block ownership in the shared V6DCacheStorage
-   metadata store when CPU data transfer is skipped.
-3. Resolve lookup hits through the same shared metadata store and classify
-   local vs remote ownership.
-4. Bypass scheduler-side `client.create()` while preserving cross-group
+2. Resolve lookup hits through real v6d daemon P2P path (client.exists →
+   Redis tracker), without attempting SRPC/CUDA data transfer.
+3. Bypass scheduler-side `client.create()` while preserving cross-group
    allocation semantics.
 
-The fallback `/dev/shm` tracker is retained only for local development when
-etcd is unavailable; dual-node validation should use the shared metastore.
+NOTE: The legacy etcd-backed V6dBlockOwnershipTracker and V6DCacheStorage
+have been removed. The P2P path (client.exists via Redis tracker) is the
+only supported cross-node matching mechanism.
 """
 
 from __future__ import annotations
-import fcntl
 import json
 import os
-import shutil
 from typing import Any, Iterable
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
-
-# ---------------------------------------------------------------------------
-# File-backed cross-process ownership tracker
-# ---------------------------------------------------------------------------
-
-_TRACKER_DIR = "/dev/shm/v6d_sim_tracker"
-_OWNERSHIP_FILE = os.path.join(_TRACKER_DIR, "ownership.json")
-_STATS_FILE = os.path.join(_TRACKER_DIR, "stats.json")
-_LOCK_FILE = os.path.join(_TRACKER_DIR, ".lock")
-
-
-class V6dBlockOwnershipTracker:
-    """Ownership tracker used by the native V6D CPU bypass.
-
-    The preferred storage is shared V6DCacheStorage(etcd), which provides
-    physical cross-node visibility between node1 and node2.  The file-backed
-    `/dev/shm` fallback is used only when that shared store is unavailable.
-    """
-
-    @classmethod
-    def _ensure_dir(cls):
-        os.makedirs(_TRACKER_DIR, exist_ok=True)
-
-    @classmethod
-    def _lock(cls):
-        """Acquire exclusive file lock. Returns lock file descriptor."""
-        cls._ensure_dir()
-        fd = open(_LOCK_FILE, "w")
-        fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
-        return fd
-
-    @classmethod
-    def _unlock(cls, fd):
-        """Release file lock."""
-        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-        fd.close()
-
-    @classmethod
-    def _read_json(cls, path: str) -> dict:
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError, ValueError):
-            return {}
-
-    @classmethod
-    def _write_json(cls, path: str, data: dict):
-        with open(path, "w") as f:
-            json.dump(data, f)
-
-    @classmethod
-    def reset(cls):
-        """Reset all tracking data. Call at test setup."""
-        if os.path.exists(_TRACKER_DIR):
-            shutil.rmtree(_TRACKER_DIR)
-        cls._ensure_dir()
-
-    @classmethod
-    def _storage(cls):
-        try:
-            from sglang_simulator.simulation.vllm.v6d_cache_storage import (
-                V6DCacheStorage,
-            )
-            storage = V6DCacheStorage.get_instance()
-            if storage.connected:
-                return storage
-        except Exception:
-            logger.debug("[V6D RPC Bypass] etcd tracker unavailable", exc_info=True)
-        return None
-
-    @classmethod
-    def record_seal(cls, key: str, worker_id: str) -> None:
-        """Record that worker_id sealed the given block key."""
-        storage = cls._storage()
-        if storage is not None and storage.register_block(key, worker_id):
-            return
-        lock = cls._lock()
-        try:
-            data = cls._read_json(_OWNERSHIP_FILE)
-            data[key] = worker_id
-            cls._write_json(_OWNERSHIP_FILE, data)
-        finally:
-            cls._unlock(lock)
-
-    @classmethod
-    def get_owner(cls, key: str) -> str | None:
-        """Get the owner worker_id of a block key, or None if unknown."""
-        storage = cls._storage()
-        if storage is not None:
-            owner = storage.lookup_block(key)
-            if owner is not None:
-                return owner
-        lock = cls._lock()
-        try:
-            data = cls._read_json(_OWNERSHIP_FILE)
-            return data.get(key)
-        finally:
-            cls._unlock(lock)
-
-    @classmethod
-    def classify_hit(cls, key: str, current_worker_id: str) -> str:
-        """Classify a cache hit as local, remote, or unknown."""
-        lock = cls._lock()
-        try:
-            data = cls._read_json(_OWNERSHIP_FILE)
-            owner = data.get(key)
-        finally:
-            cls._unlock(lock)
-
-        if owner is None:
-            return "unknown"
-        return "local" if owner == current_worker_id else "remote"
-
-    @classmethod
-    def record_hit(cls, worker_id: str, hit_type: str, count: int = 1) -> None:
-        """Record hit classification for a worker."""
-        lock = cls._lock()
-        try:
-            stats = cls._read_json(_STATS_FILE)
-            if worker_id not in stats:
-                stats[worker_id] = {}
-            stat_key = f"{hit_type}_hits"
-            stats[worker_id][stat_key] = stats[worker_id].get(stat_key, 0) + count
-            cls._write_json(_STATS_FILE, stats)
-        finally:
-            cls._unlock(lock)
-
-    @classmethod
-    def get_stats(cls, worker_id: str) -> dict:
-        """Get hit stats for a specific worker (safe from any process)."""
-        lock = cls._lock()
-        try:
-            stats = cls._read_json(_STATS_FILE)
-            return stats.get(worker_id, {})
-        finally:
-            cls._unlock(lock)
-
-    @classmethod
-    def get_all_stats(cls) -> dict:
-        """Get all worker stats."""
-        lock = cls._lock()
-        try:
-            return cls._read_json(_STATS_FILE)
-        finally:
-            cls._unlock(lock)
-
-    @classmethod
-    def get_ownership_count(cls) -> int:
-        """Get total number of tracked ownership entries."""
-        lock = cls._lock()
-        try:
-            data = cls._read_json(_OWNERSHIP_FILE)
-            return len(data)
-        finally:
-            cls._unlock(lock)
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +60,6 @@ class C_V6dObjectManagerHook(BaseHook):
                 if _fn is None:
                     raise RuntimeError("_connect_v6d_with_retry not found")
                 self.client = _fn(self._v6d_url)
-                self._sim_fallback_mode = False
                 logger.info(
                     "[V6D P2P] Manager group=%d connected to v6d daemon "
                     "at %s (real P2P path)",
@@ -226,14 +67,9 @@ class C_V6dObjectManagerHook(BaseHook):
                 )
             except Exception as e:
                 self.client = None
-                self._sim_fallback_mode = True
                 logger.warning(
-                    "[V6D P2P] *** FALLBACK TO ETCD MODE *** "
-                    "Manager group=%d cannot connect to v6d daemon at %s: %s. "
-                    "Cross-node ownership queries will use etcd HTTP API "
-                    "instead of real v6d P2P discovery (redis tracker). "
-                    "This path DIFFERS from production and may not reproduce "
-                    "all inflight/prefill issues.",
+                    "[V6D P2P] Manager group=%d cannot connect to v6d daemon "
+                    "at %s: %s. Cross-node lookup will return 0 hits.",
                     self._group_id, getattr(self, "_v6d_url", "?"), e,
                 )
                 if self._v6d_backend is not None:
@@ -260,32 +96,19 @@ class C_V6dObjectManagerHook(BaseHook):
                 logger.debug(
                     f"[V6D RPC Bypass] Manager group={self._group_id} "
                     f"no active worker_id")
-            self._sim_fallback_mode = False
 
         target.__init__ = override_init
 
-        # ---- Override seal() to record ownership ----
+        # ---- Override seal() ----
         original_seal = target.seal
 
         def override_seal(self, block_hashes: Iterable, request_id=None):
-            """Record sealed block ownership without v6d client data-plane."""
-            if not getattr(self, "_sim_fallback_mode", False):
-                return original_seal(self, block_hashes, request_id=request_id)
-            block_hashes_list = list(block_hashes)
-            worker_id = getattr(self, "_sim_worker_id", None)
-            if worker_id:
-                for h in block_hashes_list:
-                    key = self._make_key(h)
-                    V6dBlockOwnershipTracker.record_seal(key, worker_id)
-                logger.info(
-                    f"[V6D RPC Bypass] seal: {len(block_hashes_list)} blocks "
-                    f"by {worker_id} group={self._group_id}")
-            for h in block_hashes_list:
-                self._pending_objs.pop(h, None)
+            """Forward seal to original v6d client (P2P path)."""
+            return original_seal(self, block_hashes, request_id=request_id)
 
         target.seal = override_seal
 
-        # ---- Override _process_lookup() to classify hits ----
+        # ---- Override _process_lookup() ----
         original_process_lookup = target._process_lookup
 
         def override_process_lookup(
@@ -295,64 +118,15 @@ class C_V6dObjectManagerHook(BaseHook):
             request_id: str | None,
             unfetched_objs: dict[str, Any] | None = None,
         ) -> int:
-            """Process lookup using file-backed ownership tracker."""
-            if not getattr(self, "_sim_fallback_mode", False):
-                return original_process_lookup(
-                    self, block_hashes, got_objs, request_id,
-                    unfetched_objs=unfetched_objs)
-            worker_id = getattr(self, "_sim_worker_id", None)
-            hits = 0
-            local_count = 0
-            remote_count = 0
-            unknown_count = 0
-
-            for h in block_hashes:
-                key = self._make_key(h)
-                owner = V6dBlockOwnershipTracker.get_owner(key)
-                if owner is None:
-                    break
-                hits += 1
-                self._cached_objs[key] = key
-                if request_id is not None:
-                    self._hold_key_for_req(key, request_id)
-                if worker_id is None:
-                    unknown_count += 1
-                elif owner == worker_id:
-                    local_count += 1
-                else:
-                    remote_count += 1
-
-            if worker_id and hits > 0:
-                if local_count:
-                    V6dBlockOwnershipTracker.record_hit(
-                        worker_id, "local", local_count)
-                if remote_count:
-                    V6dBlockOwnershipTracker.record_hit(
-                        worker_id, "remote", remote_count)
-                if unknown_count:
-                    V6dBlockOwnershipTracker.record_hit(
-                        worker_id, "unknown", unknown_count)
-
-                logger.info(
-                    f"[V6D RPC Bypass] Worker {worker_id}: lookup group={self._group_id} "
-                    f"hits={hits} local={local_count} remote={remote_count} "
-                    f"unknown={unknown_count} (v6d client bypassed)")
-                if remote_count > 0:
-                    logger.info(
-                        f"[V6D RPC Bypass] Worker {worker_id}: "
-                        f"cross-node hit! local={local_count} remote={remote_count} "
-                        f"unknown={unknown_count} (RPC bypassed)")
-
-            return hits
+            """Forward to original _process_lookup (P2P path)."""
+            return original_process_lookup(
+                self, block_hashes, got_objs, request_id,
+                unfetched_objs=unfetched_objs)
 
         target._process_lookup = override_process_lookup
 
         def override_lookup(self, block_hashes, request_id=None,
                             unfetched_objs=None):
-            if getattr(self, "_sim_fallback_mode", True):
-                return self._process_lookup(
-                    list(block_hashes), {}, request_id,
-                    unfetched_objs=unfetched_objs)
             if getattr(self, "client", None) is None:
                 return 0
             hits = 0
@@ -375,10 +149,6 @@ class C_V6dObjectManagerHook(BaseHook):
 
         async def override_async_lookup(self, block_hashes, request_id=None,
                                         unfetched_objs=None):
-            if getattr(self, "_sim_fallback_mode", True):
-                return self._process_lookup(
-                    list(block_hashes), {}, request_id,
-                    unfetched_objs=unfetched_objs)
             if getattr(self, "client", None) is None:
                 return 0
             import asyncio
@@ -408,37 +178,25 @@ class C_V6dObjectManagerHook(BaseHook):
                 if request_id is not None:
                     self._hold_key_for_req(key, request_id)
                 return key
-            if not getattr(self, "_sim_fallback_mode", False):
-                # P2P mode: use client.exists() to check tracker without
-                # attempting client.get() which fails under -rpc=false.
-                # Simulate "data transferred" by returning a fake key;
-                # actual KV data is not needed in CPU simulation.
-                try:
-                    if self.client is not None and self.client.exists(key):
-                        self._cached_objs[key] = key
-                        if request_id is not None:
-                            self._hold_key_for_req(key, request_id)
-                        return key
-                except Exception:
-                    pass
-                return None
-            # Fallback mode: use etcd ownership tracker
-            if V6dBlockOwnershipTracker.get_owner(key) is None:
-                return None
-            self._cached_objs[key] = key
-            if request_id is not None:
-                self._hold_key_for_req(key, request_id)
-            return key
+            # P2P mode: use client.exists() to check tracker without
+            # attempting client.get() which fails under -rpc=false.
+            # Simulate "data transferred" by returning a fake key;
+            # actual KV data is not needed in CPU simulation.
+            try:
+                if self.client is not None and self.client.exists(key):
+                    self._cached_objs[key] = key
+                    if request_id is not None:
+                        self._hold_key_for_req(key, request_id)
+                    return key
+            except Exception:
+                pass
+            return None
 
         async def override_async_get_key(self, block_hash, request_id=None):
             return override_get_key(self, block_hash, request_id=request_id)
 
         def override_reset(self):
-            if not getattr(self, "_sim_fallback_mode", False):
-                return original_reset(self)
-            self._cached_objs.clear()
-            self._cached_objs_reqs.clear()
-            self._pending_objs.clear()
+            return original_reset(self)
 
         original_lookup = target.lookup
         original_async_lookup = target.async_lookup
@@ -458,33 +216,29 @@ class C_V6dObjectManagerHook(BaseHook):
             def override_batch_allocate(self, block_hashes, size, shape,
                                         dtype, request_id=None):
                 """Allocate simulated V6D keys without v6d client data-plane."""
-                if not getattr(self, "_sim_fallback_mode", False):
-                    if getattr(self, "client", None) is not None:
-                        return original_batch_allocate(
-                            self, block_hashes, size, shape, dtype,
-                            request_id=request_id)
-                    logger.warning(
-                        "[V6D RPC Bypass] batch_allocate: client is None "
-                        "(daemon not connected), falling back to sim "
-                        "path. group=%s req=%s",
-                        self._group_id, request_id)
+                if getattr(self, "client", None) is not None:
+                    return original_batch_allocate(
+                        self, block_hashes, size, shape, dtype,
+                        request_id=request_id)
+                logger.warning(
+                    "[V6D RPC Bypass] batch_allocate: client is None "
+                    "(daemon not connected), using local key allocation. "
+                    "group=%s req=%s",
+                    self._group_id, request_id)
                 result = {}
-                worker_id = getattr(self, "_sim_worker_id", None)
                 for h in block_hashes:
                     key = self._make_key(h)
                     self._pending_objs[h] = key
                     result[h] = key
-                    if worker_id:
-                        V6dBlockOwnershipTracker.record_seal(key, worker_id)
                 logger.info(
                     f"[V6D RPC Bypass] batch_allocate: {len(result)} blocks "
-                    f"group={self._group_id} req={request_id} owner={worker_id}")
+                    f"group={self._group_id} req={request_id}")
                 return result
 
             target.batch_allocate = override_batch_allocate
 
         logger.info("[V6D Hijack] V6dObjectManager hook installed "
-                    "(real v6d P2P + etcd fallback)")
+                    "(real v6d P2P path)")
 
 
 class C_V6dObjectConnectorSchedulerHook(BaseHook):
@@ -588,21 +342,15 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                         all_match = False
                         break
                     key = manager._make_key(group_hashes[abs_idx])
-                    if getattr(self, "_sim_fallback_mode", False):
-                        # etcd fallback mode
-                        if V6dBlockOwnershipTracker.get_owner(key) is None:
+                    # P2P mode: use client.exists() to check Redis tracker
+                    try:
+                        client = getattr(manager, "client", None)
+                        if client is None or not client.exists(key):
                             all_match = False
                             break
-                    else:
-                        # P2P mode: use client.exists() to check Redis tracker
-                        try:
-                            client = getattr(manager, "client", None)
-                            if client is None or not client.exists(key):
-                                all_match = False
-                                break
-                        except Exception:
-                            all_match = False
-                            break
+                    except Exception:
+                        all_match = False
+                        break
                 if all_match:
                     return aligned_hit_length
 
