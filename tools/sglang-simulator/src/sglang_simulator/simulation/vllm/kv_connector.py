@@ -78,6 +78,12 @@ class MockHybridMetadata:
 # ---------------------------------------------------------------------------
 
 
+# DEPRECATED: MockHybridConnector is legacy code from the non-native CPU simulation path.
+# It is only used when SGLANG_SIMULATOR_NATIVE_V6D_CONTROL_PLANE is NOT set (default off).
+# The current production path uses NATIVE_V6D_CONTROL_PLANE=1 which keeps the real
+# HybridConnector and does not use this class.
+# V6DCacheStorage (etcd backend) has been deleted; this code will NOT work if activated.
+# Retained for backward compatibility reference only. Do NOT enable in new deployments.
 class MockHybridConnector:
     """Simulates HybridConnector's cross-node KV cache sharing for CPU.
 

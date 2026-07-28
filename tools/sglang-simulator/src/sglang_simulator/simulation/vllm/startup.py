@@ -508,6 +508,10 @@ def init_hook(force: bool = False):
     else:
         # Default CPU simulation path: replace HybridConnector with
         # MockHybridConnector + V6DCacheStorage(etcd) for scheduling parity.
+        # DEPRECATED: This branch is only taken when NATIVE_V6D_CONTROL_PLANE is NOT set.
+        # The MockHybridConnector path is legacy and no longer maintained.
+        # V6DCacheStorage has been deleted; this code will fail if activated.
+        # Use SGLANG_SIMULATOR_NATIVE_V6D_CONTROL_PLANE=1 for the supported P2P path.
         hooks.append(kv_connector.C_KVConnectorFactoryHook)
 
     sglang_simulator_hook.install_class_hooks(hooks)

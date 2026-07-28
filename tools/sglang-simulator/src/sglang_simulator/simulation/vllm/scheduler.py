@@ -110,6 +110,9 @@ class C_VLLMSchedulerHook(BaseHook):
                 # any non-Mock connector so request_finished/get_num_new_matched_tokens
                 # consistently go through V6DCacheStorage(etcd).
                 try:
+                # DEPRECATED: This else-branch installs MockHybridConnector when
+                # NATIVE_V6D_CONTROL_PLANE is not enabled. The legacy MockHybridConnector
+                # path is no longer maintained. Use NATIVE_V6D_CONTROL_PLANE=1 instead.
                     from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
                     kv_cache_config = None
                     if hasattr(self, 'kv_cache_config'):
