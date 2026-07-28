@@ -1,4 +1,0 @@
-{"filename":"parallel.py","lineno":574,"message":"Data parallel size: 1, local size: 1, rank: 0, local rank: None, master ip: 127.0.0.1, master port: 0","time":"2026-07-22 15:05:59.740"}
-{"filename":"import_utils.py","lineno":78,"message":"Loading module triton_kernels from /usr/local/lib/python3.12/dist-packages/triton_kernels/__init__.py.","time":"2026-07-22 15:05:59.904"}
-[/tmp/dashlog/csrc/metrics/meter_client.cc:149 _CheckEndpoint()] DashLog MeterClient endpoint reachable (status_code=404): http://127.0.0.1:8880
-[/tmp/dashlog/csrc/metrics/meter_client.cc:249 _Init()] DashLog MeterClient initialized, endpoint: http://127.0.0.1:8880

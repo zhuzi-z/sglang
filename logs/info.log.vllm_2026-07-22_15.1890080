@@ -1,4 +1,0 @@
-{"filename":"import_utils.py","lineno":78,"message":"Loading module triton_kernels from /usr/local/lib/python3.12/dist-packages/triton_kernels/__init__.py.","time":"2026-07-22 15:06:21.297"}
-{"filename":"kv_cache_utils.py","lineno":1295,"message":"GPU KV cache size: 20,400,311 tokens","time":"2026-07-22 15:06:43.420"}
-{"filename":"kv_cache_utils.py","lineno":1296,"message":"Maximum concurrency for 1,048,576 tokens per request: 19.46x","time":"2026-07-22 15:06:43.420"}
-{"filename":"core.py","lineno":454,"message":"init engine (profile, create kv cache, warmup model) took 0.02 seconds","time":"2026-07-22 15:06:43.428"}
