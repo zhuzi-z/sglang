@@ -94,9 +94,15 @@ class C_HybridConnectorHook(BaseHook):
             }
             if noop_store_reqs:
                 try:
-                    from vllm.v1.hybrid_connector import mark_backend_save_done
+                    # sched_get_req looks up the live Scheduler's requests
+                    # dict (engine_proxy); HybridConnector itself has no
+                    # get_request() — same pattern as v6d_manager.py.
+                    from vllm.v1.hybrid_connector import (
+                        mark_backend_save_done,
+                        sched_get_req,
+                    )
                     for req_id in sorted(noop_store_reqs):
-                        req = self.get_request(req_id)
+                        req = sched_get_req(req_id)
                         if req is not None:
                             mark_backend_save_done(req)
                     logger.info(

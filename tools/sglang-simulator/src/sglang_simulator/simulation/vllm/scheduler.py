@@ -42,7 +42,11 @@ class C_VLLMSchedulerHook(BaseHook):
 
     # Per-request stats collected during simulation.
     # Key: request_id, Value: dict with queue_start, queue_end,
-    #   gen_token_latencies, last_event_time, created_time
+    #   gen_token_latencies, last_event_time, created_time,
+    #   input_length, output_length, final_device_hit_len,
+    #   local_kv_hit_len / ext_kv_hit_len (same fields as the real
+    #   vllm_hook), plus legacy final_host_hit_len / final_storage_hit_len
+    #   for the RequestStats schema in simulation/utils.py.
     REQUEST_STATS: dict[str, dict] = {}
     # One record per scheduler forward step.  Keep the schema aligned with the
     # SGLang hook so step-level predictor validation can consume either backend.
@@ -72,8 +76,27 @@ class C_VLLMSchedulerHook(BaseHook):
 
         # Per-request created_time lookup (req_id -> created_time)
         req_created_time: dict[str, float] = {}
-        # Track whether a request has been scheduled at least once
-        req_first_scheduled: set[str] = set()
+
+        def _new_request_stats(request, created_time, queue_start, last_event_time):
+            """Initial REQUEST_STATS entry with the full RequestStats schema
+            so every dumped record carries length / hit fields (0 by default)."""
+            input_length = getattr(request, "num_prompt_tokens", None)
+            if input_length is None:
+                input_length = len(getattr(request, "prompt_token_ids", None) or [])
+            return {
+                "created_time": created_time,
+                "queue_start": queue_start,
+                "queue_end": -1,
+                "gen_token_latencies": [],
+                "last_event_time": last_event_time,
+                "input_length": input_length,
+                "output_length": 0,
+                "final_device_hit_len": 0,
+                "local_kv_hit_len": 0,
+                "ext_kv_hit_len": 0,
+                "final_host_hit_len": 0,
+                "final_storage_hit_len": 0,
+            }
 
         def wrapped_init(self, vllm_config, *args, **kwargs):
             """Hook __init__ to initialize AIConfigurator predictor
@@ -87,9 +110,7 @@ class C_VLLMSchedulerHook(BaseHook):
             cls.REQUEST_STATS.clear()
             cls.ITERATION_STATS.clear()
             req_created_time.clear()
-            req_first_scheduled.clear()
             # Per-instance tracking to avoid cross-worker contamination
-            self._sim_req_first_scheduled = set()
             self._sim_req_created_time = {}
 
             original_init(self, vllm_config, *args, **kwargs)
@@ -227,13 +248,12 @@ class C_VLLMSchedulerHook(BaseHook):
                 # BLOCKING mode: process immediately, record stats with real time
                 now = time.time()
                 rid = request.request_id
-                cls.REQUEST_STATS[rid] = {
-                    "created_time": created_time if created_time is not None else now,
-                    "queue_start": now,
-                    "queue_end": -1,
-                    "gen_token_latencies": [],
-                    "last_event_time": now,
-                }
+                cls.REQUEST_STATS[rid] = _new_request_stats(
+                    request,
+                    created_time=created_time if created_time is not None else now,
+                    queue_start=now,
+                    last_event_time=now,
+                )
                 original_add_request(self, request)
             elif created_time is not None:
                 # OFFLINE mode: hold in future_queue
@@ -271,13 +291,12 @@ class C_VLLMSchedulerHook(BaseHook):
                 # Record queue_start = time when request enters the waiting queue
                 rid = request.request_id
                 ct = req_created_time.get(rid, current_time)
-                cls.REQUEST_STATS[rid] = {
-                    "created_time": ct,
-                    "queue_start": current_time,
-                    "queue_end": -1,
-                    "gen_token_latencies": [],
-                    "last_event_time": ct,  # starts at created_time
-                }
+                cls.REQUEST_STATS[rid] = _new_request_stats(
+                    request,
+                    created_time=ct,
+                    queue_start=current_time,
+                    last_event_time=ct,  # starts at created_time
+                )
 
         def wrapped_schedule(self):
             # --- Dispatch eligible requests from future_queue (OFFLINE mode) ---
@@ -299,49 +318,35 @@ class C_VLLMSchedulerHook(BaseHook):
             if not num_scheduled_tokens:
                 return scheduler_output
 
-            # Record queue_end and prefix cache hit for newly scheduled requests (first schedule)
+            # Record queue_end and prefix cache hit for newly scheduled requests
+            # (first schedule), same scheme/fields as the real vllm_hook:
+            #   final_device_hit_len = num_cached_tokens (total reused)
+            #   ext_kv_hit_len       = num_external_computed_tokens (cross-node)
+            #   local_kv_hit_len     = difference (local radix)
             queue_end_time = (
                 time.time()
                 if cls.SIM_MODE == SimulationMode.BLOCKING
                 else StateManager.get_global_clock()
             )
-            for req_id, num_tokens in num_scheduled_tokens.items():
-                _inst_first = getattr(self, "_sim_req_first_scheduled", req_first_scheduled)
-                if req_id not in _inst_first:
-                    _inst_first.add(req_id)
-                    if req_id in cls.REQUEST_STATS:
-                        cls.REQUEST_STATS[req_id]["queue_end"] = queue_end_time
-                    # Track prefix cache hit: final_device_hit_len = total reused (L1+L2),
-                    # final_host_hit_len = L2 portion. Metric layer subtracts for per-level ratios.
+            if scheduler_output.scheduled_new_reqs:
+                for new_req_data in scheduler_output.scheduled_new_reqs:
+                    req_id = new_req_data.req_id
                     request = self.requests.get(req_id)
-                    if request is not None:
-                        total_hit_len = request.num_computed_tokens - num_tokens
-                        host_hit_len = 0
-                        # Try prefill_stats (public vLLM) or num_external_computed_tokens (modified vLLM)
-                        if (
-                            hasattr(request, "prefill_stats")
-                            and request.prefill_stats is not None
-                        ):
-                            host_hit_len = (
-                                getattr(
-                                    request.prefill_stats,
-                                    "num_external_cached_tokens",
-                                    0,
-                                )
-                                or 0
-                            )
-                        if host_hit_len == 0:
-                            host_hit_len = getattr(
-                                request, "num_external_computed_tokens", 0
-                            ) or 0
-                        if total_hit_len > 0 and req_id in cls.REQUEST_STATS:
-                            cls.REQUEST_STATS[req_id]["final_device_hit_len"] = (
-                                total_hit_len
-                            )
-                        if host_hit_len > 0 and req_id in cls.REQUEST_STATS:
-                            cls.REQUEST_STATS[req_id]["final_host_hit_len"] = (
-                                host_hit_len
-                            )
+                    if request is None:
+                        continue
+                    st = cls.REQUEST_STATS.get(req_id)
+                    if st is None or st["queue_end"] != -1:
+                        continue
+                    st["queue_end"] = queue_end_time
+                    st["input_length"] = request.num_prompt_tokens
+                    st["output_length"] = request.max_tokens
+                    cached = max(getattr(request, "num_cached_tokens", 0) or 0, 0)
+                    ext = getattr(request, "num_external_computed_tokens", 0) or 0
+                    st["final_device_hit_len"] = cached
+                    st["ext_kv_hit_len"] = ext
+                    st["local_kv_hit_len"] = cached - ext
+                    # Legacy schema (vllm_worker / metric layer): host = external
+                    st["final_host_hit_len"] = ext
 
             simulation_batch = ScheduleBatch(reqs=[])
             for req_id, num_tokens in num_scheduled_tokens.items():
@@ -414,6 +419,34 @@ class C_VLLMSchedulerHook(BaseHook):
         def wrapped_get_num_unfinished(self):
             return original_get_num_unfinished(self) + len(future_queue)
 
+        original_reset_prefix_cache = getattr(target, "reset_prefix_cache", None)
+
+        def wrapped_reset_prefix_cache(self, *args, **kwargs):
+            """reset_prefix_cache + flush sim v6d connector caches.
+
+            The bench clears cache state per iteration via v6d restart +
+            /reset_prefix_cache, but vLLM's reset (reset_connector=False,
+            and HybridConnector lacks reset_cache forwarding) never clears
+            the v6d managers' _cached_objs.  Stale entries survive the
+            daemon restart and make prepare_batch_allocate skip re-uploads
+            to the fresh daemon (registry holes -> L2 lookup truncation).
+            """
+            result = original_reset_prefix_cache(self, *args, **kwargs)
+            try:
+                from sglang_simulator.simulation.vllm.v6d_manager import (
+                    reset_all_sim_v6d_managers,
+                )
+                n = reset_all_sim_v6d_managers()
+                if n:
+                    logger.info(
+                        "[Scheduler Hook] reset_prefix_cache: flushed "
+                        "%d v6d manager connector caches", n)
+            except Exception as e:
+                logger.warning(
+                    "[Scheduler Hook] reset_prefix_cache: v6d manager "
+                    "cache flush failed: %r", e)
+            return result
+
 
 
         target.__init__ = wrapped_init
@@ -421,3 +454,5 @@ class C_VLLMSchedulerHook(BaseHook):
         target.schedule = wrapped_schedule
         target.update_from_output = override_update_from_output
         target.get_num_unfinished_requests = wrapped_get_num_unfinished
+        if original_reset_prefix_cache is not None:
+            target.reset_prefix_cache = wrapped_reset_prefix_cache

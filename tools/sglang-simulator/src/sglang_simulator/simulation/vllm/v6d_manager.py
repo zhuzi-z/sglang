@@ -19,12 +19,233 @@ only supported cross-node matching mechanism.
 from __future__ import annotations
 import json
 import os
+import shutil
+import weakref
 from typing import Any, Iterable
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
+
+# All live V6dObjectManager instances (registered in override_init).
+# Needed by reset_all_sim_v6d_managers() to flush connector-side caches
+# (_cached_objs / _pending_objs) when the bench clears cache state via
+# /reset_prefix_cache after restarting the v6d daemons.  Without this,
+# stale _cached_objs entries survive the daemon restart and poison
+# prepare_batch_allocate()'s dedup: blocks "already cached" are never
+# re-uploaded to the fresh daemon, leaving holes in the cross-node
+# registry (observed as bench round-2+ L2 lookup truncations).
+_SIM_V6D_MANAGERS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def reset_all_sim_v6d_managers() -> int:
+    """Reset every live V6dObjectManager (clears _cached_objs etc.).
+
+    Returns the number of managers reset.  Called from the sim scheduler
+    hook's reset_prefix_cache wrapper so each bench iteration starts with
+    a connector-cache state consistent with the freshly restarted v6d.
+    """
+    count = 0
+    for manager in list(_SIM_V6D_MANAGERS):
+        try:
+            manager.reset()
+            count += 1
+        except Exception as e:
+            logger.warning(
+                "[V6D Hijack] reset of manager group=%s failed: %r",
+                getattr(manager, "_group_id", "?"), e)
+    return count
+
+
+def _sim_client_exists(client, key: str, request_id=None) -> bool:
+    """exists() RPC that threads request_id to the sim-patched daemon.
+
+    The stock ``ExistsRequest`` dataclass has no request_id field; the
+    simulator's daemon-side hook (C_V6dDaemonExistsHook) parses it from
+    the raw JSON body for per-request hit classification and answers
+    with an extra ``location`` field.  Against a stock daemon the extra
+    field is rejected (HTTP 500) — fall back to plain client.exists().
+    """
+    if request_id:
+        try:
+            data = client.rpc.call("exists", {
+                "object_key": key,
+                "peer": None,
+                "request_id": request_id,
+            })
+            location = data.get("location")
+            if location:
+                logger.debug(
+                    f"[V6D P2P] exists req={request_id} key={key} -> {location}")
+            return bool(data.get("exists"))
+        except Exception as e:
+            logger.warning(
+                "[V6D DIAG] exists(rpc) failed req=%s key=%s: %r; "
+                "falling back to plain exists()", request_id, key, e)
+    try:
+        return bool(client.exists(key))
+    except Exception as e:
+        logger.warning(
+            "[V6D DIAG] exists() failed req=%s key=%s: %r -> treated as MISS",
+            request_id, key, e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# File-backed cross-process ownership tracker
+# ---------------------------------------------------------------------------
+
+_TRACKER_DIR = "/dev/shm/v6d_sim_tracker"
+_OWNERSHIP_FILE = os.path.join(_TRACKER_DIR, "ownership.json")
+_STATS_FILE = os.path.join(_TRACKER_DIR, "stats.json")
+_LOCK_FILE = os.path.join(_TRACKER_DIR, ".lock")
+
+
+class V6dBlockOwnershipTracker:
+    """Ownership tracker used by the native V6D CPU bypass.
+
+    The preferred storage is shared V6DCacheStorage(etcd), which provides
+    physical cross-node visibility between node1 and node2.  The file-backed
+    `/dev/shm` fallback is used only when that shared store is unavailable.
+    """
+
+    @classmethod
+    def _ensure_dir(cls):
+        os.makedirs(_TRACKER_DIR, exist_ok=True)
+
+    @classmethod
+    def _lock(cls):
+        """Acquire exclusive file lock. Returns lock file descriptor."""
+        cls._ensure_dir()
+        fd = open(_LOCK_FILE, "w")
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
+        return fd
+
+    @classmethod
+    def _unlock(cls, fd):
+        """Release file lock."""
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        fd.close()
+
+    @classmethod
+    def _read_json(cls, path: str) -> dict:
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            return {}
+
+    @classmethod
+    def _write_json(cls, path: str, data: dict):
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    @classmethod
+    def reset(cls):
+        """Reset all tracking data. Call at test setup."""
+        if os.path.exists(_TRACKER_DIR):
+            shutil.rmtree(_TRACKER_DIR)
+        cls._ensure_dir()
+
+    @classmethod
+    def _storage(cls):
+        try:
+            from sglang_simulator.simulation.vllm.v6d_cache_storage import (
+                V6DCacheStorage,
+            )
+            storage = V6DCacheStorage.get_instance()
+            if storage.connected:
+                return storage
+        except Exception:
+            logger.debug("[V6D RPC Bypass] etcd tracker unavailable", exc_info=True)
+        return None
+
+    @classmethod
+    def record_seal(cls, key: str, worker_id: str) -> None:
+        """Record that worker_id sealed the given block key."""
+        storage = cls._storage()
+        if storage is not None and storage.register_block(key, worker_id):
+            return
+        lock = cls._lock()
+        try:
+            data = cls._read_json(_OWNERSHIP_FILE)
+            data[key] = worker_id
+            cls._write_json(_OWNERSHIP_FILE, data)
+        finally:
+            cls._unlock(lock)
+
+    @classmethod
+    def get_owner(cls, key: str) -> str | None:
+        """Get the owner worker_id of a block key, or None if unknown."""
+        storage = cls._storage()
+        if storage is not None:
+            owner = storage.lookup_block(key)
+            if owner is not None:
+                return owner
+        lock = cls._lock()
+        try:
+            data = cls._read_json(_OWNERSHIP_FILE)
+            return data.get(key)
+        finally:
+            cls._unlock(lock)
+
+    @classmethod
+    def classify_hit(cls, key: str, current_worker_id: str) -> str:
+        """Classify a cache hit as local, remote, or unknown."""
+        lock = cls._lock()
+        try:
+            data = cls._read_json(_OWNERSHIP_FILE)
+            owner = data.get(key)
+        finally:
+            cls._unlock(lock)
+
+        if owner is None:
+            return "unknown"
+        return "local" if owner == current_worker_id else "remote"
+
+    @classmethod
+    def record_hit(cls, worker_id: str, hit_type: str, count: int = 1) -> None:
+        """Record hit classification for a worker."""
+        lock = cls._lock()
+        try:
+            stats = cls._read_json(_STATS_FILE)
+            if worker_id not in stats:
+                stats[worker_id] = {}
+            stat_key = f"{hit_type}_hits"
+            stats[worker_id][stat_key] = stats[worker_id].get(stat_key, 0) + count
+            cls._write_json(_STATS_FILE, stats)
+        finally:
+            cls._unlock(lock)
+
+    @classmethod
+    def get_stats(cls, worker_id: str) -> dict:
+        """Get hit stats for a specific worker (safe from any process)."""
+        lock = cls._lock()
+        try:
+            stats = cls._read_json(_STATS_FILE)
+            return stats.get(worker_id, {})
+        finally:
+            cls._unlock(lock)
+
+    @classmethod
+    def get_all_stats(cls) -> dict:
+        """Get all worker stats."""
+        lock = cls._lock()
+        try:
+            return cls._read_json(_STATS_FILE)
+        finally:
+            cls._unlock(lock)
+
+    @classmethod
+    def get_ownership_count(cls) -> int:
+        """Get total number of tracked ownership entries."""
+        lock = cls._lock()
+        try:
+            data = cls._read_json(_OWNERSHIP_FILE)
+            return len(data)
+        finally:
+            cls._unlock(lock)
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +306,7 @@ class C_V6dObjectManagerHook(BaseHook):
         def override_init(self, *args, **kwargs):
             """Tag manager with active worker_id from environment."""
             original_init(self, *args, **kwargs)
+            _SIM_V6D_MANAGERS.add(self)
             worker_id = get_active_worker_id()
             if worker_id:
                 self._sim_worker_id = worker_id
@@ -130,21 +352,30 @@ class C_V6dObjectManagerHook(BaseHook):
             if getattr(self, "client", None) is None:
                 return 0
             hits = 0
+            total = 0
+            stop_reason = "all_hit"
             for h in block_hashes:
+                total += 1
                 key = self._make_key(h)
                 if key in self._cached_objs:
                     hits += 1
                     continue
                 try:
-                    if self.client.exists(key):
+                    if _sim_client_exists(self.client, key, request_id):
                         self._cached_objs[key] = key
                         if request_id is not None:
                             self._hold_key_for_req(key, request_id)
                         hits += 1
                     else:
+                        stop_reason = f"miss@{hits} key={key}"
                         break
-                except Exception:
+                except Exception as e:
+                    stop_reason = f"exception@{hits} key={key}: {e!r}"
                     break
+            if stop_reason != "all_hit":
+                logger.info(
+                    "[V6D DIAG] lookup group=%s req=%s hits=%d/%d stop=%s",
+                    self._group_id, request_id, hits, total, stop_reason)
             return hits * getattr(self, "_group_block_size", 1)
 
         async def override_async_lookup(self, block_hashes, request_id=None,
@@ -154,22 +385,32 @@ class C_V6dObjectManagerHook(BaseHook):
             import asyncio
             loop = asyncio.get_event_loop()
             hits = 0
+            total = 0
+            stop_reason = "all_hit"
             for h in block_hashes:
+                total += 1
                 key = self._make_key(h)
                 if key in self._cached_objs:
                     hits += 1
                     continue
                 try:
-                    exists = await loop.run_in_executor(None, self.client.exists, key)
+                    exists = await loop.run_in_executor(
+                        None, _sim_client_exists, self.client, key, request_id)
                     if exists:
                         self._cached_objs[key] = key
                         if request_id is not None:
                             self._hold_key_for_req(key, request_id)
                         hits += 1
                     else:
+                        stop_reason = f"miss@{hits} key={key}"
                         break
-                except Exception:
+                except Exception as e:
+                    stop_reason = f"exception@{hits} key={key}: {e!r}"
                     break
+            if stop_reason != "all_hit":
+                logger.info(
+                    "[V6D DIAG] async_lookup group=%s req=%s hits=%d/%d stop=%s",
+                    self._group_id, request_id, hits, total, stop_reason)
             return hits * getattr(self, "_group_block_size", 1)
 
         def override_get_key(self, block_hash, request_id=None):
@@ -286,6 +527,10 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
             if lcm_block_size > 0:
                 hit_length = hit_length // lcm_block_size * lcm_block_size
             if hit_length <= 0:
+                logger.info(
+                    "[V6D DIAG] Request %s: scheduler lookup MISS "
+                    "(final hit_length=%d) from num_computed_tokens=%d",
+                    request.request_id, hit_length, num_computed_tokens)
                 return 0, False
             if hasattr(self, "_to_load_token_idx"):
                 self._to_load_token_idx[request.request_id] = num_computed_tokens
@@ -327,8 +572,10 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
             aligned_hit_lengths = list(range(
                 max_mamba_hit_length, 0, -lcm_block_size))
 
+            first_fail_reason = None
             for aligned_hit_length in aligned_hit_lengths:
                 all_match = True
+                fail_reason = None
                 for group_id in mamba_group_ids:
                     manager = self.managers[group_id]
                     group_block_size = self.group_block_sizes[group_id]
@@ -339,21 +586,51 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                         // group_block_size - 1
                     )
                     if abs_idx < 0 or abs_idx >= len(group_hashes):
+                        fail_reason = (
+                            f"idx_out_of_range group={group_id} "
+                            f"abs_idx={abs_idx} n={len(group_hashes)}")
                         all_match = False
                         break
                     key = manager._make_key(group_hashes[abs_idx])
-                    # P2P mode: use client.exists() to check Redis tracker
-                    try:
-                        client = getattr(manager, "client", None)
-                        if client is None or not client.exists(key):
+                    if getattr(self, "_sim_fallback_mode", False):
+                        # etcd fallback mode
+                        if V6dBlockOwnershipTracker.get_owner(key) is None:
+                            fail_reason = (
+                                f"no_owner group={group_id} key={key}")
                             all_match = False
                             break
-                    except Exception:
-                        all_match = False
-                        break
+                    else:
+                        # P2P mode: use client.exists() to check Redis tracker
+                        try:
+                            client = getattr(manager, "client", None)
+                            if client is None or not client.exists(key):
+                                fail_reason = (
+                                    f"exists=False group={group_id} key={key}")
+                                all_match = False
+                                break
+                        except Exception as e:
+                            fail_reason = (
+                                f"exists_exception group={group_id} "
+                                f"key={key}: {e!r}")
+                            all_match = False
+                            break
                 if all_match:
+                    if aligned_hit_length != max_mamba_hit_length:
+                        logger.info(
+                            "[V6D DIAG] mamba_validate: degraded "
+                            "%d -> %d (first_fail: %s)",
+                            max_mamba_hit_length, aligned_hit_length,
+                            first_fail_reason)
                     return aligned_hit_length
+                if first_fail_reason is None:
+                    first_fail_reason = (
+                        f"boundary={aligned_hit_length}: {fail_reason}")
 
+            logger.info(
+                "[V6D DIAG] mamba_validate: ALL boundaries failed, "
+                "fa_hit=%d max_mamba=%d num_computed=%d first_fail: %s",
+                fa_hit_length, max_mamba_hit_length, num_computed_tokens,
+                first_fail_reason)
             return 0
 
         def override_get_num_new_matched_tokens(

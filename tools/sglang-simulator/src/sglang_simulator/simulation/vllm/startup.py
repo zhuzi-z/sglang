@@ -446,6 +446,7 @@ def init_hook(force: bool = False):
         kv_connector,
         kv_offload,
         platform,
+        profile_hook,
         scheduler,
         v6d_backend,
         v6d_manager,
@@ -484,6 +485,9 @@ def init_hook(force: bool = False):
         worker.C_VLLMWorkerHook,
         # Scheduler hook for time prediction
         scheduler.C_VLLMSchedulerHook,
+        # Profile hook — exports REQUEST_STATS / ITERATION_STATS on
+        # /start_profile & /stop_profile (EngineCore.profile)
+        profile_hook.C_VLLMProfileHook,
         # Native SimpleCPUOffloadWorker hook (bypasses CUDA for native offload)
         kv_offload.C_VLLMSimpleCPUOffloadWorkerHook,
         # Native OffloadingConnectorWorker hook (default native path)

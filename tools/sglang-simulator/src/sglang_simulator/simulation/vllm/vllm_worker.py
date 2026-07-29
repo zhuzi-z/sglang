@@ -214,6 +214,8 @@ class VLLMWorker(BaseWorker):
                 queue_end = tracked["queue_end"]
                 last_event_time = tracked["last_event_time"]
                 final_device_hit_len = tracked.get("final_device_hit_len", 0)
+                local_kv_hit_len = tracked.get("local_kv_hit_len", 0)
+                ext_kv_hit_len = tracked.get("ext_kv_hit_len", 0)
                 final_host_hit_len = tracked.get("final_host_hit_len", 0)
             else:
                 # Fallback for non-simulation requests
@@ -223,6 +225,8 @@ class VLLMWorker(BaseWorker):
                 queue_end = 0.0
                 last_event_time = sum(gen_token_latencies)
                 final_device_hit_len = 0
+                local_kv_hit_len = 0
+                ext_kv_hit_len = 0
                 final_host_hit_len = 0
 
             stats.append(
@@ -235,6 +239,8 @@ class VLLMWorker(BaseWorker):
                     "input_length": input_len,
                     "output_length": output_len,
                     "final_device_hit_len": final_device_hit_len,
+                    "local_kv_hit_len": local_kv_hit_len,
+                    "ext_kv_hit_len": ext_kv_hit_len,
                     "final_host_hit_len": final_host_hit_len,
                     "final_storage_hit_len": 0,
                 }
