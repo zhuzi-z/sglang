@@ -161,14 +161,12 @@ class C_HybridConnectorHook(BaseHook):
             # immediately (simulating instant load completion in CPU mode).
             assert self._worker is not None
             self._worker.start_load_kv()
-        def override_start_save_kv(self, forward_context=None, **kwargs):
-            pass
+
         target.bind_connector_metadata = override_bind_connector_metadata
         target.wait_for_save = override_wait_for_save
         target.get_finished = override_get_finished
         target.clear_connector_metadata = override_clear_connector_metadata
         target.start_load_kv = override_start_load_kv
-        target.start_save_kv = override_start_save_kv
 
         def override_update_connector_output(self, connector_output):
             # Delegate to scheduler-side backend (V6dObjectConnectorScheduler)
