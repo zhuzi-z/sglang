@@ -95,13 +95,11 @@ class MockHybridConnector:
     """
 
     def __init__(self, config: "VllmConfig", role, kv_cache_config):
-        from sglang_simulator.simulation.vllm.v6d_cache_storage import (
-            V6DCacheStorage,
-        )
+        # DEPRECATED: v6d_cache_storage deleted
         self._config = config
         self._kv_cache_config = kv_cache_config
         self._v6d_storage = V6DCacheStorage.get_instance()
-        from sglang_simulator.simulation.vllm.v6d_manager import (
+        from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
             get_active_worker_id,
         )
         self._worker_id = get_active_worker_id()
@@ -298,9 +296,7 @@ class MockHybridConnector:
         return False
 
     def reset_cache(self) -> bool | None:
-        from sglang_simulator.simulation.vllm.v6d_cache_storage import (
-            V6DCacheStorage,
-        )
+        # DEPRECATED: v6d_cache_storage deleted
         V6DCacheStorage.reset_instance()
         return True
 

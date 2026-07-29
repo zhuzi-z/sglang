@@ -10,7 +10,7 @@ validation exercise the real control plane without transferring full KV data.
 import torch
 
 from sglang_simulator.hook import BaseHook
-from sglang_simulator.simulation.vllm.v6d_swap import DummyEvent, DummyStream
+from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent, DummyStream
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()

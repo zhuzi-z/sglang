@@ -11,7 +11,7 @@ bypasses the unavailable CPU-only data plane:
 3. Bypass scheduler-side `client.create()` while preserving cross-group
    allocation semantics.
 
-NOTE: The legacy etcd-backed V6dBlockOwnershipTracker and V6DCacheStorage
+NOTE: The legacy etcd-backed # V6dBlockOwnershipTracker (removed) and V6DCacheStorage
 have been removed. The P2P path (client.exists via Redis tracker) is the
 only supported cross-node matching mechanism.
 """
@@ -19,7 +19,6 @@ only supported cross-node matching mechanism.
 from __future__ import annotations
 import json
 import os
-import shutil
 import weakref
 from typing import Any, Iterable
 
@@ -92,160 +91,7 @@ def _sim_client_exists(client, key: str, request_id=None) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# File-backed cross-process ownership tracker
-# ---------------------------------------------------------------------------
 
-_TRACKER_DIR = "/dev/shm/v6d_sim_tracker"
-_OWNERSHIP_FILE = os.path.join(_TRACKER_DIR, "ownership.json")
-_STATS_FILE = os.path.join(_TRACKER_DIR, "stats.json")
-_LOCK_FILE = os.path.join(_TRACKER_DIR, ".lock")
-
-
-class V6dBlockOwnershipTracker:
-    """Ownership tracker used by the native V6D CPU bypass.
-
-    The preferred storage is shared V6DCacheStorage(etcd), which provides
-    physical cross-node visibility between node1 and node2.  The file-backed
-    `/dev/shm` fallback is used only when that shared store is unavailable.
-    """
-
-    @classmethod
-    def _ensure_dir(cls):
-        os.makedirs(_TRACKER_DIR, exist_ok=True)
-
-    @classmethod
-    def _lock(cls):
-        """Acquire exclusive file lock. Returns lock file descriptor."""
-        cls._ensure_dir()
-        fd = open(_LOCK_FILE, "w")
-        fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
-        return fd
-
-    @classmethod
-    def _unlock(cls, fd):
-        """Release file lock."""
-        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-        fd.close()
-
-    @classmethod
-    def _read_json(cls, path: str) -> dict:
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError, ValueError):
-            return {}
-
-    @classmethod
-    def _write_json(cls, path: str, data: dict):
-        with open(path, "w") as f:
-            json.dump(data, f)
-
-    @classmethod
-    def reset(cls):
-        """Reset all tracking data. Call at test setup."""
-        if os.path.exists(_TRACKER_DIR):
-            shutil.rmtree(_TRACKER_DIR)
-        cls._ensure_dir()
-
-    @classmethod
-    def _storage(cls):
-        try:
-            from sglang_simulator.simulation.vllm.v6d_cache_storage import (
-                V6DCacheStorage,
-            )
-            storage = V6DCacheStorage.get_instance()
-            if storage.connected:
-                return storage
-        except Exception:
-            logger.debug("[V6D RPC Bypass] etcd tracker unavailable", exc_info=True)
-        return None
-
-    @classmethod
-    def record_seal(cls, key: str, worker_id: str) -> None:
-        """Record that worker_id sealed the given block key."""
-        storage = cls._storage()
-        if storage is not None and storage.register_block(key, worker_id):
-            return
-        lock = cls._lock()
-        try:
-            data = cls._read_json(_OWNERSHIP_FILE)
-            data[key] = worker_id
-            cls._write_json(_OWNERSHIP_FILE, data)
-        finally:
-            cls._unlock(lock)
-
-    @classmethod
-    def get_owner(cls, key: str) -> str | None:
-        """Get the owner worker_id of a block key, or None if unknown."""
-        storage = cls._storage()
-        if storage is not None:
-            owner = storage.lookup_block(key)
-            if owner is not None:
-                return owner
-        lock = cls._lock()
-        try:
-            data = cls._read_json(_OWNERSHIP_FILE)
-            return data.get(key)
-        finally:
-            cls._unlock(lock)
-
-    @classmethod
-    def classify_hit(cls, key: str, current_worker_id: str) -> str:
-        """Classify a cache hit as local, remote, or unknown."""
-        lock = cls._lock()
-        try:
-            data = cls._read_json(_OWNERSHIP_FILE)
-            owner = data.get(key)
-        finally:
-            cls._unlock(lock)
-
-        if owner is None:
-            return "unknown"
-        return "local" if owner == current_worker_id else "remote"
-
-    @classmethod
-    def record_hit(cls, worker_id: str, hit_type: str, count: int = 1) -> None:
-        """Record hit classification for a worker."""
-        lock = cls._lock()
-        try:
-            stats = cls._read_json(_STATS_FILE)
-            if worker_id not in stats:
-                stats[worker_id] = {}
-            stat_key = f"{hit_type}_hits"
-            stats[worker_id][stat_key] = stats[worker_id].get(stat_key, 0) + count
-            cls._write_json(_STATS_FILE, stats)
-        finally:
-            cls._unlock(lock)
-
-    @classmethod
-    def get_stats(cls, worker_id: str) -> dict:
-        """Get hit stats for a specific worker (safe from any process)."""
-        lock = cls._lock()
-        try:
-            stats = cls._read_json(_STATS_FILE)
-            return stats.get(worker_id, {})
-        finally:
-            cls._unlock(lock)
-
-    @classmethod
-    def get_all_stats(cls) -> dict:
-        """Get all worker stats."""
-        lock = cls._lock()
-        try:
-            return cls._read_json(_STATS_FILE)
-        finally:
-            cls._unlock(lock)
-
-    @classmethod
-    def get_ownership_count(cls) -> int:
-        """Get total number of tracked ownership entries."""
-        lock = cls._lock()
-        try:
-            data = cls._read_json(_OWNERSHIP_FILE)
-            return len(data)
-        finally:
-            cls._unlock(lock)
 
 
 # ---------------------------------------------------------------------------
@@ -592,28 +438,20 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                         all_match = False
                         break
                     key = manager._make_key(group_hashes[abs_idx])
-                    if getattr(self, "_sim_fallback_mode", False):
-                        # etcd fallback mode
-                        if V6dBlockOwnershipTracker.get_owner(key) is None:
+                    # P2P mode: use client.exists() to check Redis tracker
+                    try:
+                        client = getattr(manager, "client", None)
+                        if client is None or not client.exists(key):
                             fail_reason = (
-                                f"no_owner group={group_id} key={key}")
+                                f"exists=False group={group_id} key={key}")
                             all_match = False
                             break
-                    else:
-                        # P2P mode: use client.exists() to check Redis tracker
-                        try:
-                            client = getattr(manager, "client", None)
-                            if client is None or not client.exists(key):
-                                fail_reason = (
-                                    f"exists=False group={group_id} key={key}")
-                                all_match = False
-                                break
-                        except Exception as e:
-                            fail_reason = (
-                                f"exists_exception group={group_id} "
-                                f"key={key}: {e!r}")
-                            all_match = False
-                            break
+                    except Exception as e:
+                        fail_reason = (
+                            f"exists_exception group={group_id} "
+                            f"key={key}: {e!r}")
+                        all_match = False
+                        break
                 if all_match:
                     if aligned_hit_length != max_mamba_hit_length:
                         logger.info(

@@ -27,25 +27,7 @@ logger = get_logger()
 
 _OPS_PATCHED = False
 
-
-class DummyEvent:
-    """Replace torch.cuda.Event - all operations are no-ops."""
-
-    def record(self, stream=None):
-        pass
-
-    def wait(self, stream=None):
-        pass
-
-    def query(self):
-        return True
-
-    def synchronize(self):
-        pass
-
-    def elapsed_time(self, other):
-        return 0.0
-
+from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent, DummyStream
 
 class DummyStream:
     """Replace torch.cuda.Stream - all operations are no-ops."""
@@ -70,7 +52,6 @@ class DummyStream:
 
     def __exit__(self, *args):
         pass
-
 
 def _patch_v6d_ops():
     """Monkey-patch vllm._custom_ops to replace CUDA V6D kernels.
@@ -121,7 +102,6 @@ def _patch_v6d_ops():
         logger.warning(
             "[V6D Hijack] Could not import vllm._custom_ops for patching"
         )
-
 
 class C_V6dSwapHandlerHook(BaseHook):
     """Hook V6dSwapHandler to replace CUDA operations with CPU equivalents.

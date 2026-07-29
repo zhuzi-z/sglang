@@ -13,7 +13,7 @@ through class monkey-patches at interpreter startup.
 """
 
 from sglang_simulator.hook import BaseHook
-from sglang_simulator.simulation.vllm.v6d_swap import DummyEvent
+from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()

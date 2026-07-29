@@ -74,7 +74,7 @@ class VLLMWorker(BaseWorker):
 
         # Set active worker_id for V6D RPC bypass ownership tracking
         try:
-            from sglang_simulator.simulation.vllm.v6d_manager import set_active_worker_id
+            from sglang_simulator.simulation.vllm.v6d.v6d_manager import set_active_worker_id
             set_active_worker_id(name)
         except ImportError:
             pass
@@ -89,7 +89,7 @@ class VLLMWorker(BaseWorker):
 
         # Clear active worker_id after init completes
         try:
-            from sglang_simulator.simulation.vllm.v6d_manager import set_active_worker_id
+            from sglang_simulator.simulation.vllm.v6d.v6d_manager import set_active_worker_id
             set_active_worker_id(None)
         except ImportError:
             pass

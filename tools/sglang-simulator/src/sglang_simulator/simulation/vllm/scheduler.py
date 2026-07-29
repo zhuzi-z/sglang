@@ -149,15 +149,6 @@ class C_VLLMSchedulerHook(BaseHook):
                 except Exception as e:
                     logger.warning('[Scheduler Hook] Failed to install MockHybridConnector: %s', e)
 
-            # Always register MockHybridConnector with SupportsHMA regardless
-            # of how the connector was created (factory hook or fallback above).
-            # This ensures _connector_finished uses request_finished_all_groups
-            # on hybrid models with multiple kv_cache_groups (e.g. Qwen3.5).
-            try:
-                from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
-                from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
-                SupportsHMA.register(MockHybridConnector)
-            except Exception:
                 pass
             # Share scheduler reference with MockHybridConnector
             try:
@@ -433,7 +424,7 @@ class C_VLLMSchedulerHook(BaseHook):
             """
             result = original_reset_prefix_cache(self, *args, **kwargs)
             try:
-                from sglang_simulator.simulation.vllm.v6d_manager import (
+                from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
                     reset_all_sim_v6d_managers,
                 )
                 n = reset_all_sim_v6d_managers()
