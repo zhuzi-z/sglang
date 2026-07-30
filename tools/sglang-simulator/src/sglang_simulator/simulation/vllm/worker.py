@@ -142,6 +142,20 @@ def _build_kv_cache_spec(vllm_config) -> dict:
         page_size_padded=attn_page_size,
         mamba_cache_mode=getattr(cache_config, "mamba_cache_mode", "none"),
     )
+    # Forward num_speculative_blocks (MTP/EAGLE) so light-mode runtime block
+    # accounting matches the real deployment: the fork's MambaManager uses
+    # _num_runtime_blocks = 1 + num_speculative_blocks per request.  Leaving
+    # it at the default 0 makes each request hold 3 fewer blocks than real
+    # (MTP k=3), underestimating pool eviction pressure and letting cached
+    # mamba state snapshots live too long (task29: prefix-cache hit ratio
+    # overestimated by up to +10.3pp on node1_0047).
+    _mamba_fields = {f.name for f in dataclasses.fields(MambaSpec)}
+    if "num_speculative_blocks" in _mamba_fields:
+        spec_cfg = getattr(vllm_config, "speculative_config", None)
+        num_spec_tokens = (
+            getattr(spec_cfg, "num_speculative_tokens", 0) or 0
+        ) if spec_cfg is not None else 0
+        mamba_kwargs["num_speculative_blocks"] = num_spec_tokens
     mamba_type_field = next(
         (f for f in dataclasses.fields(MambaSpec) if f.name == "mamba_type"), None
     )
