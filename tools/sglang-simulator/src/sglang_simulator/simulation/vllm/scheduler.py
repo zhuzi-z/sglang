@@ -29,6 +29,32 @@ logger = get_logger()
 # None means no override (use original sampling_params.max_tokens)
 _MAX_DECODE_STEPS = int(v) if (v := os.environ.get("SGLANG_SIMULATOR_MAX_DECODE_STEPS")) is not None else None
 
+# Idle-jump lookahead fix (OFFLINE cold-start batching).
+# When the clock jumps to the next arrival, also open a lookahead window of
+# one engine step's duration so requests arriving within that window are
+# batched together, matching real vLLM accumulation during step execution.
+# Set SGLANG_SIMULATOR_IDLE_JUMP_FIX=off to restore the legacy behavior.
+_IDLE_JUMP_FIX_ENABLED = os.environ.get(
+    "SGLANG_SIMULATOR_IDLE_JUMP_FIX", "on"
+).lower() in ("1", "true", "on", "yes")
+# Fallback lookahead window (seconds) for cold start when no step history.
+# Robust parse: empty/invalid values fall back to 1.0 instead of raising at
+# import time (which would disable the whole hook).
+def _parse_idle_jump_lookahead_default() -> float:
+    raw = os.environ.get("SGLANG_SIMULATOR_IDLE_JUMP_LOOKAHEAD_S", "1.0")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid SGLANG_SIMULATOR_IDLE_JUMP_LOOKAHEAD_S=%r; "
+            "falling back to 1.0",
+            raw,
+        )
+        return 1.0
+
+
+_IDLE_JUMP_LOOKAHEAD_DEFAULT = _parse_idle_jump_lookahead_default()
+
 
 class C_VLLMSchedulerHook(BaseHook):
     """Hook the vLLM Scheduler class to inject time prediction
@@ -174,7 +200,6 @@ class C_VLLMSchedulerHook(BaseHook):
             except Exception as e:
                 logger.warning('[Scheduler Hook] Could not patch mamba assertion: %s', e)
 
-
             try:
                 from sglang_simulator.simulation.manager import ConfigManager
                 from sglang_simulator.simulation.vllm.utils import (
@@ -255,11 +280,17 @@ class C_VLLMSchedulerHook(BaseHook):
                 # Non-simulation request - process normally
                 original_add_request(self, request)
 
-        def _dispatch_eligible(self):
-            """Move requests from future_queue to self.waiting
-            whose created_time <= global_clock."""
+        # Count of clamped negative token latencies (idle-jump pre-pulled reqs)
+        neg_latency_clamps = 0
+
+        def _dispatch_eligible(self, window_end=None):
+            """Move requests from future_queue to self.waiting whose
+            created_time <= global_clock (or <= window_end when given,
+            used by the idle-jump lookahead fix to pre-pull requests
+            without advancing the physical clock)."""
             current_time = StateManager.get_global_clock()
-            while future_queue and future_queue[0][0] <= current_time:
+            threshold = window_end if window_end is not None else current_time
+            while future_queue and future_queue[0][0] <= threshold:
                 _, _, request = heapq.heappop(future_queue)
                 if hasattr(self, "_enqueue_waiting_request"):
                     self._enqueue_waiting_request(request)
@@ -270,23 +301,46 @@ class C_VLLMSchedulerHook(BaseHook):
                 ct = req_created_time.get(rid, current_time)
                 cls.REQUEST_STATS[rid] = {
                     "created_time": ct,
-                    "queue_start": current_time,
+                    # Pre-pulled requests (ct > clock) cannot be queued before
+                    # they arrive; clamp to ct.  Steady-state path always has
+                    # ct <= current_time, so this is a no-op there.
+                    "queue_start": max(current_time, ct),
                     "queue_end": -1,
                     "gen_token_latencies": [],
                     "last_event_time": ct,  # starts at created_time
                 }
 
         def wrapped_schedule(self):
+            nonlocal neg_latency_clamps
             # --- Dispatch eligible requests from future_queue (OFFLINE mode) ---
             if cls.SIM_MODE == SimulationMode.OFFLINE and all_received:
                 _dispatch_eligible(self)
 
                 # Idle state: no waiting, no running, but future has items
-                # Jump clock to next request's created_time
                 if not self.waiting and not self.running and future_queue:
                     next_time = future_queue[0][0]
+                    # Jump clock to next request's created_time (both modes:
+                    # keeps the physical timeline truthful for the first
+                    # request; TTFT is unaffected by the fix).
                     StateManager.set_global_clock(next_time + 1e-6)
-                    _dispatch_eligible(self)
+                    if _IDLE_JUMP_FIX_ENABLED:
+                        # Pre-pull all requests arriving within one engine
+                        # step's duration after next_time, so they are batched
+                        # together as real vLLM would accumulate them while
+                        # executing a step.  The window only widens dispatch
+                        # eligibility; the clock is NOT advanced by lookahead.
+                        # The most recent step's predicted latency is stored
+                        # via set_current_inference_dur() at each step's end.
+                        lookahead = StateManager.get_current_inference_dur()
+                        if lookahead <= 0:
+                            lookahead = _IDLE_JUMP_LOOKAHEAD_DEFAULT
+                        _dispatch_eligible(
+                            self, window_end=next_time + lookahead
+                        )
+                    else:
+                        # Legacy behavior: dispatch only requests whose
+                        # created_time <= clock (serializes cold-start steps).
+                        _dispatch_eligible(self)
 
             # --- Call original schedule ---
             scheduler_output = original_schedule(self)
@@ -307,7 +361,14 @@ class C_VLLMSchedulerHook(BaseHook):
                 if req_id not in _inst_first:
                     _inst_first.add(req_id)
                     if req_id in cls.REQUEST_STATS:
-                        cls.REQUEST_STATS[req_id]["queue_end"] = queue_end_time
+                        # Pre-pulled requests can be scheduled at a clock
+                        # earlier than their queue_start (= created_time);
+                        # clamp so queue_end - queue_start >= 0.  Steady-state
+                        # path always has queue_end_time >= queue_start.
+                        cls.REQUEST_STATS[req_id]["queue_end"] = max(
+                            queue_end_time,
+                            cls.REQUEST_STATS[req_id]["queue_start"],
+                        )
                     # Track prefix cache hit: final_device_hit_len = total reused (L1+L2),
                     # final_host_hit_len = L2 portion. Metric layer subtracts for per-level ratios.
                     request = self.requests.get(req_id)
@@ -401,10 +462,27 @@ class C_VLLMSchedulerHook(BaseHook):
                             continue
                     st = cls.REQUEST_STATS.get(req_id)
                     if st is not None:
-                        st["gen_token_latencies"].append(
-                            event_time - st["last_event_time"]
+                        token_latency = event_time - st["last_event_time"]
+                        if token_latency < 0:
+                            # Pre-pulled request (idle-jump lookahead): the
+                            # first token event can precede created_time when
+                            # the step latency is shorter than the arrival
+                            # offset.  Clamp to 0; keeping the later timestamp
+                            # as last_event_time preserves e2e = sum(latencies)
+                            # = last_token_time - created_time.
+                            neg_latency_clamps += 1
+                            logger.debug(
+                                "Clamped negative token latency %.6fs for "
+                                "req %s (idle-jump pre-pull, total clamps=%d)",
+                                token_latency,
+                                req_id,
+                                neg_latency_clamps,
+                            )
+                            token_latency = 0.0
+                        st["gen_token_latencies"].append(token_latency)
+                        st["last_event_time"] = max(
+                            event_time, st["last_event_time"]
                         )
-                        st["last_event_time"] = event_time
 
             return scheduler_output
 
