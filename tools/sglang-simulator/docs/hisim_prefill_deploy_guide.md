@@ -182,9 +182,10 @@ EOF
 export PYTHONPATH="/root/workspace/sglang-dev/tools/sglang-simulator:${PYTHONPATH:-}"
 export SGLANG_SIMULATOR_ENABLE_VLLM_HOOK=1
 export SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1
+export SRPC_STREAM_DISABLE_RDMA=1
 ```
 
-> **原理：** Python 启动时会从 `PYTHONPATH` 自动导入 `sitecustomize.py`；该入口只有检测到 `SGLANG_SIMULATOR_ENABLE_VLLM_HOOK=1`（或 `SGLANG_SIMULATOR_ENABLE_HOOK=1`）才安装 vLLM 调度/Worker 劫持 hook。`SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1` 额外启用真实 v6d IPC CPU 绕过：给 `VineyardPeer` 补 `-rpc=false`，并跳过 Python 层 `init_srpc_transfer()`，避免 CPU 环境加载 SRPC/BAREX 的 `libcuda.so.1` 依赖。子进程会继承 `PYTHONPATH` 和环境变量，因此 EngineCore/Worker 与 dashllm 拉起的 v6d 子进程都能自动加载 hook，同时不会影响未设置这些变量的其他服务。
+> **原理：** Python 启动时会从 `PYTHONPATH` 自动导入 `sitecustomize.py`；该入口只有检测到 `SGLANG_SIMULATOR_ENABLE_VLLM_HOOK=1`（或 `SGLANG_SIMULATOR_ENABLE_HOOK=1`）才安装 vLLM 调度/Worker 劫持 hook。CPU 环境的 RDMA 依赖由 `SRPC_STREAM_DISABLE_RDMA=1` 直接解决：该环境变量由 v6d 的 `libsrpc_stream_engine.so` 原生支持，设置后 SRPC 不再加载 `libsrpc_barex_bridge.so`（即 `libcuda.so.1`/`libibverbs` 依赖的来源），以 TCP-only 模式运行，无需再在 Python 层劫持 `init_srpc*`。`SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1` 现在仅用于在仿真进程内 `setdefault` 该环境变量（守护作用）。子进程会继承环境变量，因此 EngineCore/Worker 与 dashllm 拉起的 v6d 子进程都自动生效，同时不会影响未设置这些变量的其他服务。
 
 ---
 
@@ -195,6 +196,7 @@ export SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1
 export PYTHONPATH="/root/workspace/sglang-dev/tools/sglang-simulator:${PYTHONPATH:-}"
 export SGLANG_SIMULATOR_ENABLE_VLLM_HOOK=1
 export SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1
+export SRPC_STREAM_DISABLE_RDMA=1
 export DS_MODEL_PRELOAD_TO_SHM=0
 export SGLANG_SIMULATOR_OUTPUT_MODE=BLOCKING
 export SGLANG_SIMULATOR_CONFIG_PATH="/home/admin/hisim/config.json"
@@ -301,7 +303,7 @@ LOCAL_CACHE_REBUILD_TRIGGERED
 | `OSError: port 8001 already in use` | 残留进程未清理 | `pkill -9 -f dashservingd` |
 | V6D etcd 连接失败 | `V6D_ETCD_ENDPOINT` 未设置或不可达 | 检查 etcd 服务是否存活 |
 | dashllm 未自动拉起 v6d | 缺少 `KVS_METASERVICE_REDIS_URI` 或 `DS_LLM_LAUNCH_V6D!=1` | 用 dashctl/env 注入 `KVS_METASERVICE_REDIS_URI`，并保持 `REQUIRE_REAL_V6D_IPC=1` fail-fast |
-| v6d CPU 环境报 `libcuda.so.1` | 未启用 `SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1` 或 `PYTHONPATH` 未包含工作目录 | 同时设置 `PYTHONPATH=/root/workspace/sglang-dev/tools/sglang-simulator:${PYTHONPATH:-}` 与 `SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1` |
+| v6d CPU 环境报 `libcuda.so.1` | 未设置 `SRPC_STREAM_DISABLE_RDMA=1`，SRPC 尝试加载 barex/RDMA | `export SRPC_STREAM_DISABLE_RDMA=1`（v6d so 库原生支持，TCP-only 模式） |
 
 ---
 

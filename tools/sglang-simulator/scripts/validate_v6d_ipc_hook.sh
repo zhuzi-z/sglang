@@ -19,6 +19,7 @@ BASE_RPC_PORT=$((31000 + ($$ % 1000)))
 
 export PYTHONPATH="${SIMULATOR_PATH}:${PYTHONPATH:-}"
 export SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1
+export SRPC_STREAM_DISABLE_RDMA=1
 
 log() {
   echo "[validate_v6d_ipc_hook] $*"

@@ -41,6 +41,7 @@ URL_A = f"http://127.0.0.1:{V6D_PORT}"
 V6D_ENV = {
     **os.environ,
     "LD_LIBRARY_PATH": LIB_DIR + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
+    "SRPC_STREAM_DISABLE_RDMA": "1",
     "SGLANG_SIMULATOR_V6D_CAPACITY_CONTROL": "1",
 }
 

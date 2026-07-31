@@ -4,13 +4,19 @@ V6D Virtual Capacity Manager — C_VineyardServerHook + runtime patches.
 This module consolidates ALL v6d-side simulation hooks needed to run a
 vineyardd process on CPU without RDMA:
 
-1. **SRPC bypass** — ``init_srpc*`` → no-op, ``init_transfer_engine_client``
-   → ``init_mmap`` only (shared-memory IPC, no RDMA).
+1. **SRPC bypass** — sets ``SRPC_STREAM_DISABLE_RDMA=1`` (the SRPC engine
+   natively skips barex/RDMA and runs TCP-only, no libcuda dependency)
+   and no-ops ``init_srpc_transfer``.  The latter is still required
+   because the ``-2M_alignment=false`` patch below makes the mmap size a
+   non-2MB multiple, which real SRPC memory registration rejects with
+   ``SRPC_STREAM_ERROR_MEM_ALIGN_ERROR``.  The sim daemon never uses the
+   SRPC data plane, so skipping registration is safe.
 2. **VineyardPeer rpc=false + 4K alignment + capacity extraction** —
    inject ``-rpc=false`` and replace ``-2M_alignment=true`` with
    ``-2M_alignment=false`` in argv.  Also extracts ``--vineyard-size``
-   from argv to initialise virtual capacity.  The C++ barex SRPC init
-   is skipped while P2P tracker (Redis) discovery is preserved.
+   from argv to initialise virtual capacity.  ``-rpc=false`` prevents the
+   C++ SRPC server from registering the 4K-aligned mmap (same alignment
+   constraint as above) while P2P tracker (Redis) discovery is preserved.
 3. **Virtual capacity control** — ``C_VineyardServerHook`` patches four
    ``VineyardServer`` methods.  ``get_memory_usage`` returns virtual
    ``(used, total)``; ``create_blobs`` / ``create_blob`` check virtual
@@ -321,49 +327,38 @@ class VirtualCapacityManager:
 
 
 # ---------------------------------------------------------------------------
-# 1. SRPC bypass — no-op all SRPC init entrypoints
+# 1. SRPC bypass — disable RDMA + skip daemon-side memory registration
 # ---------------------------------------------------------------------------
 
 def patch_srpc_bypass():
-    """Replace all SRPC init functions with no-ops.
+    """Disable RDMA in the SRPC engine and skip daemon-side registration.
 
-    Patches ``v6d.common.transfer`` and ``v6d.lite.common.transfer_engine``
-    so that ``init_srpc*`` → no-op and ``init_transfer_engine_client`` →
-    ``init_mmap`` (shared-memory IPC only, no RDMA).
+    ``SRPC_STREAM_DISABLE_RDMA=1`` is understood natively by
+    ``libsrpc_stream_engine.so``: barex/RDMA (and its libcuda/ibverbs
+    dependencies) are never loaded and SRPC runs TCP-only.  This replaces
+    the former blanket no-op patching of all ``init_srpc*`` entrypoints.
+
+    ``init_srpc_transfer`` (called by ``VineyardPeer.__init__``) is still
+    no-op'd: with the sim's ``-2M_alignment=false`` argv patch the mmap
+    size is not a 2MB multiple, and real SRPC memory registration fails
+    with ``SRPC_STREAM_ERROR_MEM_ALIGN_ERROR``.  The sim daemon never
+    transfers blob data over SRPC, so registration is unnecessary.
     """
+    os.environ.setdefault("SRPC_STREAM_DISABLE_RDMA", "1")
+
     import v6d.common.transfer as transfer
 
-    def _skip_srpc(*args, **kwargs):
-        logger.info("[v6d-sim] skip SRPC init")
+    def _skip_srpc_transfer(*args, **kwargs):
+        logger.info("[v6d-sim] skip SRPC memory registration (4K-aligned mmap)")
         return None
 
-    transfer.init_srpc_transfer = _skip_srpc
-    if hasattr(transfer, "init_srpc"):
-        transfer.init_srpc = _skip_srpc
-    if hasattr(transfer, "init_srpc_"):
-        transfer.init_srpc_ = _skip_srpc
+    transfer.init_srpc_transfer = _skip_srpc_transfer
 
-    if hasattr(transfer, "init_mmap") and hasattr(
-        transfer, "init_transfer_engine_client"
-    ):
-        def _init_client(fd: int, size: int):
-            return transfer.init_mmap(fd, size)
-
-        transfer.init_transfer_engine_client = _init_client
-
-    logger.info("[v6d-sim] patched v6d.common.transfer SRPC entrypoints")
-
-    try:
-        import v6d.lite.common.transfer_engine as te
-        if hasattr(te, "init_srpc"):
-            te.init_srpc = _skip_srpc
-        if hasattr(te, "init_srpc_"):
-            te.init_srpc_ = _skip_srpc
-        if hasattr(te, "init_srpc_transfer"):
-            te.init_srpc_transfer = _skip_srpc
-        logger.info("[v6d-sim] patched v6d.lite transfer_engine SRPC entrypoints")
-    except Exception:
-        pass
+    logger.info(
+        "[v6d-sim] SRPC bypass: SRPC_STREAM_DISABLE_RDMA=%s, "
+        "init_srpc_transfer no-op",
+        os.environ["SRPC_STREAM_DISABLE_RDMA"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +369,11 @@ class C_VineyardPeerHook(BaseHook):
     """Hook ``VineyardPeer`` to inject ``-rpc=false``, 4K alignment, and
     extract ``--vineyard-size`` for virtual capacity initialization.
 
-    Skips the C++ SRPC barex initialization while preserving P2P
-    tracker (Redis) discovery capability.  Replaces ``-2M_alignment=true``
+    ``-rpc=false`` keeps the C++ SRPC server from registering the mmap:
+    with 4K alignment the mmap size is not a 2MB multiple and SRPC
+    registration would abort the process (RDMA itself is already disabled
+    via ``SRPC_STREAM_DISABLE_RDMA=1``).  P2P tracker (Redis) discovery
+    is preserved.  Replaces ``-2M_alignment=true``
     with ``-2M_alignment=false`` so the C++ mmap uses 4K page alignment,
     maximising the number of physical blocks available.  This ensures
     virtual capacity (our hook) is always the eviction bottleneck, not
@@ -406,7 +404,7 @@ class C_VineyardPeerHook(BaseHook):
         ):
             patched_argv = list(argv) if argv is not None else None
             if patched_argv is not None:
-                # Inject -rpc=false (skip C++ barex SRPC init)
+                # Inject -rpc=false (4K-aligned mmap cannot be SRPC-registered)
                 if not any(a.startswith("-rpc=") for a in patched_argv):
                     patched_argv.append("-rpc=false")
                     argc = len(patched_argv)
