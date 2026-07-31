@@ -86,37 +86,15 @@ logger = logging.getLogger("sglang_simulator")
 
 _ENV_ENABLE = "SGLANG_SIMULATOR_V6D_CAPACITY_CONTROL"
 _ENV_LOGICAL_CAPACITY = "SGLANG_SIMULATOR_V6D_LOGICAL_CAPACITY"
-_ENV_SCALE_FACTOR = "SGLANG_SIMULATOR_V6D_CAPACITY_SCALE_FACTOR"
 
 _DEFAULT_CAPACITY = 1 << 30   # 1 GB (default virtual capacity)
 
 _REAL_MEMORY_ARG = "1G"       # Real mmap size passed to C++ backend
 _REAL_BLOB_SIZE = 4096        # Real allocation per blob in C++ backend (4K)
 
-
-def _get_capacity_scale_factor() -> int:
-    """Read the capacity scale factor from env var.
-
-    When head_dim=1 is injected (simulation), vLLM sends scaled-down blob
-    sizes to v6d. This factor multiplies them back to real sizes so that
-    --vineyard-size can be set to the real HBM capacity (e.g. 800G) and
-    eviction decisions match the real scenario.
-
-    Default: 1 (no scaling, sizes used as-is).
-    Set to the head_dim reduction ratio (e.g. 256) to restore real sizes.
-    """
-    raw = os.environ.get(_ENV_SCALE_FACTOR, "").strip()
-    if not raw:
-        return 1
-    try:
-        factor = int(raw)
-        if factor < 1:
-            logger.warning("[V6D Capacity] invalid %s=%r, using 1", _ENV_SCALE_FACTOR, raw)
-            return 1
-        return factor
-    except ValueError:
-        logger.warning("[V6D Capacity] invalid %s=%r, using 1", _ENV_SCALE_FACTOR, raw)
-        return 1
+# NOTE: declared sizes are real model sizes natively — the sim keeps the
+# real head_dim in the KV cache spec (physical allocation is MINIMAL),
+# so no size scaling exists anywhere.  v6d only sees plain data blocks.
 
 _SIZE_PATTERN = re.compile(r"^(\d+(?:\.\d+)?)\s*([KMGTP]?B?)$", re.IGNORECASE)
 _SIZE_MULTIPLIERS = {
@@ -543,20 +521,15 @@ class C_VineyardServerHook(BaseHook):
             """Return virtual (used, total) — drives eviction decisions."""
             return manager.get_usage()
 
-        scale_factor = _get_capacity_scale_factor()
-
         def patched_create_blobs(
             self, sizes: list[int], request_id: str = ""
         ) -> list:
-            """Check virtual capacity with scaled sizes; allocate 4K per blob in C++.
+            """Check virtual capacity with declared sizes; allocate 4K per blob.
 
-            When scale_factor > 1, incoming sizes are scaled-down values
-            (e.g. head_dim=1). We multiply by scale_factor to restore real
-            sizes for capacity tracking, so --vineyard-size can be the real
-            HBM capacity.
+            Sizes arrive already in real units (the KV cache spec keeps
+            the real head_dim; physical blob allocation stays 4K).
             """
-            scaled_sizes = [s * scale_factor for s in sizes]
-            total_bytes = sum(scaled_sizes)
+            total_bytes = sum(sizes)
             if not manager.try_allocate(total_bytes):
                 used, total = manager.get_usage()
                 raise NotEnoughMemoryException(
@@ -568,29 +541,27 @@ class C_VineyardServerHook(BaseHook):
             # C++ backend allocates 4K per blob (not the virtual size)
             real_sizes = [_REAL_BLOB_SIZE] * len(sizes)
             payloads = original_create_blobs(self, real_sizes, request_id)
-            manager.record_allocate(scaled_sizes)
-            if scale_factor > 1:
-                logger.info(
-                    "[V6D Capacity] create_blobs: %d blobs, sim_size=%d, "
-                    "real_size=%d (scale=%dx), total_used=%d/%d",
-                    len(sizes), sum(sizes), total_bytes, scale_factor,
-                    manager.get_usage()[0], manager.get_usage()[1],
-                )
+            manager.record_allocate(sizes)
+            logger.debug(
+                "[V6D Capacity] create_blobs: %d blobs, declared=%d, "
+                "total_used=%d/%d",
+                len(sizes), total_bytes,
+                manager.get_usage()[0], manager.get_usage()[1],
+            )
             return payloads
 
         def patched_create_blob(self, size: int, request_id: str = ""):
-            """Check virtual capacity with scaled size; allocate 4K in C++."""
-            scaled_size = size * scale_factor
-            if not manager.try_allocate(scaled_size):
+            """Check virtual capacity with declared size; allocate 4K in C++."""
+            if not manager.try_allocate(size):
                 used, total = manager.get_usage()
                 raise NotEnoughMemoryException(
                     f"Virtual capacity exceeded: used={used}, "
-                    f"requested={scaled_size} (1 blob), "
+                    f"requested={size} (1 blob), "
                     f"total={total}, "
-                    f"deficit={used + scaled_size - total}"
+                    f"deficit={used + size - total}"
                 )
             payload = original_create_blob(self, _REAL_BLOB_SIZE, request_id)
-            manager.record_allocate([scaled_size])
+            manager.record_allocate([size])
             return payload
 
         def patched_drop_names(self, names, request_id: str = ""):
@@ -613,9 +584,8 @@ class C_VineyardServerHook(BaseHook):
         logger.info(
             "[V6D Capacity] C_VineyardServerHook installed: "
             "get_memory_usage, create_blob, create_blobs, drop_names "
-            "(capacity=%d MB, scale_factor=%dx, actual-size tracking)",
+            "(capacity=%d MB, declared-size tracking)",
             manager._total // (1 << 20),
-            scale_factor,
         )
 
 

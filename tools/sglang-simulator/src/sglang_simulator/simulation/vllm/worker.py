@@ -2,10 +2,12 @@
 vLLM Worker Hook - Hijacks the Worker class at the worker level only.
 
 V6D-aware simulation strategy (merged from feat/vllm-pai + V6D additions):
-- Inject head_dim=1 to shrink KV cache data volume (~128x reduction)
+- Keep the real head_dim: physical KV allocation is MINIMAL (1 page per
+  tensor) and v6d blobs are fixed 4K, so page sizes are accounting-only
+  and can stay at real model values (no scale factor needed anywhere)
 - Use real num_kv_heads so V6D page_size matches production structure
 - No GPUModelRunner construction (avoids all CUDA dependencies)
-- KV cache spec built from HF config with head_dim=1
+- KV cache spec built from HF config with real head_dim
 - Mock execute_model output with KV connector lifecycle
 """
 
@@ -37,44 +39,13 @@ def _noop(*args, **kwargs):
     return None
 
 
-def _inject_head_dim(vllm_config):
-    """Inject head_dim=1 into HF config.
-
-    This propagates through the entire system:
-    - model_config.get_head_size() -> returns 1
-    - FullAttentionSpec.page_size_bytes -> shrinks ~128x
-    - V6D _compute_group_block_bytes -> uses same small page_size
-    - KV cache allocation -> tiny CPU tensors
-    """
-    model_config = vllm_config.model_config
-    hf_config = model_config.hf_text_config
-
-    config_head_dim = getattr(hf_config, "head_dim", None)
-    computed_head_dim = (
-        hf_config.hidden_size // hf_config.num_attention_heads
-    )
-    # Use the larger value as effective head_dim for reduction ratio
-    original_head_dim = max(config_head_dim or 0, computed_head_dim)
-
-    hf_config.head_dim = 1
-    logger.info(
-        "[V6D Hijack] Injected head_dim=1 "
-        "(config_head_dim=%s, computed_head_dim=%d, "
-        "effective_original=%d, reduction=%dx)",
-        config_head_dim,
-        computed_head_dim,
-        original_head_dim,
-        original_head_dim,
-    )
-    return original_head_dim
-
-
 def _build_kv_cache_spec(vllm_config) -> dict:
-    """Build KV cache spec from HF model config with head_dim=1.
+    """Build KV cache spec from HF model config with the real head_dim.
 
-    Uses REAL num_kv_heads from the model config so that V6D object layout
-    (page_size_bytes) matches between scheduler and worker sides.
-    head_size=1 is the injected value from _inject_head_dim().
+    Uses REAL num_kv_heads and head_size so that V6D object layout
+    (page_size_bytes) matches the production server exactly — declared
+    sizes need no scale compensation.  Physical allocation stays MINIMAL
+    (1 page per tensor), so real page sizes cost no memory.
 
     Handles both pure-MHA models and hybrid models (e.g. Qwen3.5 with
     full_attention + linear_attention layers).
@@ -115,8 +86,13 @@ def _build_kv_cache_spec(vllm_config) -> dict:
                                      hf_config.num_attention_heads)
     num_kv_heads = max(total_num_kv_heads // tp_size, 1)
 
-    # head_size=1 (injected by _inject_head_dim)
-    head_size = 1
+    # Real head_size from the model config (page sizes are accounting-only)
+    if hasattr(model_config, "get_head_size"):
+        head_size = model_config.get_head_size()
+    else:
+        head_size = getattr(hf_config, "head_dim", None) or (
+            hf_config.hidden_size // hf_config.num_attention_heads
+        )
 
     block_size = cache_config.block_size
     dtype = model_config.dtype
@@ -267,9 +243,6 @@ class C_VLLMWorkerHook(BaseHook):
                     "gloo",
                 )
             set_random_seed(self.vllm_config.model_config.seed)
-
-            # Inject head_dim=1 for V6D simulation
-            _inject_head_dim(self.vllm_config)
 
             self.device = torch.device("cpu")
 

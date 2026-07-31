@@ -51,6 +51,22 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
             try:
                 import asyncio
                 import time
+
+                from vllm import envs
+
+                # Upstream pairs this notification with the scheduler-side
+                # handler registration, both gated on VLLM_V6D_ASYNC_REGISTER
+                # (v6d_object_backend registers _V6D_READY_REQ only then).
+                # In sync mode the scheduler is ready by default; sending
+                # anyway hits "rpc unknown head" and the RpcServer closes the
+                # pooled connection, poisoning io_done traffic.
+                if not envs.VLLM_V6D_ASYNC_REGISTER:
+                    logger.info(
+                        "[V6D Hijack] skip CPU v6d ready notification "
+                        "(sync register mode, scheduler ready by default)"
+                    )
+                    return
+
                 from vllm.v1.hybrid_connector import IoDoneReqs, hybridworker
                 from vllm.v1.hybrid_connector.engine_proxy import get_hybrid_worker_loop
                 from vllm.v1.hybrid_connector.utils import kill_me_if_exception

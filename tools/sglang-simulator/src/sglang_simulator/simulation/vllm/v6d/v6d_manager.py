@@ -27,6 +27,7 @@ from sglang_simulator.utils import get_logger
 
 logger = get_logger()
 
+
 # All live V6dObjectManager instances (registered in override_init).
 # Needed by reset_all_sim_v6d_managers() to flush connector-side caches
 # (_cached_objs / _pending_objs) when the bench clears cache state via
@@ -597,11 +598,36 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
         target.request_finished = override_request_finished
         target.request_finished_all_groups = override_request_finished_all_groups
 
+        original_cross_group_batch_allocate = getattr(
+            target, "_cross_group_batch_allocate", None
+        )
+
         def override_cross_group_batch_allocate(
             self,
             group_candidates,
             request_id=None,
         ):
+            # Prefer the upstream merged path: all groups collected into ONE
+            # client.create() call (the daemon then logs a single
+            # BATCH_CREATE n=6 per request, matching the real server).
+            client = None
+            if getattr(self, "managers", None):
+                client = next(iter(self.managers.values())).client
+            if client is not None and original_cross_group_batch_allocate is not None:
+                result = original_cross_group_batch_allocate(
+                    self, group_candidates, request_id=request_id
+                )
+                logger.info(
+                    "[V6D RPC Bypass] cross_group_batch_allocate(merged): "
+                    "groups=%s blobs=%d req=%s",
+                    sorted(result),
+                    sum(len(v) for v in result.values()),
+                    request_id,
+                )
+                return result
+
+            # Fallback: daemon not connected — per-group loop so the
+            # manager-level batch_allocate bypass can hand out local keys.
             result = {}
             for group_id, candidate_hashes in group_candidates.items():
                 if not candidate_hashes:
@@ -617,17 +643,11 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                     request_id=request_id,
                 )
             logger.info(
-                "[V6D RPC Bypass] cross_group_batch_allocate: groups=%s req=%s",
+                "[V6D RPC Bypass] cross_group_batch_allocate(fallback): "
+                "groups=%s req=%s",
                 sorted(result),
                 request_id,
             )
-            for gid in sorted(result):
-                bb, _ = self._group_block_bytes[gid]
-                logger.info(
-                    "[V6D RPC Bypass] block_size group=%d: block_bytes=%d (%.1f KB), blobs=%d, total=%d bytes",
-                    gid, bb, bb / 1024.0,
-                    len(result[gid]), bb * len(result[gid]),
-                )
             return result
 
         target._cross_group_batch_allocate = override_cross_group_batch_allocate

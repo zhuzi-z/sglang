@@ -81,72 +81,21 @@ class TestDummyPrimitives:
 
 
 # ============================================================
-# Test 2: head_dim injection
-# ============================================================
-
-class TestHeadDimInjection:
-    """Test _inject_head_dim modifies HF config correctly."""
-
-    def _make_mock_vllm_config(self, head_dim=128, num_attention_heads=32):
-        hf_config = SimpleNamespace(
-            head_dim=head_dim,
-            hidden_size=head_dim * num_attention_heads,
-            num_attention_heads=num_attention_heads,
-        )
-        model_config = SimpleNamespace(hf_text_config=hf_config)
-        return SimpleNamespace(model_config=model_config)
-
-    def test_inject_head_dim_sets_to_one(self):
-        from sglang_simulator.simulation.vllm.worker import _inject_head_dim
-
-        vllm_config = self._make_mock_vllm_config(head_dim=128)
-        original = _inject_head_dim(vllm_config)
-
-        assert original == 128
-        assert vllm_config.model_config.hf_text_config.head_dim == 1
-
-    def test_inject_head_dim_fallback_no_head_dim_attr(self):
-        """When hf_config has no head_dim, compute from hidden_size/num_heads."""
-        from sglang_simulator.simulation.vllm.worker import _inject_head_dim
-
-        hf_config = SimpleNamespace(
-            hidden_size=4096,
-            num_attention_heads=32,
-        )
-        model_config = SimpleNamespace(hf_text_config=hf_config)
-        vllm_config = SimpleNamespace(model_config=model_config)
-
-        original = _inject_head_dim(vllm_config)
-        assert original == 128  # 4096 / 32
-        assert hf_config.head_dim == 1
-
-    def test_inject_head_dim_idempotent(self):
-        """Calling inject twice should still result in head_dim=1."""
-        from sglang_simulator.simulation.vllm.worker import _inject_head_dim
-
-        vllm_config = self._make_mock_vllm_config(head_dim=128)
-        _inject_head_dim(vllm_config)
-        # Second call: head_dim is already 1
-        original = _inject_head_dim(vllm_config)
-        assert original == 1
-        assert vllm_config.model_config.hf_text_config.head_dim == 1
-
-
-# ============================================================
 # Test 3: _build_kv_cache_spec
 # ============================================================
 
 class TestBuildKVCacheSpec:
-    """Test KV cache spec construction with head_dim=1."""
+    """Test KV cache spec construction with the real head_dim."""
 
     def _make_vllm_config(
-        self, num_layers=28, num_kv_heads=4, block_size=16, tp_size=1
+        self, num_layers=28, num_kv_heads=4, block_size=16, tp_size=1,
+        head_dim=128,
     ):
         hf_config = SimpleNamespace(
             num_hidden_layers=num_layers,
             num_key_value_heads=num_kv_heads,
             num_attention_heads=32,
-            head_dim=1,  # Already injected
+            head_dim=head_dim,  # real model head_dim, no injection
         )
         model_config = SimpleNamespace(
             hf_text_config=hf_config,
@@ -175,7 +124,7 @@ class TestBuildKVCacheSpec:
         assert len(spec) == 28
 
     def test_spec_uses_real_num_kv_heads(self):
-        """Spec should use real num_kv_heads (not 1)."""
+        """Spec should use real num_kv_heads and real head_size."""
         from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
 
         vllm_config = self._make_vllm_config(num_kv_heads=8, tp_size=1)
@@ -183,7 +132,7 @@ class TestBuildKVCacheSpec:
 
         first_spec = list(spec.values())[0]
         assert first_spec.num_kv_heads == 8
-        assert first_spec.head_size == 1
+        assert first_spec.head_size == 128
 
     def test_spec_with_tp_sharding(self):
         """With TP=4 and num_kv_heads=8, per-TP should be 2."""
@@ -201,8 +150,8 @@ class TestBuildKVCacheSpec:
         first_spec = list(spec.values())[0]
         assert first_spec.num_kv_heads == 2  # 8 / 4
 
-    def test_spec_page_size_is_tiny(self):
-        """With head_size=1, page_size should be very small."""
+    def test_spec_page_size_is_real(self):
+        """With real head_size, page_size should match the real layout."""
         from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
 
         vllm_config = self._make_vllm_config(
@@ -212,8 +161,8 @@ class TestBuildKVCacheSpec:
 
         first_spec = list(spec.values())[0]
         # page_size = 2 * block_size * num_kv_heads * head_size * dtype_size
-        # = 2 * 16 * 8 * 1 * 2 (fp16) = 512 bytes
-        assert first_spec.page_size_bytes == 512
+        # = 2 * 16 * 8 * 128 * 2 (fp16) = 65536 bytes
+        assert first_spec.page_size_bytes == 65536
 
     def test_spec_layer_name_format(self):
         """Layer names should follow model.layers.{i} format."""
@@ -237,7 +186,7 @@ class TestBuildKVCacheSpec:
             num_hidden_layers=4,
             num_key_value_heads=4,
             num_attention_heads=32,
-            head_dim=1,
+            head_dim=128,
             layer_types=[
                 "full_attention",
                 "linear_attention",

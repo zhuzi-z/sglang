@@ -68,29 +68,15 @@ def _patch_v6d_ops():
             layer_gpu_tensor_ptrs, cpu_block_tensor_ptrs,
             page_size, gpu_block_ids, swap_in
         ):
-            """CPU memcpy replacement for CUDA DMA kernel.
+            """No-op replacement for the CUDA DMA kernel.
 
-            With head_dim=1, page_size is tiny (~bytes to KB),
-            so CPU memcpy overhead is negligible.
+            KV tensors are MINIMAL (1 page, 4096 bytes) while page_size
+            is the real model value, so pointer arithmetic
+            (base + block_id * page_size) points outside the allocation
+            — an actual memmove would corrupt memory.  Simulation never
+            reads KV data contents, so no copy is needed.
             """
-            import ctypes
-
-            num_blocks = gpu_block_ids.numel()
-            num_layers = layer_gpu_tensor_ptrs.numel()
-
-            for i in range(num_blocks):
-                cpu_base = cpu_block_tensor_ptrs[i].item()
-                block_id = gpu_block_ids[i].item()
-
-                for layer_idx in range(num_layers):
-                    layer_ptr = layer_gpu_tensor_ptrs[layer_idx].item()
-                    kv_ptr = layer_ptr + block_id * page_size
-                    obj_ptr = cpu_base + layer_idx * page_size
-
-                    if swap_in:
-                        ctypes.memmove(kv_ptr, obj_ptr, page_size)
-                    else:
-                        ctypes.memmove(obj_ptr, kv_ptr, page_size)
+            return None
 
         ops.v6d_swap_blocks = mock_v6d_swap_blocks
         ops.v6d_register_host_memory = lambda base_addr, size: None

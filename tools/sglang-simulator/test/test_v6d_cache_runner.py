@@ -273,64 +273,19 @@ class TestV6dCacheMultiNode:
         runner2.shutdown()
 
 
-class TestV6dHeadDimReduction:
-    """Verify head_dim=1 correctly reduces data volume."""
+class TestV6dRealHeadDimSpec:
+    """Verify KV cache spec uses real head_dim (no size mocking).
 
-    def test_kv_cache_tensor_size_is_tiny(self):
-        """Allocated KV cache tensors should be ~128x smaller than original."""
-        from sglang_simulator.simulation.vllm.worker import (
-            _inject_head_dim, _build_kv_cache_spec,
-        )
+    Physical allocation is MINIMAL (1 page per tensor), so real page
+    sizes cost no memory while making declared v6d object sizes match
+    the production server without any scale factor.
+    """
+
+    def _make_vllm_config(self):
         from types import SimpleNamespace
+        import torch
 
         # Simulate Qwen3-0.6B: 28 layers, 8 kv_heads, head_dim=128
-        hf_config = SimpleNamespace(
-            num_hidden_layers=28,
-            num_key_value_heads=8,
-            num_attention_heads=16,
-            head_dim=128,
-            hidden_size=2048,
-        )
-        model_config = SimpleNamespace(
-            hf_text_config=hf_config,
-            dtype="float16",
-        )
-        cache_config = SimpleNamespace(
-            block_size=16,
-            mamba_block_size=None,
-        )
-        parallel_config = SimpleNamespace(tensor_parallel_size=1)
-        vllm_config = SimpleNamespace(
-            model_config=model_config,
-            cache_config=cache_config,
-            parallel_config=parallel_config,
-        )
-
-        # Before injection: compute expected page_size
-        # page_size = 2 * 16 * 8 * 128 * 2 = 65536 bytes
-        original_page_size = 2 * 16 * 8 * 128 * 2
-
-        # Inject head_dim=1
-        _inject_head_dim(vllm_config)
-
-        # Build spec
-        import torch
-        vllm_config.model_config.dtype = torch.float16
-        spec = _build_kv_cache_spec(vllm_config)
-
-        # After injection: page_size = 2 * 16 * 8 * 1 * 2 = 512 bytes
-        first_spec = list(spec.values())[0]
-        assert first_spec.page_size_bytes == 512
-        assert original_page_size / first_spec.page_size_bytes == 128
-
-    def test_total_kv_cache_memory_is_small(self):
-        """With head_dim=1 and 200 blocks, total memory should be < 10 MB."""
-        from sglang_simulator.simulation.vllm.worker import (
-            _inject_head_dim, _build_kv_cache_spec,
-        )
-        from types import SimpleNamespace
-        import torch
-
         hf_config = SimpleNamespace(
             num_hidden_layers=28,
             num_key_value_heads=8,
@@ -347,24 +302,40 @@ class TestV6dHeadDimReduction:
             mamba_block_size=None,
         )
         parallel_config = SimpleNamespace(tensor_parallel_size=1)
-        vllm_config = SimpleNamespace(
+        return SimpleNamespace(
             model_config=model_config,
             cache_config=cache_config,
             parallel_config=parallel_config,
         )
 
-        _inject_head_dim(vllm_config)
+    def test_spec_page_size_matches_real_model(self):
+        """page_size_bytes should equal the real model layout."""
+        from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
+
+        vllm_config = self._make_vllm_config()
+        spec = _build_kv_cache_spec(vllm_config)
+
+        # page_size = 2(K+V) * block 16 * 8 kv_heads * head 128 * fp16(2B)
+        expected_page_size = 2 * 16 * 8 * 128 * 2
+        first_spec = list(spec.values())[0]
+        assert first_spec.page_size_bytes == expected_page_size
+        assert first_spec.head_size == 128
+
+    def test_declared_total_matches_real_capacity_math(self):
+        """Declared bytes (spec x blocks) follow real capacity accounting."""
+        from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
+
+        vllm_config = self._make_vllm_config()
         spec = _build_kv_cache_spec(vllm_config)
 
         num_blocks = 200
         total_bytes = sum(
             s.page_size_bytes * num_blocks for s in spec.values()
         )
-        total_mb = total_bytes / (1024 * 1024)
-
-        # 28 layers * 512 bytes/block * 200 blocks = 2.8 MB
-        assert total_mb < 10, f"Total KV cache too large: {total_mb:.2f} MB"
-        assert total_mb > 1, f"Total KV cache suspiciously small: {total_mb:.2f} MB"
+        # 28 layers * 65536 bytes/block * 200 blocks = 350 MiB declared;
+        # physical allocation stays MINIMAL regardless of this value.
+        expected = 28 * (2 * 16 * 8 * 128 * 2) * num_blocks
+        assert total_bytes == expected
 
 
 if __name__ == "__main__":
