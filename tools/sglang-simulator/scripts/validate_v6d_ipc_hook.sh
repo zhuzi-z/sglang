@@ -18,7 +18,6 @@ BASE_PORT=$((19000 + ($$ % 1000)))
 BASE_RPC_PORT=$((31000 + ($$ % 1000)))
 
 export PYTHONPATH="${SIMULATOR_PATH}:${PYTHONPATH:-}"
-export SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1
 export SRPC_STREAM_DISABLE_RDMA=1
 
 log() {
@@ -112,7 +111,7 @@ try:
         args="--peer=tiered_vineyard --vineyard-size=" + os.environ.get("V6D_SIZE", "256M"),
         envs_to_update={
             "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
-            "SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK": "1",
+            "SRPC_STREAM_DISABLE_RDMA": "1",
         },
         log_fp=log_fp,
         is_rank_0=True,

@@ -58,8 +58,6 @@ V6D_ENV = {
     "LD_LIBRARY_PATH": LIB_DIR + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
     "PYTHONPATH": SIM_ROOT + ":" + os.environ.get("PYTHONPATH", ""),
     "SRPC_STREAM_DISABLE_RDMA": "1",
-    "SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK": "1",
-    "SGLANG_SIMULATOR_V6D_CAPACITY_CONTROL": "1",
 }
 
 # --------------------------------------------------------------------------

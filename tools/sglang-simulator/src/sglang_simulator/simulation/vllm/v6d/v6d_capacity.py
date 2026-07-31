@@ -64,9 +64,9 @@ Enables both eviction paths in ``TieredVineyardPeer``:
 
 Configuration:
 
-  ``SGLANG_SIMULATOR_V6D_CAPACITY_CONTROL=1``
-      Enable virtual capacity control (SRPC bypass and VineyardPeer patch
-      are always applied by ``install_v6d_runtime_hooks()``).
+  Capacity control is always active once ``install_v6d_runtime_hooks()``
+  is called — using the simulation hooks implies virtual capacity
+  hijacking; no opt-in env var is needed.
 
   ``SGLANG_SIMULATOR_V6D_LOGICAL_CAPACITY``
       Optional override for virtual total capacity in bytes.  When unset,
@@ -90,7 +90,6 @@ logger = logging.getLogger("sglang_simulator")
 # Constants
 # ---------------------------------------------------------------------------
 
-_ENV_ENABLE = "SGLANG_SIMULATOR_V6D_CAPACITY_CONTROL"
 _ENV_LOGICAL_CAPACITY = "SGLANG_SIMULATOR_V6D_LOGICAL_CAPACITY"
 
 _DEFAULT_CAPACITY = 1 << 30   # 1 GB (default virtual capacity)
@@ -453,10 +452,6 @@ class C_VineyardPeerHook(BaseHook):
 # 3. C_VineyardServerHook — virtual memory capacity control
 # ---------------------------------------------------------------------------
 
-def _env_enabled(name: str) -> bool:
-    return os.environ.get(name, "").lower() in ("1", "true", "yes")
-
-
 class C_VineyardServerHook(BaseHook):
     """Hook ``VineyardServer`` to enforce virtual memory capacity.
 
@@ -489,10 +484,6 @@ class C_VineyardServerHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        if not _env_enabled(_ENV_ENABLE):
-            logger.debug("[V6D Capacity] %s not set, skipping hook", _ENV_ENABLE)
-            return
-
         try:
             from v6d.common.exceptions import NotEnoughMemoryException
         except ImportError:
@@ -612,10 +603,9 @@ def install_v6d_runtime_hooks():
       1. C_VineyardPeerHook (inject ``-rpc=false`` + ``-2M_alignment=false``
          via class hook; also extracts ``--vineyard-size`` from argv for
          virtual capacity initialization)
-      2. SRPC bypass (``patch_srpc_bypass``)
-
-    Conditionally applies (when ``SGLANG_SIMULATOR_V6D_CAPACITY_CONTROL=1``):
-      3. C_VineyardServerHook (virtual memory capacity control)
+      2. C_VineyardServerHook (virtual memory capacity control — using
+         the simulation hooks implies capacity hijacking, no opt-in)
+      3. SRPC bypass (``patch_srpc_bypass``)
 
     Virtual capacity is resolved at runtime from ``--vineyard-size`` in
     the v6d serve CLI args (extracted in ``C_VineyardPeerHook`` when
@@ -628,11 +618,6 @@ def install_v6d_runtime_hooks():
     """
     from sglang_simulator.hook import install_class_hooks
 
-    hooks = [C_VineyardPeerHook]
-    if _env_enabled(_ENV_ENABLE):
-        hooks.append(C_VineyardServerHook)
-        logger.info("[v6d-sim] C_VineyardServerHook enabled")
-
-    install_class_hooks(hooks)
+    install_class_hooks([C_VineyardPeerHook, C_VineyardServerHook])
 
     patch_srpc_bypass()

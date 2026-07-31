@@ -8,7 +8,9 @@ logger = logging.getLogger("sglang_simulator")
 def register_v6d_hooks(hooks: list) -> None:
     """Append V6D native control-plane hooks to the given hook list.
 
-    Called from startup.init_hook() when SGLANG_SIMULATOR_NATIVE_V6D_CONTROL_PLANE=1.
+    Called unconditionally from startup.init_hook(): these are class hooks
+    on vLLM's v6d connector classes and only take effect when a
+    HybridConnector/v6d backend is actually configured.
     """
     from sglang_simulator.simulation.vllm.v6d.v6d_swap import C_V6dSwapHandlerHook
     from sglang_simulator.simulation.vllm.v6d.v6d_backend import (

@@ -114,50 +114,23 @@ class C_VLLMSchedulerHook(BaseHook):
             self._sim_req_created_time = {}
 
             original_init(self, vllm_config, *args, **kwargs)
-            native_v6d_control_plane = os.environ.get(
-                'SGLANG_SIMULATOR_NATIVE_V6D_CONTROL_PLANE', ''
-            ).strip().lower() in {'1', 'true', 'yes', 'on'}
-            if native_v6d_control_plane:
-                logger.info(
-                    '[Scheduler Hook] Native V6D control-plane mode: '
-                    'keeping connector=%s',
-                    type(self.connector).__name__ if self.connector is not None else None,
-                )
-            else:
-                # Ensure the simulator always owns the scheduler connector.
-                # PAI-vLLM may eagerly create a native HybridConnector before the
-                # factory hook is reached; in CPU simulation that path will not
-                # produce MockHybridConnector request-level ownership logs.  Replace
-                # any non-Mock connector so request_finished/get_num_new_matched_tokens
-                # consistently go through V6DCacheStorage(etcd).
-                try:
-                # DEPRECATED: This else-branch installs MockHybridConnector when
-                # NATIVE_V6D_CONTROL_PLANE is not enabled. The legacy MockHybridConnector
-                # path is no longer maintained. Use NATIVE_V6D_CONTROL_PLANE=1 instead.
-                    from sglang_simulator.simulation.vllm.kv_connector import MockHybridConnector
-                    kv_cache_config = None
-                    if hasattr(self, 'kv_cache_config'):
-                        kv_cache_config = self.kv_cache_config
-                    if not isinstance(self.connector, MockHybridConnector):
-                        original_connector = type(self.connector).__name__ if self.connector is not None else None
-                        self.connector = MockHybridConnector(vllm_config, None, kv_cache_config)
-                        logger.info(
-                            '[Scheduler Hook] Installed MockHybridConnector '
-                            '(replaced connector=%s)',
-                            original_connector,
-                        )
-                except Exception as e:
-                    logger.warning('[Scheduler Hook] Failed to install MockHybridConnector: %s', e)
-
-                pass
-            # Share scheduler reference with MockHybridConnector
+            # Native V6D control-plane mode is the only supported path:
+            # the real connector stack stays in place (the legacy
+            # MockHybridConnector replacement has been removed).
+            logger.info(
+                '[Scheduler Hook] Native V6D control-plane mode: '
+                'keeping connector=%s',
+                type(self.connector).__name__ if self.connector is not None else None,
+            )
+            # Share scheduler reference with the sim worker (execute_model
+            # reads scheduler.requests through get_scheduler_ref()).
             try:
                 from sglang_simulator.simulation.vllm.kv_connector import set_scheduler_ref
                 set_scheduler_ref(self)
             except Exception:
                 pass
             # Patch _mamba_block_aligned_split to allow external computed tokens
-            # Required for MockHybridConnector v2 (uses scheduler's
+            # (v6d remote hits arrive as external computed tokens via the
             # get_num_new_matched_tokens -> WAITING_FOR_REMOTE_KVS path)
             try:
                 if hasattr(self, '_mamba_block_aligned_split'):

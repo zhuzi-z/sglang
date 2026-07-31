@@ -1,21 +1,10 @@
-import os
+def init_hook():
+    """Install all SGLang hooks.
 
-
-_TRUE_VALUES = {"1", "true", "yes", "on"}
-
-
-def _env_enabled(*names: str) -> bool:
-    return any(os.environ.get(name, "").strip().lower() in _TRUE_VALUES for name in names)
-
-
-def init_hook(force: bool = False):
-    """Install all SGLang hooks only when explicitly enabled."""
-    if not force and not _env_enabled(
-        "SGLANG_SIMULATOR_ENABLE_HOOK",
-        "SGLANG_SIMULATOR_ENABLE_SGLANG_HOOK",
-    ):
-        return False
-
+    Hooks install unconditionally: this entry is only imported by the
+    simulator's own entrypoints (launch_server / worker), so reaching it
+    already means simulation mode — no opt-in env var gating.
+    """
     import torch
 
     import sglang_simulator.hook as sglang_simulator_hook

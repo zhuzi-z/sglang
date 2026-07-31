@@ -9,18 +9,6 @@ import json
 import os
 
 
-_TRUE_VALUES = {"1", "true", "yes", "on"}
-_FALSE_VALUES = {"0", "false", "no", "off"}
-
-
-def _env_enabled(*names: str) -> bool:
-    return any(os.environ.get(name, "").strip().lower() in _TRUE_VALUES for name in names)
-
-
-def _env_default_enabled(name: str) -> bool:
-    return os.environ.get(name, "1").strip().lower() not in _FALSE_VALUES
-
-
 def _decode_kv_transfer_params(value):
     """Decode explicitly provided kv_transfer_params from request inputs."""
     if value is None:
@@ -233,33 +221,20 @@ def _patch_torch_cuda_for_cpu():
     torch.cuda._lazy_init = _mock_lazy_init
 
 
-def init_hook(force: bool = False):
+def init_hook():
     """Install all vLLM hooks. Must be called before importing vllm.
 
-    The startup entry lives in the project working directory as sitecustomize.py.
-    Python imports it only when that directory is added to PYTHONPATH, and hooks
-    are installed only when explicitly enabled by environment variable. This
-    avoids installing global .pth files or affecting normal vLLM users sharing
-    the same Python environment.
+    Hooks install unconditionally: this entry is only imported by the
+    simulator's own entrypoints (launch_server / vllm_worker), so reaching
+    it already means simulation mode.  No opt-in env var gating — using
+    the hooks implies hijacking.  Normal vLLM users sharing the same
+    Python environment are unaffected because nothing imports this module
+    outside the simulator entrypoints.
     """
-    enable_vllm = _env_enabled(
-        "SGLANG_SIMULATOR_ENABLE_HOOK",
-        "SGLANG_SIMULATOR_ENABLE_VLLM_HOOK",
-    )
-    enable_v6d_ipc = _env_enabled(
-        "SGLANG_SIMULATOR_ENABLE_HOOK",
-        "SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK",
-    )
-    if not force and not (enable_vllm or enable_v6d_ipc):
-        return False
-
     import logging
 
-    if enable_v6d_ipc:
-        from sglang_simulator.simulation.vllm.v6d.ipc_hook import _install_v6d_ipc_hook
-        _install_v6d_ipc_hook()
-    if not force and not enable_vllm:
-        return True
+    from sglang_simulator.simulation.vllm.v6d.ipc_hook import _install_v6d_ipc_hook
+    _install_v6d_ipc_hook()
 
     import sglang_simulator.hook as sglang_simulator_hook
     from sglang_simulator.simulation.vllm import (
@@ -283,10 +258,6 @@ def init_hook(force: bool = False):
     _patch_triton_for_cpu()
     _patch_torch_cuda_for_cpu()
 
-    native_v6d_control_plane = _env_enabled(
-        "SGLANG_SIMULATOR_NATIVE_V6D_CONTROL_PLANE"
-    )
-
     hooks = [
         # Platform hook — intercepts Platform class definition to inject
         # _MockCudaPlatform before any platform detection runs.
@@ -306,12 +277,11 @@ def init_hook(force: bool = False):
         kv_offload.C_VLLMOffloadingConnectorWorkerHook,
     ]
 
-    if native_v6d_control_plane:
-        logging.getLogger('sglang_simulator').info(
-            '[init_hook] Native V6D control-plane mode enabled: '
-            'keeping real KVConnectorFactory and installing V6D CUDA-bypass hooks')
-        from sglang_simulator.simulation.vllm.v6d.hooks import register_v6d_hooks
-        register_v6d_hooks(hooks)
+    # Native V6D control-plane hooks are always registered: they are class
+    # hooks on vLLM's v6d connector classes and only take effect when a
+    # HybridConnector/v6d backend is actually configured.
+    from sglang_simulator.simulation.vllm.v6d.hooks import register_v6d_hooks
+    register_v6d_hooks(hooks)
 
     sglang_simulator_hook.install_class_hooks(hooks)
     _install_dashllm_kv_transfer_hook()

@@ -176,16 +176,14 @@ EOF
 
 ### 3.2 Hook 入口说明
 
-不再向 `/usr/local/lib/python3.12/dist-packages` 写入 `.pth` 文件。hook 入口位于 sglang-simulator 工作目录下的 `sitecustomize.py`，只在启动仿真进程时通过 `PYTHONPATH` 暴露：
+不再向 `/usr/local/lib/python3.12/dist-packages` 写入 `.pth` 文件。hook 通过 sglang_simulator 的仿真入口（`simulation.vllm.launch_server` / `vllm_worker` 等）在 import 时无条件安装——使用仿真入口即意味着劫持，没有 opt-in 开关：
 
 ```bash
 export PYTHONPATH="/root/workspace/sglang-dev/tools/sglang-simulator:${PYTHONPATH:-}"
-export SGLANG_SIMULATOR_ENABLE_VLLM_HOOK=1
-export SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1
 export SRPC_STREAM_DISABLE_RDMA=1
 ```
 
-> **原理：** Python 启动时会从 `PYTHONPATH` 自动导入 `sitecustomize.py`；该入口只有检测到 `SGLANG_SIMULATOR_ENABLE_VLLM_HOOK=1`（或 `SGLANG_SIMULATOR_ENABLE_HOOK=1`）才安装 vLLM 调度/Worker 劫持 hook。CPU 环境的 RDMA 依赖由 `SRPC_STREAM_DISABLE_RDMA=1` 直接解决：该环境变量由 v6d 的 `libsrpc_stream_engine.so` 原生支持，设置后 SRPC 不再加载 `libsrpc_barex_bridge.so`（即 `libcuda.so.1`/`libibverbs` 依赖的来源），以 TCP-only 模式运行，无需再在 Python 层劫持 `init_srpc*`。`SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1` 现在仅用于在仿真进程内 `setdefault` 该环境变量（守护作用）。子进程会继承环境变量，因此 EngineCore/Worker 与 dashllm 拉起的 v6d 子进程都自动生效，同时不会影响未设置这些变量的其他服务。
+> **原理：** hook 入口 `startup.init_hook()` 只被仿真专用 entrypoint 导入并调用，安装即生效（原来的 `SGLANG_SIMULATOR_ENABLE_VLLM_HOOK` / `SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK` / `SGLANG_SIMULATOR_NATIVE_V6D_CONTROL_PLANE` 开关已全部删除）。CPU 环境的 RDMA 依赖由 `SRPC_STREAM_DISABLE_RDMA=1` 直接解决：该环境变量由 v6d 的 `libsrpc_stream_engine.so` 原生支持，设置后 SRPC 不再加载 `libsrpc_barex_bridge.so`（即 `libcuda.so.1`/`libibverbs` 依赖的来源），以 TCP-only 模式运行。init_hook 也会在进程内 `setdefault` 该变量作为守护。子进程会继承环境变量，因此 EngineCore/Worker 与 dashllm 拉起的 v6d 子进程都自动生效；未走仿真入口的普通 vLLM 服务不受任何影响。
 
 ---
 
@@ -194,8 +192,6 @@ export SRPC_STREAM_DISABLE_RDMA=1
 ```bash
 # Serving 阶段额外覆盖
 export PYTHONPATH="/root/workspace/sglang-dev/tools/sglang-simulator:${PYTHONPATH:-}"
-export SGLANG_SIMULATOR_ENABLE_VLLM_HOOK=1
-export SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1
 export SRPC_STREAM_DISABLE_RDMA=1
 export DS_MODEL_PRELOAD_TO_SHM=0
 export SGLANG_SIMULATOR_OUTPUT_MODE=BLOCKING
@@ -248,14 +244,14 @@ DASH_LAUNCH_V6D_CONNECT_OK Client
 
 这表示：
 
-1. `sitecustomize.py` 已通过 `PYTHONPATH` 加载；
-2. `SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1` 已生效；
+1. 仿真 hook 已随 sglang_simulator 入口加载（无需任何 ENABLE 开关）；
+2. `SRPC_STREAM_DISABLE_RDMA=1` 已生效；
 3. 真实 `v6d serve --peer tiered_vineyard` 能在 CPU 环境暴露 vineyard IPC socket；
-4. `dashllm.utils.vineyard.launch_v6d()` 能把 hook 环境传递给 v6d 子进程。
+4. `dashllm.utils.vineyard.launch_v6d()` 能把环境变量传递给 v6d 子进程。
 
 ### 5.2 验证跨节点匹配状态可见
 
-跨节点匹配仍走 `MockHybridConnector + V6DCacheStorage(etcd)` 路径：请求完成后注册 `block_hash -> owner_worker_id`，另一节点查询到 owner 与当前 worker 不同即判定为 remote hit。CPU 仿真命中后不走 SRPC/KVT 大块数据传输，而是触发本地 cache 重建/更新，保持与线上“跨节点共享”语义一致。
+跨节点匹配走 native V6D 控制面路径（真实 HybridConnector 栈 + Redis tracker P2P 发现）：请求完成后 seal 注册 block 归属，另一节点通过 `client.exists()` 查询 tracker 判定 remote hit。CPU 仿真命中后不走 SRPC/KVT 大块数据传输，而是触发本地 cache 重建/更新，保持与线上"跨节点共享"语义一致。
 
 在 Node 1 写入状态：
 

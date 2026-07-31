@@ -79,8 +79,8 @@ def _install_v6d_ipc_hook() -> None:
 # Native V6D control-plane mode keeps the real vLLM connector stack
 # (HybridConnector -> V6dObjectKVTBackend -> V6dObjectBackend/PBackend ->
 # V6dObjectConnectorScheduler/V6dObjectManager) and installs only runtime
-# hijack hooks for CPU-only execution.  The default CPU simulation mode still
-# uses MockHybridConnector + V6DCacheStorage(etcd) for scheduling parity.
+# hijack hooks for CPU-only execution.  It is the only supported mode
+# (the legacy MockHybridConnector path has been removed).
 #
 # This file must not patch DashServing/vLLM source files on disk.  All behavior
 # changes are installed through environment variables and monkey patches

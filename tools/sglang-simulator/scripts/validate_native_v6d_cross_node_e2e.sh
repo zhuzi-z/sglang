@@ -3,10 +3,11 @@
 #
 # This script assumes node1/node2 services are already running with:
 #   PYTHONPATH=<repo>/tools/sglang-simulator
-#   SGLANG_SIMULATOR_ENABLE_VLLM_HOOK=1
-#   SGLANG_SIMULATOR_ENABLE_V6D_IPC_HOOK=1
-#   SGLANG_SIMULATOR_NATIVE_V6D_CONTROL_PLANE=1
+#   SRPC_STREAM_DISABLE_RDMA=1
 #   _SIM_V6D_ACTIVE_WORKER_ID=worker_v6d_1 / worker_v6d_2
+# (Hooks install unconditionally once the simulator entrypoints are used;
+#  the former SGLANG_SIMULATOR_ENABLE_*_HOOK / NATIVE_V6D_CONTROL_PLANE
+#  env vars have been removed.)
 #
 # It verifies three gates:
 #   1. simulator code is consistent on both nodes
