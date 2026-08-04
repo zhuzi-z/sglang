@@ -282,6 +282,22 @@ class C_VLLMSchedulerHook(BaseHook):
                 else:
                     predicted_latency = 0.001  # fallback: 1ms per step
 
+                # logprobs compensation (both modes): when the baseline was
+                # collected without logprobs but the target deployment enables
+                # them, the extra GPU work (topk / D2H / tolists) is
+                # proportional to this step's scheduled tokens of logprobs
+                # requests. Sim has no real GPU, so it must be added
+                # explicitly. Only active with logprobs_cost_us_per_token > 0.
+                _predictor = cls.INFERENCE_PREDICTOR
+                _lp_cost = getattr(_predictor, "logprobs_cost_s_per_token", 0.0)
+                _logprobs_tokens = 0
+                if _lp_cost > 0:
+                    for _rid, _ntok in num_scheduled_tokens.items():
+                        _req = self.requests.get(_rid)
+                        _sp = getattr(_req, "sampling_params", None)
+                        if _sp is not None and getattr(_sp, "logprobs", None):
+                            _logprobs_tokens += _ntok
+
                 if cls.SIM_MODE == SimulationMode.BLOCKING:
                     # One-time engine cold start (CUDA graph capture / kernel
                     # JIT / first allocation). Measured on RTX PRO 6000: the
@@ -301,9 +317,24 @@ class C_VLLMSchedulerHook(BaseHook):
                                 "[sim-coldstart] one-time cold-start "
                                 "overhead %.3f s on first non-empty iter", _cs)
                             time.sleep(_cs)
-                    time.sleep(abs(predicted_latency))
+                    # BLOCKING: real wall clock. Engine-side per-step CPU
+                    # overhead (schedule/update/dispatch/post_step) is
+                    # naturally consumed by the real engine loop, so nothing
+                    # besides the predicted GPU time (+ logprobs term) needs
+                    # to be slept for.
+                    time.sleep(abs(predicted_latency) + _lp_cost * _logprobs_tokens)
                     event_time = time.time()
                 else:
+                    # OFFLINE: the virtual clock accumulates only the
+                    # predicted GPU time. Known diff vs real, deliberately NOT
+                    # compensated: the engine residual (~2.5ms/step = RPC
+                    # transfers + EngineCore bookkeeping, outside the X1
+                    # label) is unmodellable wall-clock time; back-filling it
+                    # from real measurements would smuggle in an unjustified
+                    # calibration. OFFLINE duration is expected to run
+                    # ~2.5ms/step shorter than real; treat it as a known diff
+                    # item when interpreting results, not a bug.
+                    predicted_latency += _lp_cost * _logprobs_tokens
                     StateManager.set_current_inference_dur(predicted_latency)
                     StateManager.step_global_clock(predicted_latency)
                     event_time = StateManager.get_global_clock()
