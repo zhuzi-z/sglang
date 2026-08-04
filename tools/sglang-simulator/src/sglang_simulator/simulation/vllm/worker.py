@@ -291,30 +291,8 @@ class C_VLLMWorkerHook(BaseHook):
                 ConfigManager.set_scheduler_config(sched_config)
                 available_bytes = profile_device_available_bytes(model, hw, sched_config)
 
-                # In CPU simulation, cap reported memory to avoid OOM from block
-                # metadata structures (prefix tree, block tables, free queues).
-                # Each block needs ~100-200 bytes of metadata in EngineCore.
-                # Physical RAM limit: use min(simulated, 4 GiB) to keep block
-                # count under ~1M, which needs ~200 MB metadata.
-                import psutil
-                phys_ram = psutil.virtual_memory().total
-                # Allow at most 25% of physical RAM for KV cache simulation
-                max_safe_bytes = int(phys_ram * 0.25)
-                if available_bytes > max_safe_bytes:
-                    logger.info(
-                        "[vLLM Hijack] Worker.determine_available_memory: "
-                        "capping simulated %d bytes (%.2f GiB) → %d bytes "
-                        "(%.2f GiB) to fit physical RAM (%d bytes)",
-                        available_bytes, available_bytes / (1 << 30),
-                        max_safe_bytes, max_safe_bytes / (1 << 30), phys_ram,
-                    )
-                    available_bytes = max_safe_bytes
-                else:
-                    logger.info(
-                        "[vLLM Hijack] Worker.determine_available_memory: "
-                        "profiled %d bytes (%.2f GiB)",
-                        available_bytes, available_bytes / (1 << 30),
-                    )
+                logger.info("[vLLM Hijack] Worker.determine_available_memory: %d gibibytes. The available memory will be used for kv cache allocation.", available_bytes // (1 << 30))
+
                 return available_bytes
             except Exception:
                 return 80 * (1 << 30)  # 80 GiB fallback
@@ -408,7 +386,7 @@ class C_VLLMWorkerHook(BaseHook):
                         kv_caches[layer_name] = tensor
                 logger.info(
                     "[vLLM Hijack] Allocated %d MINIMAL CPU KV cache tensors "
-                    "(num_blocks=%d, simulated_bytes=%d, actual_bytes=minimal)",
+                    "(num_blocks=%d, simulated_bytes=%d, actual_bytes=4k)",
                     len(kv_cache_config.kv_cache_tensors), num_blocks,
                     sum(t.size for t in kv_cache_config.kv_cache_tensors),
                 )
@@ -423,7 +401,7 @@ class C_VLLMWorkerHook(BaseHook):
                     kv_caches[layer_name] = tensor
                 logger.info(
                     "[vLLM Hijack] Allocated %d MINIMAL CPU KV cache tensors "
-                    "(num_blocks=%d, page_size=%d, actual_alloc=minimal)",
+                    "(num_blocks=%d, page_size=%d, actual_alloc=4k)",
                     len(kv_caches), num_blocks,
                     spec.page_size_bytes if kv_spec else 0,
                 )
@@ -570,6 +548,9 @@ class C_VLLMWorkerHook(BaseHook):
             self._last_model_output = output
             return output
 
+        def override_take_draft_token_ids(self):
+            return None
+
         def override_sample_tokens(self, grammar_output):
             """Return the mock output built by execute_model."""
             return self._last_model_output
@@ -593,6 +574,7 @@ class C_VLLMWorkerHook(BaseHook):
         target.initialize_from_config = override_initialize_from_config
         target.compile_or_warm_up_model = override_compile_or_warm_up_model
         target.execute_model = override_execute_model
+        target.take_draft_token_ids = override_take_draft_token_ids
         target.sample_tokens = override_sample_tokens
         def override_reset_mm_cache(self):
             """No-op: no real model_runner to reset."""
