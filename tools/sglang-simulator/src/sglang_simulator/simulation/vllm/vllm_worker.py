@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from sglang_simulator.dataset import GenericRequest
 from sglang_simulator.simulation.benchmark import BaseWorker
+from sglang_simulator.simulation.manager import StateManager
+from sglang_simulator.simulation.req_stats_manager import request_stats_manager
 from sglang_simulator.utils import get_logger
 from sglang_simulator.simulation.vllm.startup import init_hook
 
@@ -27,6 +29,12 @@ init_hook()
 
 from vllm import LLM, SamplingParams  # noqa: E402
 from vllm.engine.arg_utils import EngineArgs  # noqa: E402
+
+# Hook modules are imported only after init_hook(): by then they are already
+# loaded by the hook installation sequence, and any future transitive
+# dependency can never precede hook installation.
+from sglang_simulator.simulation.vllm.scheduler import C_VLLMSchedulerHook  # noqa: E402
+from sglang_simulator.simulation.vllm.v6d.v6d_manager import set_active_worker_id  # noqa: E402
 
 logger = get_logger("sglang_simulator")
 
@@ -73,11 +81,7 @@ class VLLMWorker(BaseWorker):
                 setattr(engine_args, field_name, sim_default)
 
         # Set active worker_id for V6D RPC bypass ownership tracking
-        try:
-            from sglang_simulator.simulation.vllm.v6d.v6d_manager import set_active_worker_id
-            set_active_worker_id(name)
-        except ImportError:
-            pass
+        set_active_worker_id(name)
 
         self._llm = LLM(
             **{
@@ -88,11 +92,7 @@ class VLLMWorker(BaseWorker):
         logger.info("[VLLMWorker] Initialized with model=%s", engine_args.model)
 
         # Clear active worker_id after init completes
-        try:
-            from sglang_simulator.simulation.vllm.v6d.v6d_manager import set_active_worker_id
-            set_active_worker_id(None)
-        except ImportError:
-            pass
+        set_active_worker_id(None)
 
         # Detect API availability: newer vLLM has enqueue/wait_for_completion
         self._has_enqueue_api = hasattr(self._llm, "enqueue")
@@ -167,7 +167,7 @@ class VLLMWorker(BaseWorker):
         # First task to acquire lock triggers batch processing
         async with self._batch_lock:
             if not self._batch_processed:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 if self._has_enqueue_api:
                     self._batch_outputs = await loop.run_in_executor(
                         self._executor,
@@ -196,8 +196,6 @@ class VLLMWorker(BaseWorker):
 
     def get_request_stats(self) -> list[dict]:
         """Build per-request stats from scheduler-tracked data."""
-        from sglang_simulator.simulation.vllm.scheduler import C_VLLMSchedulerHook
-
         stats = []
         for req, output in self._completed_reqs:
             input_len = len(req.token_ids) if req.token_ids else 0
@@ -205,18 +203,18 @@ class VLLMWorker(BaseWorker):
 
             # Look up per-request stats recorded by the scheduler hook
             req_id = output.request_id
-            tracked = C_VLLMSchedulerHook.REQUEST_STATS.get(req_id)
+            tracked = request_stats_manager.stats.get(req_id)
 
             if tracked:
-                gen_token_latencies = tracked["gen_token_latencies"]
-                created_time = tracked["created_time"]
-                queue_start = tracked["queue_start"]
-                queue_end = tracked["queue_end"]
-                last_event_time = tracked["last_event_time"]
-                final_device_hit_len = tracked.get("final_device_hit_len", 0)
-                local_kv_hit_len = tracked.get("local_kv_hit_len", 0)
-                ext_kv_hit_len = tracked.get("ext_kv_hit_len", 0)
-                final_host_hit_len = tracked.get("final_host_hit_len", 0)
+                gen_token_latencies = tracked.gen_token_latencies
+                created_time = tracked.created_time
+                queue_start = tracked.queue_start
+                queue_end = tracked.queue_end
+                last_event_time = tracked.last_event_time
+                final_device_hit_len = tracked.final_device_hit_len
+                local_kv_hit_len = tracked.local_kv_hit_len
+                ext_kv_hit_len = tracked.ext_kv_hit_len
+                final_host_hit_len = tracked.final_host_hit_len
             else:
                 # Fallback for non-simulation requests
                 gen_token_latencies = [0.001] * max(1, output_len)
@@ -249,10 +247,7 @@ class VLLMWorker(BaseWorker):
 
     def reset_stats(self):
         """Reset per-request stats for the next benchmark round."""
-        from sglang_simulator.simulation.vllm.scheduler import C_VLLMSchedulerHook
-        from sglang_simulator.simulation.manager import StateManager
-
-        C_VLLMSchedulerHook.REQUEST_STATS.clear()
+        request_stats_manager.reset()
         C_VLLMSchedulerHook.ITERATION_STATS.clear()
         # Reset global simulation state (global_clock, iteration counter, etc.)
         # to prevent state leakage across consecutive benchmark runs.
@@ -260,8 +255,6 @@ class VLLMWorker(BaseWorker):
 
     def get_iteration_stats(self) -> list[dict]:
         """Return per-iteration stats collected by the scheduler hook."""
-        from sglang_simulator.simulation.vllm.scheduler import C_VLLMSchedulerHook
-
         return list(C_VLLMSchedulerHook.ITERATION_STATS)
 
     # ------------------------------------------------------------------

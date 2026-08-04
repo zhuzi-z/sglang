@@ -17,45 +17,14 @@ only supported cross-node matching mechanism.
 """
 
 from __future__ import annotations
-import json
+import asyncio
 import os
-import weakref
-from typing import Any, Iterable
+import sys
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
-
-
-# All live V6dObjectManager instances (registered in override_init).
-# Needed by reset_all_sim_v6d_managers() to flush connector-side caches
-# (_cached_objs / _pending_objs) when the bench clears cache state via
-# /reset_prefix_cache after restarting the v6d daemons.  Without this,
-# stale _cached_objs entries survive the daemon restart and poison
-# prepare_batch_allocate()'s dedup: blocks "already cached" are never
-# re-uploaded to the fresh daemon, leaving holes in the cross-node
-# registry (observed as bench round-2+ L2 lookup truncations).
-_SIM_V6D_MANAGERS: "weakref.WeakSet" = weakref.WeakSet()
-
-
-def reset_all_sim_v6d_managers() -> int:
-    """Reset every live V6dObjectManager (clears _cached_objs etc.).
-
-    Returns the number of managers reset.  Called from the sim scheduler
-    hook's reset_prefix_cache wrapper so each bench iteration starts with
-    a connector-cache state consistent with the freshly restarted v6d.
-    """
-    count = 0
-    for manager in list(_SIM_V6D_MANAGERS):
-        try:
-            manager.reset()
-            count += 1
-        except Exception as e:
-            logger.warning(
-                "[V6D Hijack] reset of manager group=%s failed: %r",
-                getattr(manager, "_group_id", "?"), e)
-    return count
 
 
 def _sim_client_exists(client, key: str, request_id=None) -> bool:
@@ -122,8 +91,7 @@ class C_V6dObjectManagerHook(BaseHook):
             so SRPC BAREX init is skipped and client connects without CUDA.
             """
             try:
-                import sys as _sys
-                _mod = _sys.modules.get(target.__module__)
+                _mod = sys.modules.get(target.__module__)
                 _fn = getattr(_mod, "_connect_v6d_with_retry", None)
                 if _fn is None:
                     raise RuntimeError("_connect_v6d_with_retry not found")
@@ -153,7 +121,6 @@ class C_V6dObjectManagerHook(BaseHook):
         def override_init(self, *args, **kwargs):
             """Tag manager with active worker_id from environment."""
             original_init(self, *args, **kwargs)
-            _SIM_V6D_MANAGERS.add(self)
             worker_id = get_active_worker_id()
             if worker_id:
                 self._sim_worker_id = worker_id
@@ -168,36 +135,12 @@ class C_V6dObjectManagerHook(BaseHook):
 
         target.__init__ = override_init
 
-        # ---- Override seal() ----
-        original_seal = target.seal
+        def _lookup_loop(self, block_hashes, request_id, exists_fn):
+            """Shared hit-counting loop for lookup/async_lookup.
 
-        def override_seal(self, block_hashes: Iterable, request_id=None):
-            """Forward seal to original v6d client (P2P path)."""
-            return original_seal(self, block_hashes, request_id=request_id)
-
-        target.seal = override_seal
-
-        # ---- Override _process_lookup() ----
-        original_process_lookup = target._process_lookup
-
-        def override_process_lookup(
-            self,
-            block_hashes,
-            got_objs: dict[str, Any],
-            request_id: str | None,
-            unfetched_objs: dict[str, Any] | None = None,
-        ) -> int:
-            """Forward to original _process_lookup (P2P path)."""
-            return original_process_lookup(
-                self, block_hashes, got_objs, request_id,
-                unfetched_objs=unfetched_objs)
-
-        target._process_lookup = override_process_lookup
-
-        def override_lookup(self, block_hashes, request_id=None,
-                            unfetched_objs=None):
-            if getattr(self, "client", None) is None:
-                return 0
+            *exists_fn* performs the (possibly awaited-elsewhere) exists
+            check for one key; the loop truncates at the first miss.
+            """
             hits = 0
             total = 0
             stop_reason = "all_hit"
@@ -208,7 +151,7 @@ class C_V6dObjectManagerHook(BaseHook):
                     hits += 1
                     continue
                 try:
-                    if _sim_client_exists(self.client, key, request_id):
+                    if exists_fn(key):
                         self._cached_objs[key] = key
                         if request_id is not None:
                             self._hold_key_for_req(key, request_id)
@@ -219,6 +162,15 @@ class C_V6dObjectManagerHook(BaseHook):
                 except Exception as e:
                     stop_reason = f"exception@{hits} key={key}: {e!r}"
                     break
+            return hits, total, stop_reason
+
+        def override_lookup(self, block_hashes, request_id=None,
+                            unfetched_objs=None):
+            if getattr(self, "client", None) is None:
+                return 0
+            hits, total, stop_reason = _lookup_loop(
+                self, block_hashes, request_id,
+                lambda key: _sim_client_exists(self.client, key, request_id))
             if stop_reason != "all_hit":
                 logger.info(
                     "[V6D DIAG] lookup group=%s req=%s hits=%d/%d stop=%s",
@@ -229,8 +181,7 @@ class C_V6dObjectManagerHook(BaseHook):
                                         unfetched_objs=None):
             if getattr(self, "client", None) is None:
                 return 0
-            import asyncio
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             hits = 0
             total = 0
             stop_reason = "all_hit"
@@ -283,19 +234,14 @@ class C_V6dObjectManagerHook(BaseHook):
         async def override_async_get_key(self, block_hash, request_id=None):
             return override_get_key(self, block_hash, request_id=request_id)
 
-        def override_reset(self):
-            return original_reset(self)
-
         original_lookup = target.lookup
         original_async_lookup = target.async_lookup
         original_get_key = target.get_key
         original_async_get_key = target.async_get_key
-        original_reset = target.reset
         target.lookup = override_lookup
         target.async_lookup = override_async_lookup
         target.get_key = override_get_key
         target.async_get_key = override_async_get_key
-        target.reset = override_reset
 
         # ---- Override batch_allocate to record ownership ----
         if hasattr(target, 'batch_allocate'):
@@ -339,8 +285,6 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        import sys
-
         module = sys.modules.get(target.__module__)
         block_hash_list_with_block_size = getattr(
             module, "BlockHashListWithBlockSize", None
@@ -386,7 +330,7 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                     total_tokens=num_hash_blocks * self.hash_block_size,
                     hit_tokens=hit_length,
                 )
-            logger.info(
+            logger.debug(
                 "[V6D RPC Bypass] Request %s: scheduler lookup hit %d "
                 "tokens from num_computed_tokens=%d",
                 request.request_id,
@@ -472,6 +416,23 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                 first_fail_reason)
             return 0
 
+        def _fa_lookup_plan(self, block_hashes, num_computed_tokens):
+            """Yield (manager, group_block_size, tail_hashes) per FA group.
+
+            Shared between the sync and async get_num_new_matched_tokens
+            overrides — only the lookup call itself differs.
+            """
+            fa_group_ids = sorted(
+                getattr(self, "full_attention_group_ids", set()))
+            for group_id in fa_group_ids:
+                manager = self.managers[group_id]
+                group_block_size = self.group_block_sizes[group_id]
+                group_hashes = _group_block_hashes(
+                    self, block_hashes, group_block_size
+                )
+                start_block_idx = num_computed_tokens // group_block_size
+                yield manager, group_block_size, group_hashes[start_block_idx:]
+
         def override_get_num_new_matched_tokens(
             self, request, num_computed_tokens
         ):
@@ -481,18 +442,12 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                 return 0, False
 
             # Step 1: full attention groups — take min
-            fa_group_ids = sorted(
-                getattr(self, "full_attention_group_ids", set()))
             hit_length = num_hash_blocks * self.hash_block_size
-            for group_id in fa_group_ids:
-                manager = self.managers[group_id]
-                group_block_size = self.group_block_sizes[group_id]
-                group_hashes = _group_block_hashes(
-                    self, block_hashes, group_block_size
-                )
-                start_block_idx = num_computed_tokens // group_block_size
+            for manager, group_block_size, tail_hashes in _fa_lookup_plan(
+                self, block_hashes, num_computed_tokens
+            ):
                 group_hits = manager.lookup(
-                    group_hashes[start_block_idx:],
+                    tail_hashes,
                     request_id=request.request_id,
                     unfetched_objs={},
                 )
@@ -515,18 +470,12 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                 return 0, False
 
             # Step 1: full attention groups — take min
-            fa_group_ids = sorted(
-                getattr(self, "full_attention_group_ids", set()))
             hit_length = num_hash_blocks * self.hash_block_size
-            for group_id in fa_group_ids:
-                manager = self.managers[group_id]
-                group_block_size = self.group_block_sizes[group_id]
-                group_hashes = _group_block_hashes(
-                    self, block_hashes, group_block_size
-                )
-                start_block_idx = num_computed_tokens // group_block_size
+            for manager, group_block_size, tail_hashes in _fa_lookup_plan(
+                self, block_hashes, num_computed_tokens
+            ):
                 group_hits = await manager.async_lookup(
-                    group_hashes[start_block_idx:],
+                    tail_hashes,
                     request_id=request.request_id,
                     unfetched_objs={},
                 )
@@ -566,7 +515,7 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                 pass
             if hasattr(self, "_release_protected_blocks"):
                 self._release_protected_blocks(req_id)
-            logger.info(
+            logger.debug(
                 "[V6D RPC Bypass] Request %s: completed scheduler-side "
                 "CPU no-op store without async wait",
                 req_id,
@@ -617,7 +566,7 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
                 result = original_cross_group_batch_allocate(
                     self, group_candidates, request_id=request_id
                 )
-                logger.info(
+                logger.debug(
                     "[V6D RPC Bypass] cross_group_batch_allocate(merged): "
                     "groups=%s blobs=%d req=%s",
                     sorted(result),
@@ -652,11 +601,6 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
 
         target._cross_group_batch_allocate = override_cross_group_batch_allocate
 
-        original_update_output = target.update_connector_output
-        def override_update_connector_output(self, connector_output):
-            _fs = getattr(connector_output, "finished_sending", None)
-            return original_update_output(self, connector_output)
-        target.update_connector_output = override_update_connector_output
         logger.info(
             "[V6D Hijack] V6dObjectConnectorScheduler hook installed "
             "(cross-group allocation bypass)"
@@ -702,17 +646,6 @@ def get_active_worker_id() -> str | None:
     return None
 
 
-def set_manager_worker_id(connector, worker_id: str) -> None:
-    """Set the worker_id on all V6dObjectManager instances in a connector."""
-
-    if hasattr(connector, 'managers'):
-        for gid, manager in connector.managers.items():
-            manager._sim_worker_id = worker_id
-            logger.info(
-                f"[V6D RPC Bypass] Manager group={gid} tagged with "
-                f"worker_id={worker_id}")
-
-
 class C_HybridSchedulerHook(BaseHook):
     """Hook HybridScheduler.step() to flush _saving into _saved.
 
@@ -742,7 +675,7 @@ class C_HybridSchedulerHook(BaseHook):
                         saved.append(req_id)
                         flushed.append(req_id)
                 if flushed:
-                    logger.info(
+                    logger.debug(
                         "[V6D Hijack] Flushed %d saving entries into _saved "
                         "for _step_saved processing: %s",
                         len(flushed), flushed,

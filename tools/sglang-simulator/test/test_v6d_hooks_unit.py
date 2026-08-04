@@ -30,7 +30,7 @@ class TestDummyPrimitives:
     """Test DummyStream and DummyEvent mock CUDA primitives."""
 
     def setup_method(self):
-        from sglang_simulator.simulation.vllm.v6d_swap import (
+        from sglang_simulator.simulation.vllm.v6d.v6d_swap import (
             DummyStream, DummyEvent,
         )
         self.DummyStream = DummyStream
@@ -229,7 +229,7 @@ class TestOpsPatch:
 
     def test_patch_replaces_swap_blocks(self):
         """After patching, v6d_swap_blocks should be a Python function."""
-        from sglang_simulator.simulation.vllm import v6d_swap
+        from sglang_simulator.simulation.vllm.v6d import v6d_swap
 
         # Reset patch state
         v6d_swap._OPS_PATCHED = False
@@ -283,9 +283,9 @@ class TestMockSwapBlocks:
         gpu_block_ids = torch.arange(num_blocks, dtype=torch.long)
 
         # Perform swap-in
-        from sglang_simulator.simulation.vllm.v6d_swap import _patch_v6d_ops
+        from sglang_simulator.simulation.vllm.v6d.v6d_swap import _patch_v6d_ops
         # Get the mock function directly
-        import sglang_simulator.simulation.vllm.v6d_swap as swap_mod
+        import sglang_simulator.simulation.vllm.v6d.v6d_swap as swap_mod
 
         # Call internal mock directly
         # We need to test the actual memcpy logic
@@ -370,7 +370,7 @@ class TestV6dSwapHandlerHook:
     """Test that the hook correctly installs overrides on target class."""
 
     def test_hook_installs_init_override(self):
-        from sglang_simulator.simulation.vllm.v6d_swap import (
+        from sglang_simulator.simulation.vllm.v6d.v6d_swap import (
             C_V6dSwapHandlerHook, DummyStream,
         )
 
@@ -399,7 +399,7 @@ class TestV6dSwapHandlerHook:
         assert handler._gpu_device == torch.device("cpu")
 
     def test_hook_installs_swap_override(self):
-        from sglang_simulator.simulation.vllm.v6d_swap import (
+        from sglang_simulator.simulation.vllm.v6d.v6d_swap import (
             C_V6dSwapHandlerHook,
         )
 
@@ -421,7 +421,7 @@ class TestV6dSwapHandlerHook:
 
     def test_hook_get_finished_returns_all_immediately(self):
         from collections import deque
-        from sglang_simulator.simulation.vllm.v6d_swap import (
+        from sglang_simulator.simulation.vllm.v6d.v6d_swap import (
             C_V6dSwapHandlerHook, DummyEvent,
         )
 
@@ -461,7 +461,7 @@ class TestV6dObjectConnectorWorkerHook:
     """Test V6dObjectConnectorWorker hook skips CUDA operations."""
 
     def test_hook_replaces_register_host_memory(self):
-        from sglang_simulator.simulation.vllm.v6d_worker import (
+        from sglang_simulator.simulation.vllm.v6d.v6d_worker import (
             C_V6dObjectConnectorWorkerHook,
         )
 
@@ -490,15 +490,19 @@ class TestV6dObjectBackendHook:
     """Test V6dObjectBackend hook replaces CUDA Event pools."""
 
     def test_hook_replaces_event_pool(self):
-        from sglang_simulator.simulation.vllm.v6d_backend import (
+        from sglang_simulator.simulation.vllm.v6d.v6d_backend import (
             C_V6dObjectBackendHook,
         )
-        from sglang_simulator.simulation.vllm.v6d_swap import DummyEvent
+        from sglang_simulator.simulation.vllm.v6d.v6d_swap import DummyEvent
 
         class MockV6dObjectBackend:
             def __init__(self):
                 self._save_event_pool = ["real_event_1", "real_event_2"]
                 self._load_event_pool = ["real_event_3"]
+
+            async def async_load_kv(self, m):
+                # Hook wraps this with an instant-completion override
+                yield None
 
         C_V6dObjectBackendHook.hook(MockV6dObjectBackend)
 

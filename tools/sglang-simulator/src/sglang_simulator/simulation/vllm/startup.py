@@ -6,155 +6,10 @@ IMPORTANT: init_hook() must be called BEFORE any `import vllm.*` statement.
 """
 
 import json
+import logging
 import os
 
-
-def _decode_kv_transfer_params(value):
-    """Decode explicitly provided kv_transfer_params from request inputs."""
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
-    if isinstance(value, str):
-        try:
-            return _decode_kv_transfer_params(json.loads(value))
-        except Exception:
-            return {}
-    if isinstance(value, (list, tuple)):
-        merged = {}
-        for item in value:
-            merged.update(_decode_kv_transfer_params(item))
-        return merged
-    return {}
-
-
-def _extract_explicit_kv_transfer_params(kwargs: dict) -> dict:
-    """Collect KV params from explicit fields only; never inspect request_id."""
-    if not isinstance(kwargs, dict):
-        return {}
-
-    kv_params = _decode_kv_transfer_params(kwargs.get("kv_transfer_params"))
-    encoder_extra_args = kwargs.get("encoder_extra_args")
-    if isinstance(encoder_extra_args, dict):
-        kv_params.update(
-            _decode_kv_transfer_params(
-                encoder_extra_args.get("kv_transfer_params")
-            )
-        )
-
-    for key in (
-        "do_remote_decode",
-        "do_remote_prefill",
-        "ali_llumnix_disagg",
-        "ali_max_computed_tokens",
-        "remote_host",
-        "remote_port",
-        "transfer_id",
-        "remote_engine_id",
-        "remote_bootstrap_addr",
-    ):
-        if key in kwargs and key not in kv_params:
-            kv_params[key] = kwargs[key]
-    return kv_params
-
-
-def _merge_kv_params_into_encoder_extra_args(kwargs: dict) -> dict:
-    kv_params = _extract_explicit_kv_transfer_params(kwargs)
-    if not kv_params:
-        return {}
-    encoder_extra_args = dict(kwargs.get("encoder_extra_args") or {})
-    merged = _decode_kv_transfer_params(
-        encoder_extra_args.get("kv_transfer_params")
-    )
-    merged.update(kv_params)
-    encoder_extra_args["kv_transfer_params"] = merged
-    kwargs["encoder_extra_args"] = encoder_extra_args
-    return merged
-
-
-def _merge_kv_params_into_sampling_params(kwargs: dict) -> dict:
-    kv_params = {}
-    kv_params.update(
-        _extract_explicit_kv_transfer_params(
-            kwargs.get("kwargs_for_epd_transfer") or {}
-        )
-    )
-    kv_params.update(_extract_explicit_kv_transfer_params(kwargs))
-
-    sampling_params = dict(kwargs.get("sampling_params") or {})
-    extra_args = dict(sampling_params.get("extra_args") or {})
-    existing = _decode_kv_transfer_params(extra_args.get("kv_transfer_params"))
-    existing.update(kv_params)
-    if not existing:
-        return {}
-
-    extra_args["kv_transfer_params"] = existing
-    sampling_params["extra_args"] = extra_args
-    kwargs["sampling_params"] = sampling_params
-    return existing
-
-
-def _install_dashllm_kv_transfer_hook(original_launch_v6d=None) -> None:
-    """Install non-invasive DashServing/vLLM kv_transfer_params passthrough."""
-    try:
-        import dashllm.core.backend._backend_vllm as backend_vllm
-    except Exception:
-        return
-
-    if (
-        original_launch_v6d is not None
-        and getattr(backend_vllm, "launch_v6d", None) is original_launch_v6d
-    ):
-        try:
-            from dashllm.utils import vineyard as dashllm_vineyard
-            backend_vllm.launch_v6d = dashllm_vineyard.launch_v6d
-        except Exception:
-            pass
-
-    backend_cls = getattr(backend_vllm, "_LLMBackend4vLLM", None)
-    if backend_cls is not None and not getattr(
-        backend_cls,
-        "_sglang_simulator_kv_transfer_params_hook",
-        False,
-    ):
-        original_generate = backend_cls.generate
-
-        def _patched_generate(self, model, **kwargs):
-            _merge_kv_params_into_encoder_extra_args(kwargs)
-            return original_generate(self, model, **kwargs)
-
-        backend_cls.generate = _patched_generate
-        backend_cls._sglang_simulator_kv_transfer_params_hook = True
-
-    try:
-        import dashllm.core.backend.engine._vllm_v1 as vllm_v1
-    except Exception:
-        vllm_v1 = None
-
-    engine_cls = getattr(vllm_v1, "vLLMEngine", None) if vllm_v1 else None
-    if engine_cls is not None and not getattr(
-        engine_cls,
-        "_sglang_simulator_vllm_engine_kv_params_hook",
-        False,
-    ):
-        original_engine_generate = engine_cls.generate
-        original_engine_generate_impl = getattr(engine_cls, "_generate_impl", None)
-
-        def _patched_engine_generate(self, *args, **kwargs):
-            _merge_kv_params_into_sampling_params(kwargs)
-            yield from original_engine_generate(self, *args, **kwargs)
-
-        engine_cls.generate = _patched_engine_generate
-
-        if original_engine_generate_impl is not None:
-            def _patched_engine_generate_impl(self, *args, **kwargs):
-                _merge_kv_params_into_sampling_params(kwargs)
-                yield from original_engine_generate_impl(self, *args, **kwargs)
-
-            engine_cls._generate_impl = _patched_engine_generate_impl
-
-        engine_cls._sglang_simulator_vllm_engine_kv_params_hook = True
-
+import torch
 
 
 def _patch_triton_for_cpu():
@@ -186,8 +41,6 @@ def _patch_torch_cuda_for_cpu():
     module level (e.g. in expert_parallel.py). This patches those calls to
     return fake device properties so the imports succeed without a GPU.
     """
-    import torch
-
     if torch.cuda.is_available():
         return  # Real GPU available, no patching needed
 
@@ -221,18 +74,28 @@ def _patch_torch_cuda_for_cpu():
     torch.cuda._lazy_init = _mock_lazy_init
 
 
+# Set once init_hook() has run; makes repeated installs (e.g. an explicit
+# simulator entrypoint plus the .pth auto-start trigger in the same process)
+# no-ops instead of double-registering every class hook.
+_HOOKS_INSTALLED = False
+
+
 def init_hook():
     """Install all vLLM hooks. Must be called before importing vllm.
 
     Hooks install unconditionally: this entry is only imported by the
-    simulator's own entrypoints (launch_server / vllm_worker), so reaching
-    it already means simulation mode.  No opt-in env var gating — using
-    the hooks implies hijacking.  Normal vLLM users sharing the same
-    Python environment are unaffected because nothing imports this module
-    outside the simulator entrypoints.
-    """
-    import logging
+    simulator's own entrypoints (launch_server / vllm_worker) or by the
+    .pth auto-start bootstrap (which itself is gated on
+    SGLANG_SIMULATOR_ENABLE), so reaching it already means simulation mode.
+    No opt-in env var gating here — using the hooks implies hijacking.
+    Normal vLLM users sharing the same Python environment are unaffected
+    because nothing imports this module outside those paths.
 
+    Idempotent: calling it more than once in the same process is a no-op.
+    """
+    global _HOOKS_INSTALLED
+    if _HOOKS_INSTALLED:
+        return True
     from sglang_simulator.simulation.vllm.v6d.ipc_hook import _install_v6d_ipc_hook
     _install_v6d_ipc_hook()
 
@@ -268,7 +131,7 @@ def init_hook():
         worker.C_VLLMWorkerHook,
         # Scheduler hook for time prediction
         scheduler.C_VLLMSchedulerHook,
-        # Profile hook — exports REQUEST_STATS / ITERATION_STATS on
+        # Profile hook — exports request / iteration stats on
         # /start_profile & /stop_profile (EngineCore.profile)
         profile_hook.C_VLLMProfileHook,
         # Native SimpleCPUOffloadWorker hook (bypasses CUDA for native offload)
@@ -284,5 +147,8 @@ def init_hook():
     register_v6d_hooks(hooks)
 
     sglang_simulator_hook.install_class_hooks(hooks)
+
+    from sglang_simulator.simulation.vllm.dashllm.kv_transfer_hook import _install_dashllm_kv_transfer_hook
     _install_dashllm_kv_transfer_hook()
+    _HOOKS_INSTALLED = True
     return True

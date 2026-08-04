@@ -9,7 +9,7 @@ from typing import Any
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
-from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
+from sglang_simulator.simulation.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
     resolve_scheduler_config,

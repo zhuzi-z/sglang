@@ -18,7 +18,7 @@ import threading
 from collections import deque
 from typing import Optional
 
-from sglang_simulator.hook import BaseHook
+from sglang_simulator.hook import BaseHook, install_class_hooks
 
 logger = logging.getLogger("sglang_simulator")
 
@@ -377,8 +377,6 @@ def install_v6d_runtime_hooks():
     """Apply all v6d-side simulation hooks; call once before v6d.cli main
     (class hooks must precede the imports that define the target classes).
     """
-    from sglang_simulator.hook import install_class_hooks
-
     install_class_hooks([
         C_VineyardPeerHook,
         C_VineyardRunnerHook,

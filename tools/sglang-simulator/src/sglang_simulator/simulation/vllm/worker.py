@@ -11,7 +11,19 @@ V6D-aware simulation strategy (merged from feat/vllm-pai + V6D additions):
 - Mock execute_model output with KV connector lifecycle
 """
 
+import asyncio
+import dataclasses
+import threading
+
+import torch
+
 from sglang_simulator.hook import BaseHook
+from sglang_simulator.simulation.manager import ConfigManager
+from sglang_simulator.simulation.utils import profile_device_available_bytes
+from sglang_simulator.simulation.vllm.utils import (
+    resolve_model_info,
+    resolve_scheduler_config,
+)
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
@@ -50,8 +62,6 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     Handles both pure-MHA models and hybrid models (e.g. Qwen3.5 with
     full_attention + linear_attention layers).
     """
-    import torch
-    import dataclasses
     from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
     # MambaAttentionBackendEnum moved between vLLM versions
@@ -72,7 +82,6 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     # Real num_kv_heads (divided by TP for per-shard spec)
     scheduler_config = None
     try:
-        from sglang_simulator.simulation.manager import ConfigManager
         scheduler_config = ConfigManager.get_scheduler_config()
     except Exception:
         pass
@@ -203,6 +212,9 @@ class C_VLLMWorkerHook(BaseHook):
         # Cache imports at hook-install time
         from vllm.v1.outputs import ModelRunnerOutput as _ModelRunnerOutput
 
+        # Field set varies across vLLM versions; probe once at install time.
+        _mro_fields = {f.name for f in dataclasses.fields(_ModelRunnerOutput)}
+
         _KVConnectorOutput = None
         try:
             from vllm.v1.outputs import KVConnectorOutput as _KVConnectorOutput
@@ -221,8 +233,6 @@ class C_VLLMWorkerHook(BaseHook):
 
         def override_init_device(self):
             """Minimal init: distributed env + head_dim injection + stub."""
-            import torch
-            import sys
             try:
                 from vllm.v1.worker.gpu_worker import (
                     init_worker_distributed_environment,
@@ -271,19 +281,11 @@ class C_VLLMWorkerHook(BaseHook):
 
         def override_load_model(self, *args, **kwargs):
             """Skip model loading entirely."""
-            import sys
             logger.info("[vLLM Hijack] Worker.load_model: skipped")
 
         def override_determine_available_memory(self):
             """Return fake GPU memory to satisfy block calculation."""
             try:
-                from sglang_simulator.simulation.manager import ConfigManager
-                from sglang_simulator.simulation.vllm.utils import (
-                    resolve_model_info, resolve_scheduler_config,
-                )
-                from sglang_simulator.simulation.utils import (
-                    profile_device_available_bytes,
-                )
                 model = resolve_model_info(self.vllm_config.model_config)
                 ConfigManager.set_model_info(model)
                 hw = ConfigManager.get_accelerator_info()
@@ -303,7 +305,6 @@ class C_VLLMWorkerHook(BaseHook):
 
         def override_initialize_from_config(self, kv_cache_config):
             """Init KV connector and allocate CPU KV cache tensors."""
-            import torch
             from vllm.distributed.kv_transfer import (
                 ensure_kv_transfer_initialized,
                 has_kv_transfer_group,
@@ -323,8 +324,6 @@ class C_VLLMWorkerHook(BaseHook):
             # worker_init path because it validates GPU-oriented HybridWorker group
             # layouts before our no-op data-plane hooks can take over.
             try:
-                import asyncio
-                import threading
                 import vllm.v1.hybrid_connector.engine_proxy as _engine_proxy
                 _orig_worker_init = _engine_proxy.worker_init
 
@@ -432,9 +431,6 @@ class C_VLLMWorkerHook(BaseHook):
 
         def override_execute_model(self, scheduler_output):
             """Return mock ModelRunnerOutput with KV connector lifecycle."""
-            _has_kvt = _has_kv_transfer_group
-            _kvt_result = _has_kvt() if _has_kvt else None
-            _meta = getattr(scheduler_output, "kv_connector_metadata", None)
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens
 
             # KV connector pre-forward
@@ -470,35 +466,25 @@ class C_VLLMWorkerHook(BaseHook):
             # request has reached the end of its prompt.  Returning a token for
             # every partial chunk makes max_tokens=1 requests finish after the
             # first 8192-token chunk and silently skips the remaining prompt.
-            try:
-                from sglang_simulator.simulation.vllm.kv_connector import (
-                    get_scheduler_ref,
-                )
-
-                scheduler = get_scheduler_ref()
-            except Exception:
-                scheduler = None
-
-            if scheduler is None:
+            # The per-request decision is computed by the scheduler hook and
+            # annotated onto scheduler_output (_sim_token_emitted), riding the
+            # native scheduler -> worker dataflow.
+            token_emitted = getattr(scheduler_output, "_sim_token_emitted", None)
+            if req_ids and token_emitted is None:
                 raise RuntimeError(
-                    "vLLM simulator scheduler reference is unavailable"
+                    "scheduler_output lacks _sim_token_emitted annotation "
+                    "(sim scheduler hook not active?)"
                 )
 
             sampled_token_ids = []
             for req_id in req_ids:
-                request = scheduler.requests.get(req_id)
-                if request is None:
+                if req_id not in token_emitted:
                     raise RuntimeError(
-                        f"scheduled request {req_id!r} is missing from scheduler"
+                        f"scheduled request {req_id!r} is missing from the "
+                        "scheduler hook's _sim_token_emitted annotation"
                     )
-                prompt_tokens = getattr(request, "num_prompt_tokens", None)
-                computed_tokens = getattr(request, "num_computed_tokens", 0)
-                prompt_complete = (
-                    prompt_tokens is None or computed_tokens >= prompt_tokens
-                )
-                sampled_token_ids.append([1] if prompt_complete else [])
+                sampled_token_ids.append([1] if token_emitted[req_id] else [])
 
-            import dataclasses as _dc
             mro_kwargs = dict(
                 req_ids=req_ids,
                 req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
@@ -506,7 +492,6 @@ class C_VLLMWorkerHook(BaseHook):
                 logprobs=None,
                 prompt_logprobs_dict={},
             )
-            _mro_fields = {f.name for f in _dc.fields(_ModelRunnerOutput)}
             if "kv_lens" in _mro_fields:
                 mro_kwargs["kv_lens"] = [0] * len(req_ids)
             if "pooler_output" in _mro_fields:

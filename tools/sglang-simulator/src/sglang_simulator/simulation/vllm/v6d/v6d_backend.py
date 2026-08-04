@@ -12,6 +12,8 @@ No DashServing/vLLM source file is modified on disk; all changes are installed
 through class monkey-patches at interpreter startup.
 """
 
+import sys
+
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent
 from sglang_simulator.utils import get_logger
@@ -127,7 +129,7 @@ class C_HybridConnectorHook(BaseHook):
                 getattr(self, "_sim_finished_load_reqs", set()) | load_reqs
             )
             if store_reqs or load_reqs:
-                logger.info(
+                logger.debug(
                     "[V6D Hijack] HybridConnector bind metadata: "
                     "store=%s load=%s",
                     sorted(store_reqs),
@@ -143,7 +145,7 @@ class C_HybridConnectorHook(BaseHook):
             self._sim_finished_store_reqs = set()
             self._sim_finished_load_reqs = set()
             if store_reqs or load_reqs:
-                logger.info(
+                logger.debug(
                     "[V6D Hijack] get_finished: store=%s load=%s "
                     "finished_req_ids=%s",
                     sorted(store_reqs),
@@ -182,9 +184,33 @@ class C_HybridConnectorHook(BaseHook):
                 scheduler = getattr(backend, "_scheduler", None) if backend is not None else None
                 if scheduler is not None and hasattr(scheduler, "update_connector_output"):
                     scheduler.update_connector_output(connector_output)
-                    logger.info("[V6D Hijack] update_connector_output delegated to backend: finished_sending=%s",
+                    logger.debug("[V6D Hijack] update_connector_output delegated to backend: finished_sending=%s",
                                getattr(connector_output, "finished_sending", None))
         target.update_connector_output = override_update_connector_output
+
+        def override_reset_cache(self):
+            # Upstream HybridConnector lacks reset_cache forwarding (falls
+            # back to the KVConnectorBase_V1 no-op), so the official
+            # /reset_prefix_cache?reset_external=true path never reaches the
+            # v6d managers.  Bridge it: walk _sched._backend[._v6d]._scheduler
+            # to the V6dObjectConnectorScheduler and reuse its reset_cache()
+            # (which resets every V6dObjectManager).
+            backend = getattr(getattr(self, "_sched", None), "_backend", None)
+            for candidate in (backend, getattr(backend, "_v6d", None)):
+                scheduler = getattr(candidate, "_scheduler", None)
+                if scheduler is not None and hasattr(scheduler, "reset_cache"):
+                    result = scheduler.reset_cache()
+                    logger.info(
+                        "[V6D Hijack] HybridConnector.reset_cache: forwarded "
+                        "to %s -> %s", type(scheduler).__name__, result)
+                    return result
+            logger.warning(
+                "[V6D Hijack] HybridConnector.reset_cache: no backend "
+                "scheduler with reset_cache found (backend=%s); connector "
+                "caches NOT reset", type(backend).__name__ if backend else None)
+            return False
+
+        target.reset_cache = override_reset_cache
         logger.info("[V6D Hijack] HybridConnector hook installed")
 
 
@@ -257,7 +283,7 @@ class C_V6dObjectBackendHook(BaseHook):
                 return
             for req_id in meta.reqs_to_load:
                 n = (m.external_tokens or {}).get(req_id, 0)
-                logger.info(
+                logger.debug(
                     "[V6D Hijack] async_load_kv: simulating instant load "
                     "completion for req=%s n=%d", req_id, n)
                 yield IoRet(reqid=req_id, n=n)
@@ -316,8 +342,6 @@ class C_KVTPBackendHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        import sys
-
         module = sys.modules.get(target.__module__)
         if module is not None:
             def _noop_generate_nic_affinity(*args, **kwargs):

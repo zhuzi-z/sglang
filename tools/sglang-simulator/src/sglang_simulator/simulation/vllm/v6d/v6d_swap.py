@@ -14,44 +14,18 @@ Mocks:
 - torch.cuda.current_stream() -> DummyStream
 """
 
-import asyncio
 from collections import deque
-from typing import Any
 
 import torch
 
 from sglang_simulator.hook import BaseHook
+from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent, DummyStream
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
 
 _OPS_PATCHED = False
 
-from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent, DummyStream
-
-class DummyStream:
-    """Replace torch.cuda.Stream - all operations are no-ops."""
-
-    def record_event(self, event=None):
-        return DummyEvent()
-
-    def wait_event(self, event):
-        pass
-
-    def wait_stream(self, stream):
-        pass
-
-    def synchronize(self):
-        pass
-
-    def query(self):
-        return True
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
 
 def _patch_v6d_ops():
     """Monkey-patch vllm._custom_ops to replace CUDA V6D kernels.
@@ -151,9 +125,6 @@ class C_V6dSwapHandlerHook(BaseHook):
         target.__init__ = override_init
 
         # Override swap() to remove torch.cuda.stream() usage
-        original_validate_swap = target._validate_swap
-        original_process_swap_batch = target._process_swap_batch
-
         def override_swap(
             self, job_id, keys, gpu_block_ids, request_id,
             group_ids=None

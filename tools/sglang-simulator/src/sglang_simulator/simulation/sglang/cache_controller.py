@@ -4,7 +4,7 @@ from queue import Queue
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager, StateManager
-from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
+from sglang_simulator.simulation.req_stats_manager import request_stats_manager
 
 
 class C_HiCacheController(BaseHook):
