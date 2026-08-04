@@ -1,10 +1,24 @@
+# Set once init_hook() has run; makes repeated installs (e.g. an explicit
+# simulator entrypoint plus the .pth auto-start trigger in the same process)
+# no-ops instead of double-registering every class hook.
+_HOOKS_INSTALLED = False
+
+
 def init_hook():
     """Install all SGLang hooks.
 
     Hooks install unconditionally: this entry is only imported by the
-    simulator's own entrypoints (launch_server / worker), so reaching it
-    already means simulation mode — no opt-in env var gating.
+    simulator's own entrypoints (launch_server / worker) or by the .pth
+    auto-start bootstrap (which itself is gated on SGLANG_SIMULATOR_ENABLE),
+    so reaching it already means simulation mode — no opt-in env var gating
+    here.
+
+    Idempotent: calling it more than once in the same process is a no-op.
     """
+    global _HOOKS_INSTALLED
+    if _HOOKS_INSTALLED:
+        return True
+
     import torch
 
     import sglang_simulator.hook as sglang_simulator_hook
@@ -49,4 +63,5 @@ def init_hook():
             disaggregation.C_DecodePreallocQueueHook,
         ]
     )
+    _HOOKS_INSTALLED = True
     return True

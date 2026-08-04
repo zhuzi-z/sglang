@@ -10,14 +10,22 @@ Similar to SGLang's future_queue pattern:
 """
 
 import heapq
+import inspect
 import os
+import textwrap
 import time
 from collections import deque
 
 from sglang_simulator.hook import BaseHook
+from sglang_simulator.simulation.manager import ConfigManager
 from sglang_simulator.simulation.manager import StateManager
 from sglang_simulator.simulation.manager.env import Envs
+from sglang_simulator.simulation.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.types import SimulationMode
+from sglang_simulator.simulation.vllm.utils import (
+    resolve_model_info,
+    resolve_scheduler_config,
+)
 from sglang_simulator.time_predictor import InferTimePredictor
 from sglang_simulator.time_predictor import ScheduleBatch
 from sglang_simulator.time_predictor import ScheduleRequest
@@ -40,14 +48,8 @@ class C_VLLMSchedulerHook(BaseHook):
     INFERENCE_PREDICTOR: InferTimePredictor = None
     SIM_MODE: SimulationMode = SimulationMode(Envs.simulation_mode())
 
-    # Per-request stats collected during simulation.
-    # Key: request_id, Value: dict with queue_start, queue_end,
-    #   gen_token_latencies, last_event_time, created_time,
-    #   input_length, output_length, final_device_hit_len,
-    #   local_kv_hit_len / ext_kv_hit_len (same fields as the real
-    #   vllm_hook), plus legacy final_host_hit_len / final_storage_hit_len
-    #   for the RequestStats schema in simulation/utils.py.
-    REQUEST_STATS: dict[str, dict] = {}
+    # Per-request stats live in the shared request_stats_manager
+    # (simulation/req_stats_manager.py), same as the SGLang backend.
     # One record per scheduler forward step.  Keep the schema aligned with the
     # SGLang hook so step-level predictor validation can consume either backend.
     ITERATION_STATS: list[dict] = []
@@ -57,15 +59,7 @@ class C_VLLMSchedulerHook(BaseHook):
         original_init = target.__init__
         original_add_request = target.add_request
         original_schedule = target.schedule
-
-        def override_update_from_output(self, scheduler_output, model_output):
-            _kvo = getattr(model_output, "kv_connector_output", None)
-            _fs = getattr(_kvo, "finished_sending", None) if _kvo else None
-            import sys as _dbg3
-            print(f"[DBG_SCH] update_from_output kv_connector_output={_kvo is not None} finished_sending={_fs}", file=_dbg3.stderr, flush=True)
-            return original_update_from_output(self, scheduler_output, model_output)
         original_get_num_unfinished = target.get_num_unfinished_requests
-        original_update_from_output = target.update_from_output
 
         # Future queue: heap of (created_time, seq_no, request)
         # Requests are held here until global_clock >= created_time
@@ -78,25 +72,20 @@ class C_VLLMSchedulerHook(BaseHook):
         req_created_time: dict[str, float] = {}
 
         def _new_request_stats(request, created_time, queue_start, last_event_time):
-            """Initial REQUEST_STATS entry with the full RequestStats schema
-            so every dumped record carries length / hit fields (0 by default)."""
+            """Initialize the shared RequestStats entry for a request so every
+            dumped record carries length / hit fields (0 by default)."""
             input_length = getattr(request, "num_prompt_tokens", None)
             if input_length is None:
                 input_length = len(getattr(request, "prompt_token_ids", None) or [])
-            return {
-                "created_time": created_time,
-                "queue_start": queue_start,
-                "queue_end": -1,
-                "gen_token_latencies": [],
-                "last_event_time": last_event_time,
-                "input_length": input_length,
-                "output_length": 0,
-                "final_device_hit_len": 0,
-                "local_kv_hit_len": 0,
-                "ext_kv_hit_len": 0,
-                "final_host_hit_len": 0,
-                "final_storage_hit_len": 0,
-            }
+            st = request_stats_manager.get_req_stats(request.request_id)
+            st.created_time = created_time
+            st.queue_start = queue_start
+            st.queue_end = -1
+            st.gen_token_latencies = []
+            st.last_event_time = last_event_time
+            st.input_length = input_length
+            st.output_length = 0
+            return st
 
         def wrapped_init(self, vllm_config, *args, **kwargs):
             """Hook __init__ to initialize AIConfigurator predictor
@@ -107,69 +96,15 @@ class C_VLLMSchedulerHook(BaseHook):
             seq_counter = 0
             total_expected = float("inf")
             all_received = False
-            cls.REQUEST_STATS.clear()
+            request_stats_manager.reset()
             cls.ITERATION_STATS.clear()
             req_created_time.clear()
             # Per-instance tracking to avoid cross-worker contamination
             self._sim_req_created_time = {}
 
             original_init(self, vllm_config, *args, **kwargs)
-            # Native V6D control-plane mode is the only supported path:
-            # the real connector stack stays in place (the legacy
-            # MockHybridConnector replacement has been removed).
-            logger.info(
-                '[Scheduler Hook] Native V6D control-plane mode: '
-                'keeping connector=%s',
-                type(self.connector).__name__ if self.connector is not None else None,
-            )
-            # Share scheduler reference with the sim worker (execute_model
-            # reads scheduler.requests through get_scheduler_ref()).
-            try:
-                from sglang_simulator.simulation.vllm.kv_connector import set_scheduler_ref
-                set_scheduler_ref(self)
-            except Exception:
-                pass
-            # Patch _mamba_block_aligned_split to allow external computed tokens
-            # (v6d remote hits arrive as external computed tokens via the
-            # get_num_new_matched_tokens -> WAITING_FOR_REMOTE_KVS path)
-            try:
-                if hasattr(self, '_mamba_block_aligned_split'):
-                    import types, textwrap
-                    orig_fn = self._mamba_block_aligned_split
-                    import inspect as _inspect
-                    src_lines = _inspect.getsource(orig_fn).split('\n')
-                    # Remove the assertion lines
-                    filtered = []
-                    skip_next = 0
-                    for line in src_lines:
-                        if skip_next > 0:
-                            skip_next -= 1
-                            continue
-                        if 'num_external_computed_tokens == 0' in line:
-                            # Skip this line and next 2 (the error msg + close paren)
-                            skip_next = 2
-                            filtered.append(line.split('assert')[0] + 'pass  # assertion removed')
-                            continue
-                        filtered.append(line)
-                    new_src = '\n'.join(filtered)
-                    new_src = textwrap.dedent(new_src)
-                    ns = orig_fn.__globals__.copy()
-                    exec(compile(new_src, '<patched_mamba_split>', 'exec'), ns)
-                    fn_name = orig_fn.__name__
-                    if fn_name in ns:
-                        self._mamba_block_aligned_split = ns[fn_name].__get__(self)
-                        logger.info('[Scheduler Hook] Patched _mamba_block_aligned_split')
-            except Exception as e:
-                logger.warning('[Scheduler Hook] Could not patch mamba assertion: %s', e)
-
 
             try:
-                from sglang_simulator.simulation.manager import ConfigManager
-                from sglang_simulator.simulation.vllm.utils import (
-                    resolve_model_info,
-                    resolve_scheduler_config,
-                )
-
                 model_config = vllm_config.model_config
                 model = resolve_model_info(model_config)
                 ConfigManager.set_model_info(model)
@@ -211,8 +146,7 @@ class C_VLLMSchedulerHook(BaseHook):
             if cls.SIM_MODE == SimulationMode.BLOCKING:
                 # BLOCKING mode: process immediately, record stats with real time
                 now = time.time()
-                rid = request.request_id
-                cls.REQUEST_STATS[rid] = _new_request_stats(
+                _new_request_stats(
                     request,
                     created_time=created_time if created_time is not None else now,
                     queue_start=now,
@@ -253,9 +187,8 @@ class C_VLLMSchedulerHook(BaseHook):
                 else:
                     self.waiting.add_request(request)
                 # Record queue_start = time when request enters the waiting queue
-                rid = request.request_id
-                ct = req_created_time.get(rid, current_time)
-                cls.REQUEST_STATS[rid] = _new_request_stats(
+                ct = req_created_time.get(request.request_id, current_time)
+                _new_request_stats(
                     request,
                     created_time=ct,
                     queue_start=current_time,
@@ -298,21 +231,27 @@ class C_VLLMSchedulerHook(BaseHook):
                     request = self.requests.get(req_id)
                     if request is None:
                         continue
-                    st = cls.REQUEST_STATS.get(req_id)
-                    if st is None or st["queue_end"] != -1:
+                    st = request_stats_manager.stats.get(req_id)
+                    if st is None or st.queue_end != -1:
                         continue
-                    st["queue_end"] = queue_end_time
-                    st["input_length"] = request.num_prompt_tokens
-                    st["output_length"] = request.max_tokens
+                    st.queue_end = queue_end_time
+                    st.input_length = request.num_prompt_tokens
+                    st.output_length = request.max_tokens
                     cached = max(getattr(request, "num_cached_tokens", 0) or 0, 0)
                     ext = getattr(request, "num_external_computed_tokens", 0) or 0
-                    st["final_device_hit_len"] = cached
-                    st["ext_kv_hit_len"] = ext
-                    st["local_kv_hit_len"] = cached - ext
+                    st.final_device_hit_len = cached
+                    st.ext_kv_hit_len = ext
+                    st.local_kv_hit_len = cached - ext
                     # Legacy schema (vllm_worker / metric layer): host = external
-                    st["final_host_hit_len"] = ext
+                    st.final_host_hit_len = ext
 
             simulation_batch = ScheduleBatch(reqs=[])
+            # Per-request "does this forward step emit a sampled token"
+            # (False for intermediate chunked-prefill forwards).  Annotated
+            # onto scheduler_output so the sim worker can build its mock
+            # ModelRunnerOutput without holding a scheduler reference — the
+            # SchedulerOutput already travels scheduler -> worker natively.
+            token_emitted: dict[str, bool] = {}
             for req_id, num_tokens in num_scheduled_tokens.items():
                 request = self.requests.get(req_id)
                 if request is None:
@@ -321,12 +260,18 @@ class C_VLLMSchedulerHook(BaseHook):
                 # so past_kv_length = num_computed_tokens - num_tokens.
                 # extend_length = num_tokens directly (prefill > 1, decode == 1).
                 past_kv_length = request.num_computed_tokens - num_tokens
+                prompt_tokens = getattr(request, "num_prompt_tokens", None)
+                token_emitted[req_id] = (
+                    prompt_tokens is None
+                    or request.num_computed_tokens >= prompt_tokens
+                )
                 simulation_batch.reqs.append(
                     ScheduleRequest(
                         extend_length=num_tokens,
                         past_kv_length=max(0, past_kv_length),
                     )
                 )
+            scheduler_output._sim_token_emitted = token_emitted
 
             if not simulation_batch.is_empty():
                 StateManager.inc_iteration()
@@ -356,67 +301,26 @@ class C_VLLMSchedulerHook(BaseHook):
 
                 # Record per-token latency for all scheduled requests
                 for req_id in num_scheduled_tokens:
-                    request = self.requests.get(req_id)
-                    if request is not None:
-                        prompt_tokens = getattr(request, "num_prompt_tokens", None)
-                        computed_tokens = getattr(
-                            request, "num_computed_tokens", 0
-                        )
-                        # Intermediate chunked-prefill forwards do not emit a
-                        # token.  Keep last_event_time unchanged so the first
-                        # recorded latency is the complete TTFT across all
-                        # prompt chunks, matching the SGLang hook semantics.
-                        if (
-                            prompt_tokens is not None
-                            and computed_tokens < prompt_tokens
-                        ):
-                            continue
-                    st = cls.REQUEST_STATS.get(req_id)
+                    # Intermediate chunked-prefill forwards do not emit a
+                    # token.  Keep last_event_time unchanged so the first
+                    # recorded latency is the complete TTFT across all
+                    # prompt chunks, matching the SGLang hook semantics.
+                    if not token_emitted.get(req_id, True):
+                        continue
+                    st = request_stats_manager.stats.get(req_id)
                     if st is not None:
-                        st["gen_token_latencies"].append(
-                            event_time - st["last_event_time"]
+                        st.gen_token_latencies.append(
+                            event_time - st.last_event_time
                         )
-                        st["last_event_time"] = event_time
+                        st.last_event_time = event_time
 
             return scheduler_output
 
         def wrapped_get_num_unfinished(self):
             return original_get_num_unfinished(self) + len(future_queue)
 
-        original_reset_prefix_cache = getattr(target, "reset_prefix_cache", None)
-
-        def wrapped_reset_prefix_cache(self, *args, **kwargs):
-            """reset_prefix_cache + flush sim v6d connector caches.
-
-            The bench clears cache state per iteration via v6d restart +
-            /reset_prefix_cache, but vLLM's reset (reset_connector=False,
-            and HybridConnector lacks reset_cache forwarding) never clears
-            the v6d managers' _cached_objs.  Stale entries survive the
-            daemon restart and make prepare_batch_allocate skip re-uploads
-            to the fresh daemon (registry holes -> L2 lookup truncation).
-            """
-            result = original_reset_prefix_cache(self, *args, **kwargs)
-            try:
-                from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
-                    reset_all_sim_v6d_managers,
-                )
-                n = reset_all_sim_v6d_managers()
-                if n:
-                    logger.info(
-                        "[Scheduler Hook] reset_prefix_cache: flushed "
-                        "%d v6d manager connector caches", n)
-            except Exception as e:
-                logger.warning(
-                    "[Scheduler Hook] reset_prefix_cache: v6d manager "
-                    "cache flush failed: %r", e)
-            return result
-
-
 
         target.__init__ = wrapped_init
         target.add_request = wrapped_add_request
         target.schedule = wrapped_schedule
-        target.update_from_output = override_update_from_output
         target.get_num_unfinished_requests = wrapped_get_num_unfinished
-        if original_reset_prefix_cache is not None:
-            target.reset_prefix_cache = wrapped_reset_prefix_cache

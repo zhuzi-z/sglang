@@ -13,6 +13,8 @@ first), so we can set `current_platform` immediately.
 
 import sys
 
+import torch
+
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils import get_logger
 
@@ -27,8 +29,6 @@ class C_VLLMPlatformHook(BaseHook):
 
     @classmethod
     def hook(cls, target_class):
-        import torch
-
         iface = sys.modules["vllm.platforms.interface"]
         PlatformEnum = iface.PlatformEnum
 

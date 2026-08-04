@@ -7,6 +7,9 @@ converted to deterministic no-op completions.  This lets CPU-only dual-node
 validation exercise the real control plane without transferring full KV data.
 """
 
+import asyncio
+import time
+
 import torch
 
 from sglang_simulator.hook import BaseHook
@@ -49,9 +52,6 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
             self._device = torch.device("cpu")
             self.client = None
             try:
-                import asyncio
-                import time
-
                 from vllm import envs
 
                 # Upstream pairs this notification with the scheduler-side
@@ -140,7 +140,7 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
 
         def override_start_load_kv(self, metadata):
             self._sim_finished_load_reqs = set(metadata.reqs_to_load)
-            logger.info(
+            logger.debug(
                 "[V6D Hijack] start_load_kv: completed CPU no-op loads %s",
                 sorted(self._sim_finished_load_reqs),
             )
@@ -148,7 +148,7 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
 
         def override_start_store_kv(self, metadata):
             self._sim_finished_store_reqs = set(metadata.reqs_to_store)
-            logger.info(
+            logger.debug(
                 "[V6D Hijack] start_store_kv: completed CPU no-op stores %s",
                 sorted(self._sim_finished_store_reqs),
             )
@@ -158,12 +158,11 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
             return None
 
         def override_async_start_load_kv(self, metadata):
-            import asyncio
             req_ids = set(metadata.reqs_to_load)
             self._sim_finished_load_reqs = (
                 getattr(self, "_sim_finished_load_reqs", set()) | req_ids
             )
-            logger.info(
+            logger.debug(
                 "[V6D Hijack] async_start_load_kv: completed CPU no-op loads %s",
                 sorted(req_ids),
             )
@@ -173,12 +172,11 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
             }
 
         def override_async_start_store_kv(self, metadata):
-            import asyncio
             req_ids = set(metadata.reqs_to_store)
             self._sim_finished_store_reqs = (
                 getattr(self, "_sim_finished_store_reqs", set()) | req_ids
             )
-            logger.info(
+            logger.debug(
                 "[V6D Hijack] async_start_store_kv: completed CPU no-op stores %s",
                 sorted(req_ids),
             )
@@ -193,7 +191,7 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
             self._sim_finished_load_reqs = set()
             self._sim_finished_store_reqs = set()
             if load_reqs or store_reqs:
-                logger.info(
+                logger.debug(
                     "[V6D Hijack] get_finished: store=%s load=%s "
                     "finished_req_ids=%s",
                     sorted(store_reqs),

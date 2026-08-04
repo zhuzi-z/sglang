@@ -141,7 +141,7 @@ class C_VLLMOffloadingConnectorWorkerHook(BaseHook):
 
         def override_prepare_store_kv(self, metadata):
             """Track store jobs for immediate completion reporting."""
-            for job_id, entry in metadata.store_jobs.items():
+            for job_id in metadata.store_jobs:
                 self._connector_worker_meta.mark_completed(job_id)
 
         def override_get_finished(self, finished_req_ids):

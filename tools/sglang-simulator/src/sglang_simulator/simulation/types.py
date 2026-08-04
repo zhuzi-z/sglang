@@ -62,6 +62,10 @@ class RequestStats:
     final_host_hit_len: int = 0  # Host hit length after prefetch
     recv_storage_hit_len: int = 0  # Storage hit length at prefetch enqueue
     final_storage_hit_len: int = 0  # Storage hit length at prefetch end
+    # vLLM v6d cross-node split of final_device_hit_len (0 on sglang backend):
+    # local radix reuse vs external (remote v6d) computed tokens.
+    local_kv_hit_len: int = 0
+    ext_kv_hit_len: int = 0
 
     queue_start: float = -1
     queue_end: float = -1
