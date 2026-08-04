@@ -64,6 +64,23 @@ class C_WorkerWrapperBaseHook(BaseHook):
 
             forward_mode = 2 if all([num_token == 1 for num_token in scheduler_output.num_scheduled_tokens.values()]) else 1
 
+            # Per-step logprobs form (for independent logprobs-compensation
+            # training). Only new reqs carry sampling_params in SchedulerOutput;
+            # cached reqs (decode steps) would need engine-side hook or a
+            # differential stress test to capture. total_num_scheduled_tokens
+            # is the step-level token count used as the MTP-compensation feature.
+            logprobs_req_count = 0
+            logprobs_tokens = 0
+            logprobs_n = 0
+            for req in scheduler_output.scheduled_new_reqs:
+                sp = getattr(req, "sampling_params", None)
+                if sp is not None and getattr(sp, "logprobs", None):
+                    logprobs_req_count += 1
+                    logprobs_tokens += scheduler_output.num_scheduled_tokens.get(
+                        req.req_id, 0
+                    )
+                    logprobs_n = max(logprobs_n, sp.logprobs)
+
             torch.cuda.synchronize()
             start = time.time()
             ret = original_execute_model(self, scheduler_output)
@@ -81,6 +98,10 @@ class C_WorkerWrapperBaseHook(BaseHook):
                         "forward_mode": forward_mode,
                         "request_infos": list(request_infos.values()),
                         "iter_latency": end - start,
+                        "total_tokens": scheduler_output.total_num_scheduled_tokens,
+                        "logprobs_req_count": logprobs_req_count,
+                        "logprobs_tokens": logprobs_tokens,
+                        "logprobs_n": logprobs_n,
                     }
                 )
 
