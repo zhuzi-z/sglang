@@ -540,6 +540,18 @@ class C_VLLMWorkerHook(BaseHook):
             """Return the mock output built by execute_model."""
             return self._last_model_output
 
+        def override_take_draft_token_ids(self):
+            """No draft tokens in simulation.
+
+            With speculative decoding (MTP/EAGLE) configured, EngineCore's
+            post_step calls executor.take_draft_token_ids() after every
+            executed step.  The real implementation reads
+            self.model_runner.take_draft_token_ids(); returning None makes
+            post_step skip the draft-token update, so decode proceeds one
+            token per step (MTP acceleration is not simulated).
+            """
+            return None
+
         def override_get_attn_backends_type(self):
             """Return empty list - no real attention backends in simulation."""
             return []
@@ -561,6 +573,7 @@ class C_VLLMWorkerHook(BaseHook):
         target.execute_model = override_execute_model
         target.take_draft_token_ids = override_take_draft_token_ids
         target.sample_tokens = override_sample_tokens
+        target.take_draft_token_ids = override_take_draft_token_ids
         def override_reset_mm_cache(self):
             """No-op: no real model_runner to reset."""
             pass

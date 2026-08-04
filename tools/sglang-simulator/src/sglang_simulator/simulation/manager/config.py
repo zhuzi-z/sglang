@@ -193,6 +193,9 @@ class ConfigManager:
                 config=sched_config,
                 database_path=predictor_config.get("database_path"),
                 latency_scale=predictor_config.get("latency_scale", 1.0),
+                logprobs_cost_us_per_token=predictor_config.get(
+                    "logprobs_cost_us_per_token", 0.0
+                ),
             )
         else:
             raise ValueError(

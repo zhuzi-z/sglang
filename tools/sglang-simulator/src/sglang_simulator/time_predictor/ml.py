@@ -53,6 +53,7 @@ class MLTimePredictor(InferTimePredictor):
         config: SchedulerConfig,
         database_path: str,
         latency_scale: float = 1.0,
+        logprobs_cost_us_per_token: float = 0.0,
         **kwargs,
     ):
         super().__init__(model, hw, config)
@@ -92,6 +93,11 @@ class MLTimePredictor(InferTimePredictor):
             )
 
         self._latency_scale = float(latency_scale)
+        # Extra linear cost for requests that enable logprobs (GPU topk /
+        # D2H / tolists, proportional to tokens). Only needed when the
+        # baseline was collected without logprobs but the target deployment
+        # enables them; must be calibrated from independent measurement.
+        self.logprobs_cost_s_per_token = float(logprobs_cost_us_per_token) / 1e6
         logger.info(
             "MLTimePredictor loaded from %s (prefill=%s, decode=%s, "
             "n_features=%d, latency_scale=%.4f)",
