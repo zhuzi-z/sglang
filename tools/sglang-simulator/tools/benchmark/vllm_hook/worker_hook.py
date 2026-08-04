@@ -28,6 +28,9 @@ class RequestInfos:
 
 SCHEDULE_INFOS: list[dict] = []
 REQUEST_INFOS: dict[str, RequestInfos] = defaultdict(RequestInfos)
+# RPC-2 (sample_tokens) window timings; aligns 1:1 with SCHEDULE_INFOS
+# strictly by call order.
+SAMPLE_TOKENS_LATENCIES: list[float] = []
 
 
 
@@ -94,20 +97,51 @@ class C_WorkerHook(BaseHook):
     @classmethod
     def hook(cls, target) -> None:
 
+        # Two-window collection (X1): if this vllm version has sample_tokens
+        # (two-RPC architecture), clamp it with cuda.sync to measure the full
+        # RPC-2 span (sampler + MTP draft forward + bookkeeping D2H + output
+        # construction). It aligns 1:1 by call order with the execute_model
+        # window (RPC-1, measured by C_WorkerWrapperBaseHook).
+        # Skipped automatically on older vllm without this method; the
+        # iter_latency semantics remain unchanged.
+        original_sample_tokens = getattr(target, "sample_tokens", None)
+        if original_sample_tokens is not None:
+
+            def wrapped_sample_tokens(self, *args, **kwargs):
+                torch.cuda.synchronize()
+                start = time.time()
+                ret = original_sample_tokens(self, *args, **kwargs)
+                torch.cuda.synchronize()
+                SAMPLE_TOKENS_LATENCIES.append(time.time() - start)
+                return ret
+
+            target.sample_tokens = wrapped_sample_tokens
+
         def override_profile(self, *args, **kwrags):
             SGL_HOOK_REQ_INFO_DIR = os.getenv("SGL_HOOK_REQ_INFO_DIR", os.getcwd())
 
             rank_suffix = f"rank{self.rank}"
 
+            n_st = len(SAMPLE_TOKENS_LATENCIES)
             with open(
                 f"{SGL_HOOK_REQ_INFO_DIR}/{rank_suffix}.schedule_batch.jsonl",
                 "w",
             ) as f:
-                for batch_infos in SCHEDULE_INFOS:
+                for i, batch_infos in enumerate(SCHEDULE_INFOS):
+                    # New fields, backward compatible: under the old hook /
+                    # old vllm, i >= n_st and no extra field is written.
+                    if i < n_st:
+                        st_lat = SAMPLE_TOKENS_LATENCIES[i]
+                        batch_infos["sample_tokens_latency"] = st_lat
+                        il = batch_infos.get("iter_latency")
+                        if il is not None:
+                            # X1 label: full GPU span = RPC-1 + RPC-2
+                            batch_infos["full_step_latency"] = il + st_lat
                     f.write(json.dumps(batch_infos) + "\n")
 
             print(f"Schedule batch data has been saved to {SGL_HOOK_REQ_INFO_DIR}/{rank_suffix}.schedule_batch.jsonl")
             SCHEDULE_INFOS.clear()
+            SAMPLE_TOKENS_LATENCIES.clear()
 
         target.profile = override_profile
 
