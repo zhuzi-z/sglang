@@ -243,6 +243,32 @@ class C_V6dObjectManagerHook(BaseHook):
         target.get_key = override_get_key
         target.async_get_key = override_async_get_key
 
+        # ---- Override prepare_batch_allocate to not skip _cached_objs ----
+        # The original prepare_batch_allocate skips hashes that are already
+        # in _cached_objs.  However, _cached_objs persists across v6d
+        # restarts (vLLM is not restarted between slowdown factors), so
+        # hashes found by Phase 2 lookup in sf=0.2 would cause saves to be
+        # skipped in sf=0.8 even though the tracker was flushed.
+        # Fix: only skip _pending_objs (in-flight creates), not _cached_objs
+        # (stale lookup cache).  client.create(ignore_existing=True) handles
+        # the actual dedup against the live tracker.
+        original_prepare_batch_allocate = getattr(target, 'prepare_batch_allocate', None)
+        if original_prepare_batch_allocate is not None:
+            def override_prepare_batch_allocate(self, block_hashes):
+                to_create_hashes = []
+                to_create_keys = []
+                for h in block_hashes:
+                    if h in self._pending_objs:
+                        continue
+                    key = self._make_key(h)
+                    to_create_hashes.append(h)
+                    to_create_keys.append(key)
+                return to_create_hashes, to_create_keys
+            target.prepare_batch_allocate = override_prepare_batch_allocate
+            logger.info("[V6D P2P] Manager group hook: prepare_batch_allocate "
+                        "override installed (skips _pending_objs only)")
+
+
         # ---- Override batch_allocate to record ownership ----
         if hasattr(target, 'batch_allocate'):
             original_batch_allocate = target.batch_allocate
