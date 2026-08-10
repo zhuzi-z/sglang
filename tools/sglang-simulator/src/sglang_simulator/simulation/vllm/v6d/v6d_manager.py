@@ -28,30 +28,11 @@ logger = get_logger()
 
 
 def _sim_client_exists(client, key: str, request_id=None) -> bool:
-    """exists() RPC that threads request_id to the sim-patched daemon.
+    """Plain client.exists() with per-request diagnostics on failure.
 
-    The stock ``ExistsRequest`` dataclass has no request_id field; the
-    simulator's daemon-side hook (C_V6dDaemonExistsHook) parses it from
-    the raw JSON body for per-request hit classification and answers
-    with an extra ``location`` field.  Against a stock daemon the extra
-    field is rejected (HTTP 500) — fall back to plain client.exists().
+    Matches the production lookup path (no protocol extensions).
+    *request_id* is used only for log attribution.
     """
-    if request_id:
-        try:
-            data = client.rpc.call("exists", {
-                "object_key": key,
-                "peer": None,
-                "request_id": request_id,
-            })
-            location = data.get("location")
-            if location:
-                logger.debug(
-                    f"[V6D P2P] exists req={request_id} key={key} -> {location}")
-            return bool(data.get("exists"))
-        except Exception as e:
-            logger.warning(
-                "[V6D DIAG] exists(rpc) failed req=%s key=%s: %r; "
-                "falling back to plain exists()", request_id, key, e)
     try:
         return bool(client.exists(key))
     except Exception as e:
@@ -672,43 +653,11 @@ def get_active_worker_id() -> str | None:
     return None
 
 
-class C_HybridSchedulerHook(BaseHook):
-    """Hook HybridScheduler.step() to flush _saving into _saved.
-
-    In CPU simulation, start_store_kv is a no-op and never sends
-    _SAVE_DONE_REQ RPC.  As a result, _step_saved() has an empty _saved
-    deque and never clears _saving, causing block exhaustion.
-
-    This hook flushes all _saving keys into _saved before each step(),
-    so _step_saved() processes them naturally (releases blocks + clears
-    _saving).  This is safe because all saves are no-ops in CPU mode.
-    """
-
-    HOOK_CLASS_NAME = "HybridScheduler"
-    HOOK_MODULE_NAME = "vllm.v1.hybrid_connector"
-
-    @classmethod
-    def hook(cls, target):
-        original_step = target.step
-
-        def override_step(self):
-            saving = getattr(self, "_saving", None)
-            saved = getattr(self, "_saved", None)
-            if saving and saved is not None:
-                flushed = []
-                for req_id in list(saving.keys()):
-                    if req_id not in saved:
-                        saved.append(req_id)
-                        flushed.append(req_id)
-                if flushed:
-                    logger.debug(
-                        "[V6D Hijack] Flushed %d saving entries into _saved "
-                        "for _step_saved processing: %s",
-                        len(flushed), flushed,
-                    )
-            return original_step(self)
-
-        target.step = override_step
-        logger.info(
-            "[V6D Hijack] HybridScheduler.step hook installed "
-            "(_saving flush for CPU no-op store)")
+# NOTE (fidelity): the former C_HybridSchedulerHook (_saving -> _saved flush
+# before each HybridScheduler.step) has been removed.  It pre-emptively tore
+# down _saving so the later _do_save_done found no state (try_advance -> None)
+# and silently skipped backend.async_cleanup — leaving v6d objects unsealed
+# and mamba protected blocks unreleased.  Save completion is now signalled
+# through the real channel (mark_backend_save_done, equivalent to the
+# worker's _SAVE_DONE_REQ RPC) from C_HybridConnectorHook in v6d_backend.py,
+# so _saved/_try_teardown_save and async_cleanup run on the native path.

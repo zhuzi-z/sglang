@@ -12,7 +12,9 @@ No DashServing/vLLM source file is modified on disk; all changes are installed
 through class monkey-patches at interpreter startup.
 """
 
+import os
 import sys
+import threading
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent
@@ -78,23 +80,45 @@ class C_HybridConnectorHook(BaseHook):
                 ids.update(_collect_req_ids(value, attr_name, seen))
             return ids
 
+        def _resolve_reqs_to_store(metadata):
+            # Walk the backend-meta nesting to find the v6d
+            # V6dObjectConnectorMetadata.reqs_to_store dict.  Layouts:
+            #   v6d_object:      metadata.reqs.inner.reqs_to_store
+            #   v6d_object+kvt:  metadata.reqs.v6d.inner.reqs_to_store
+            seen = set()
+            stack = [metadata]
+            while stack:
+                obj = stack.pop()
+                if obj is None or id(obj) in seen:
+                    continue
+                seen.add(id(obj))
+                value = getattr(obj, "reqs_to_store", None)
+                if isinstance(value, dict):
+                    return value
+                for attr in ("reqs", "inner", "v6d"):
+                    stack.append(getattr(obj, attr, None))
+            return {}
+
         def override_bind_connector_metadata(self, metadata):
             original_bind(self, metadata)
-            backend_meta = getattr(metadata, "reqs", None)
-            reqs_to_store = getattr(metadata, "reqs_to_store", None)
-            if reqs_to_store is None and backend_meta is not None:
-                reqs_to_store = getattr(backend_meta, "reqs_to_store", None)
-            if reqs_to_store is None and backend_meta is not None:
-                inner_meta = getattr(backend_meta, "inner", None)
-                if inner_meta is not None:
-                    reqs_to_store = getattr(inner_meta, "reqs_to_store", None)
-            reqs_to_store = reqs_to_store or {}
-            noop_store_reqs = {
+            reqs_to_store = _resolve_reqs_to_store(metadata)
+            # The CPU no-op "save" completes instantly.  Report completion
+            # through the REAL production channel: mark_backend_save_done()
+            # is equivalent to the worker's _SAVE_DONE_REQ RPC and drives
+            # the native chain
+            #   _do_save_done -> _saved/_try_teardown_save (block refs)
+            #                 -> _cleanup -> backend.async_cleanup
+            #                    (seal v6d objects + release mamba
+            #                     protected blocks + Redis announce).
+            # v6d save_count=1: the worker signals once, on the LAST save
+            # of the request (_is_last_save=True).  Empty groups_data is
+            # the noop last-save marker and must signal as well.
+            save_done_reqs = {
                 req_id
-                for req_id, (groups_data, _is_last_save) in reqs_to_store.items()
-                if not groups_data
+                for req_id, (_groups_data, is_last_save) in reqs_to_store.items()
+                if is_last_save
             }
-            if noop_store_reqs:
+            if save_done_reqs:
                 try:
                     # sched_get_req looks up the live Scheduler's requests
                     # dict (engine_proxy); HybridConnector itself has no
@@ -103,36 +127,44 @@ class C_HybridConnectorHook(BaseHook):
                         mark_backend_save_done,
                         sched_get_req,
                     )
-                    for req_id in sorted(noop_store_reqs):
+                    delay_ms = float(os.environ.get(
+                        "SGLANG_SIMULATOR_V6D_SAVE_DONE_DELAY_MS", "0"))
+                    for req_id in sorted(save_done_reqs):
                         req = sched_get_req(req_id)
-                        if req is not None:
+                        if req is None:
+                            logger.warning(
+                                "[V6D Hijack] save_done: request %s not "
+                                "found in scheduler, skipping", req_id)
+                            continue
+                        if delay_ms > 0:
+                            # Model the real async save latency: the
+                            # save-done RPC arrives only after the v6d put
+                            # completes, holding block protection meanwhile.
+                            threading.Timer(
+                                delay_ms / 1000.0,
+                                mark_backend_save_done, args=(req,),
+                            ).start()
+                        else:
                             mark_backend_save_done(req)
-                    logger.info(
-                        "[V6D Hijack] completed noop last_save via mark_backend_save_done: %s",
-                        sorted(noop_store_reqs),
+                    logger.debug(
+                        "[V6D Hijack] scheduled save_done (delay_ms=%s): %s",
+                        delay_ms, sorted(save_done_reqs),
                     )
                 except Exception:
                     logger.exception(
-                        "[V6D Hijack] failed to complete noop last_save: %s",
-                        sorted(noop_store_reqs),
+                        "[V6D Hijack] failed to signal save_done: %s",
+                        sorted(save_done_reqs),
                     )
-            store_reqs = {
-                req_id
-                for req_id, (groups_data, _is_last_save) in reqs_to_store.items()
-                if groups_data
-            }
             load_reqs = _collect_req_ids(metadata, "reqs_to_load")
-            self._sim_finished_store_reqs = (
-                getattr(self, "_sim_finished_store_reqs", set()) | store_reqs
-            )
             self._sim_finished_load_reqs = (
                 getattr(self, "_sim_finished_load_reqs", set()) | load_reqs
             )
-            if store_reqs or load_reqs:
+            if reqs_to_store or load_reqs:
                 logger.debug(
                     "[V6D Hijack] HybridConnector bind metadata: "
-                    "store=%s load=%s",
-                    sorted(store_reqs),
+                    "store=%s save_done=%s load=%s",
+                    sorted(reqs_to_store),
+                    sorted(save_done_reqs),
                     sorted(load_reqs),
                 )
 
@@ -140,19 +172,19 @@ class C_HybridConnectorHook(BaseHook):
             return None
 
         def override_get_finished(self, finished_req_ids):
-            store_reqs = set(getattr(self, "_sim_finished_store_reqs", set()))
+            # Fidelity: in hybrid mode the v6d save completion travels via
+            # the _SAVE_DONE_REQ RPC (simulated by mark_backend_save_done
+            # above), NOT via kv_connector_output.finished_sending — so no
+            # store reqs are reported here.
             load_reqs = set(getattr(self, "_sim_finished_load_reqs", set()))
-            self._sim_finished_store_reqs = set()
             self._sim_finished_load_reqs = set()
-            if store_reqs or load_reqs:
+            if load_reqs:
                 logger.debug(
-                    "[V6D Hijack] get_finished: store=%s load=%s "
-                    "finished_req_ids=%s",
-                    sorted(store_reqs),
+                    "[V6D Hijack] get_finished: load=%s finished_req_ids=%s",
                     sorted(load_reqs),
                     sorted(finished_req_ids or []),
                 )
-            return store_reqs, load_reqs
+            return set(), load_reqs
 
         def override_clear_connector_metadata(self):
             logger.debug(
@@ -176,17 +208,16 @@ class C_HybridConnectorHook(BaseHook):
         target.clear_connector_metadata = override_clear_connector_metadata
         target.start_load_kv = override_start_load_kv
 
-        def override_update_connector_output(self, connector_output):
-            # Delegate to scheduler-side backend (V6dObjectConnectorScheduler)
-            sched = getattr(self, "_sched", None)
-            if sched is not None:
-                backend = getattr(sched, "_backend", None)
-                scheduler = getattr(backend, "_scheduler", None) if backend is not None else None
-                if scheduler is not None and hasattr(scheduler, "update_connector_output"):
-                    scheduler.update_connector_output(connector_output)
-                    logger.debug("[V6D Hijack] update_connector_output delegated to backend: finished_sending=%s",
-                               getattr(connector_output, "finished_sending", None))
-        target.update_connector_output = override_update_connector_output
+        # NOTE (fidelity): update_connector_output and
+        # request_finished_all_groups are deliberately left untouched.
+        # Upstream HybridConnector implements neither (base no-op), and the
+        # inner v6d connector's update_connector_output is dead code in
+        # hybrid mode — its seal/release logic was moved to
+        # V6dObjectBackend.async_cleanup, driven by the save-done RPC that
+        # mark_backend_save_done simulates above.  Protected mamba blocks
+        # are therefore released ONLY via the save-done chain, exactly as
+        # in production; the finish-time safety net is expected to be
+        # fixed upstream (see docs/v6d_mamba_block_leak_hang_report.md).
 
         def override_reset_cache(self):
             # Upstream HybridConnector lacks reset_cache forwarding (falls
