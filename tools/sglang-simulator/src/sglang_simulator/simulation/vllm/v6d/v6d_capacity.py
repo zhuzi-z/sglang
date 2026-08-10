@@ -186,18 +186,23 @@ class VirtualCapacityManager:
             return self._used, self._total
 
     def page_size(self) -> int:
-        """Uniform blob size declared by the connector (0 if none seen yet).
+        """Uniform v6d object size declared by the connector (0 if none seen).
 
-        Derived, never hardcoded: the connector declares
-        ``FullAttentionSpec.page_size_bytes``, which vLLM computes from the HF
-        config (num_kv_heads/tp_size, head_size, block_size, dtype). Changing
-        model or dtype therefore updates this automatically.
+        Derived, never hardcoded. The connector declares
+        ``effective_ranks * num_layers * page_size_bytes`` per object (see the
+        "V6D object layout" log in v6d_object_connector), and all three
+        factors come from the model/runtime config, so switching model or
+        dtype updates this automatically.
 
-        NOTE: this only equals the production object size while the simulated
-        worker runs with ``tp_size=1`` (see sim_config.p2p_sim.json). Real
-        deployments shard across TP ranks but store one object per block
-        covering the full unsharded KV, so the sim must not mirror the real
-        TP degree or the declared page size would be divided by it.
+        The declared size is TP-invariant: ``page_size_bytes`` is already the
+        per-rank post-shard value, so multiplying it back by
+        ``effective_ranks`` conserves the total. tp=2 (2 x 12 x 2,146,304) and
+        tp=1 (1 x 12 x 4,292,608) both declare 51,511,296 bytes, which is why
+        production and simulation agree on capacity without any scaling.
+
+        This is the *capacity* footprint of one object. It is not the per-rank
+        byte count a single worker moves over PCIe -- that is
+        ``num_layers * page_size_bytes``, half of this under tp=2.
         """
         with self._lock:
             return self._page_size
