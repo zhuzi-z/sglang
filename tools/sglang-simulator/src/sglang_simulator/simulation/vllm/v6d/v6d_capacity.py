@@ -72,6 +72,13 @@ class VirtualCapacityManager:
         self._used: int = 0
         self._lock = threading.Lock()
         self._size_queue: deque[int] = deque()
+        # First declared blob size seen, kept sticky. vLLM derives one uniform
+        # page size per deployment (worker.py pads the mamba spec to the
+        # attention page size), so this is the footprint a remote-fetched
+        # object takes locally. Sticky rather than "last seen" so it stays
+        # valid even if a remote hit arrives before any local store.
+        self._page_size: int = 0
+        self._page_size_warned: bool = False
         logger.info(
             "[V6D Capacity] capacity=%d MB (actual-size tracking)",
             total_capacity // (1 << 20),
@@ -112,6 +119,25 @@ class VirtualCapacityManager:
         with self._lock:
             self._used += total
             self._size_queue.extend(sizes)
+            for sz in sizes:
+                if self._page_size == 0:
+                    self._page_size = sz
+                    logger.info(
+                        "[V6D Capacity] page_size learned from connector: "
+                        "%d bytes (%.3f MiB)", sz, sz / (1 << 20),
+                    )
+                elif sz != self._page_size and not self._page_size_warned:
+                    # vLLM is expected to use one uniform page size; a second
+                    # size means either a config change mid-run or a genuinely
+                    # heterogeneous layout, and remote-fetch admission would
+                    # then charge the wrong footprint.
+                    self._page_size_warned = True
+                    logger.warning(
+                        "[V6D Capacity] non-uniform blob size: got %d bytes, "
+                        "page_size was %d. Remote-fetch admission assumes a "
+                        "uniform page size and may misaccount.", sz,
+                        self._page_size,
+                    )
             logger.debug(
                 "[V6D Capacity] allocate: +%d blobs (+%d bytes), "
                 "used=%d/%d (%.1f%%)",
@@ -158,6 +184,27 @@ class VirtualCapacityManager:
         """Return (used_bytes, total_bytes) — drives eviction decisions."""
         with self._lock:
             return self._used, self._total
+
+    def page_size(self) -> int:
+        """Uniform blob size declared by the connector (0 if none seen yet).
+
+        Derived, never hardcoded: the connector declares
+        ``FullAttentionSpec.page_size_bytes``, which vLLM computes from the HF
+        config (num_kv_heads/tp_size, head_size, block_size, dtype). Changing
+        model or dtype therefore updates this automatically.
+
+        NOTE: this only equals the production object size while the simulated
+        worker runs with ``tp_size=1`` (see sim_config.p2p_sim.json). Real
+        deployments shard across TP ranks but store one object per block
+        covering the full unsharded KV, so the sim must not mirror the real
+        TP degree or the declared page size would be divided by it.
+        """
+        with self._lock:
+            return self._page_size
+
+    def last_blob_size(self) -> int:
+        """Deprecated alias for :meth:`page_size`."""
+        return self.page_size()
 
 
 # ---------------------------------------------------------------------------
@@ -264,16 +311,60 @@ class C_TieredVineyardPeerHook(BaseHook):
     def hook(cls, target):
         original_exists = target.exists
 
+        async def _admit_remote_fetch(peer_self, object_key):
+            """Mirror the local copy ``_acquire_remote_read`` leaves behind.
+
+            The real daemon fetches from the remote peer and *caches the
+            result locally* (see ``_acquire_remote_read``), so a cross-node
+            hit consumes local vineyard capacity just like a store does. The
+            sim connector never issues a read, so without admitting it here
+            the sim under-counts residency and evicts far later than
+            production at the same nominal capacity.
+            """
+            manager = VirtualCapacityManager.get_or_create()
+            size = manager.page_size()
+            if size <= 0:
+                logger.warning(
+                    "[v6d-sim] remote hit on %s before any local store: "
+                    "page size unknown, capacity not charged", object_key,
+                )
+                return
+            lease = None
+            try:
+                lease, _objs = await peer_self._acquire_create(
+                    [object_key], None, [{"size": size}],
+                    ignore_existing=True,
+                    request_id="sim-remote-fetch",
+                )
+                await peer_self.seal(lease.lease_id, request_id="sim-remote-fetch")
+            except Exception as exc:
+                logger.debug(
+                    "[v6d-sim] remote-fetch admit skipped for %s: %s",
+                    object_key, exc,
+                )
+            finally:
+                if lease is not None:
+                    try:
+                        await peer_self.release(
+                            lease.lease_id, request_id="sim-remote-fetch"
+                        )
+                    except Exception:
+                        pass
+
         async def patched_exists(self, object_key, peer=None):
             if self._is_in_vineyard(object_key):
                 self._touch_access(object_key)
                 return True
-            return await original_exists(self, object_key, peer)
+            found = await original_exists(self, object_key, peer)
+            if (found and not self._is_in_vineyard(object_key)
+                    and not self._is_evicted(object_key)):
+                await _admit_remote_fetch(self, object_key)
+            return found
 
         target.exists = patched_exists
         logger.info(
             "[v6d-sim] C_TieredVineyardPeerHook installed: "
-            "LRU touch on exists() local hit"
+            "LRU touch on exists() local hit + local admit on remote hit"
         )
 
 
