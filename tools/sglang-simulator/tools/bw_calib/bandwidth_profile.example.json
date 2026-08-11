@@ -1,0 +1,147 @@
+{
+  "schema": 1,
+  "collected_at": "2026-08-10 18:18:40",
+  "host": "ds-b5d2c54c-1.ds-b5d2c54c-1-24bfe771-a-ae32",
+  "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "gpu_count": 4,
+  "layout": {
+    "page_size_bytes": 2146304,
+    "num_layers": 12,
+    "seg2_bytes_per_block": 25755648
+  },
+  "peer_topology": "same_host_loopback",
+  "peer_endpoint": null,
+  "segments": {
+    "local_load": {
+      "fixed_overhead_s": 0.0012665920108556748,
+      "bandwidth_bytes_per_s": 65367953545.53476,
+      "bandwidth_gib_per_s": 60.87865079337243,
+      "samples": [
+        {
+          "blocks": 1,
+          "bytes": 25755648,
+          "median_s": 0.0022079519033432007,
+          "p10_s": 0.0021951038837432863,
+          "p90_s": 0.00223142409324646,
+          "gib_per_s": 10.863831032700501
+        },
+        {
+          "blocks": 2,
+          "bytes": 51511296,
+          "median_s": 0.0022048799991607666,
+          "p10_s": 0.0021968319416046144,
+          "p90_s": 0.0022234880924224855,
+          "gib_per_s": 21.757933688345844
+        },
+        {
+          "blocks": 4,
+          "bytes": 103022592,
+          "median_s": 0.002295232057571411,
+          "p10_s": 0.002292383909225464,
+          "p90_s": 0.002375967979431152,
+          "gib_per_s": 41.80286054671176
+        },
+        {
+          "blocks": 8,
+          "bytes": 206045184,
+          "median_s": 0.003950528025627136,
+          "p10_s": 0.003947520017623901,
+          "p90_s": 0.0039812479019165035,
+          "gib_per_s": 48.57440068901606
+        },
+        {
+          "blocks": 16,
+          "bytes": 412090368,
+          "median_s": 0.0078886878490448,
+          "p10_s": 0.007886208057403565,
+          "p90_s": 0.007945600032806397,
+          "gib_per_s": 48.65055758879736
+        }
+      ],
+      "affine": false,
+      "note": "NON-affine: ~2.2ms floor up to 4 blocks, bandwidth-bound above; use max(floor, bytes/BW), not t0+bytes/BW"
+    },
+    "local_store": {
+      "fixed_overhead_s": 9.807368119557104e-06,
+      "bandwidth_bytes_per_s": 51191584912.45204,
+      "bandwidth_gib_per_s": 47.67587865931172,
+      "samples": [
+        {
+          "blocks": 1,
+          "bytes": 25755648,
+          "median_s": 0.0005134400129318238,
+          "p10_s": 0.0005119040012359619,
+          "p90_s": 0.0005144960284233093,
+          "gib_per_s": 46.717855644482164
+        },
+        {
+          "blocks": 2,
+          "bytes": 51511296,
+          "median_s": 0.0010158560276031495,
+          "p10_s": 0.0010149760246276856,
+          "p90_s": 0.0010327999591827394,
+          "gib_per_s": 47.22483453259698
+        },
+        {
+          "blocks": 4,
+          "bytes": 103022592,
+          "median_s": 0.002021744012832642,
+          "p10_s": 0.002021440029144287,
+          "p90_s": 0.002023103952407837,
+          "gib_per_s": 47.45767269050517
+        },
+        {
+          "blocks": 8,
+          "bytes": 206045184,
+          "median_s": 0.004035008192062378,
+          "p10_s": 0.004033215999603271,
+          "p90_s": 0.004046559810638428,
+          "gib_per_s": 47.55740809336961
+        },
+        {
+          "blocks": 16,
+          "bytes": 412090368,
+          "median_s": 0.008059792041778565,
+          "p10_s": 0.008058176040649415,
+          "p90_s": 0.008099424362182616,
+          "gib_per_s": 47.61773759305442
+        }
+      ],
+      "affine": true
+    }
+  },
+  "concurrency": {
+    "dual_dir": {
+      "blocks": 16,
+      "bytes_each": 412090368,
+      "wall_s": 0.01030781235313043,
+      "aggregate_gib_per_s": 74.4656672729292
+    },
+    "dual_gpu": {
+      "gpus": [
+        0,
+        1
+      ],
+      "blocks": 16,
+      "bytes_each": 412090368,
+      "wall_s": 0.007922341744415463,
+      "solo_s": 0.0078886878490448,
+      "slowdown_vs_solo": 1.0042660954539782,
+      "aggregate_gib_per_s": 96.88778264849196
+    }
+  },
+  "control_plane": {
+    "save_completion": {
+      "floor_ms": 70.0,
+      "per_block_ms": 6.0,
+      "calibrated": true,
+      "source": "real-run log analysis: mark_saved-last_store, 190 samples, Pearson r=0.27"
+    },
+    "seg1_cross_node": {
+      "floor_ms": 0.0,
+      "per_block_ms": 0.0,
+      "calibrated": false,
+      "source": "PLACEHOLDER: SRPC/RDMA data path stubbed in CPU sim; measure with collect_remote.py on real hardware"
+    }
+  }
+}
