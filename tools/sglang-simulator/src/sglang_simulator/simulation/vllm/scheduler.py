@@ -283,6 +283,24 @@ class C_VLLMSchedulerHook(BaseHook):
                     predicted_latency = 0.001  # fallback: 1ms per step
 
                 if cls.SIM_MODE == SimulationMode.BLOCKING:
+                    # One-time engine cold start (CUDA graph capture / kernel
+                    # JIT / first allocation). Measured on RTX PRO 6000: the
+                    # first non-empty iter of each fresh server process runs
+                    # ~1.4-1.5 s regardless of token count (6288 tok -> +1.48 s,
+                    # 256 tok -> +1.38 s), while the predictor only models the
+                    # per-token forward. Production pays this once per process
+                    # and it delays the earliest requests' queueing; the sim
+                    # never paid it, so its queue never built up. Env-gated:
+                    # unset -> 0 -> behaviour unchanged.
+                    if not getattr(cls, "_COLD_START_DONE", False):
+                        cls._COLD_START_DONE = True
+                        _cs = float(os.environ.get(
+                            "SGLANG_SIMULATOR_COLD_START_S", "0") or 0)
+                        if _cs > 0:
+                            logger.info(
+                                "[sim-coldstart] one-time cold-start "
+                                "overhead %.3f s on first non-empty iter", _cs)
+                            time.sleep(_cs)
                     time.sleep(abs(predicted_latency))
                     event_time = time.time()
                 else:

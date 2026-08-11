@@ -15,7 +15,12 @@ through class monkey-patches at interpreter startup.
 import sys
 
 from sglang_simulator.hook import BaseHook
+import asyncio
+import os
+import time
+
 from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent
+from sglang_simulator.simulation.vllm.v6d.bandwidth import BandwidthModel
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
@@ -78,6 +83,37 @@ class C_HybridConnectorHook(BaseHook):
                 ids.update(_collect_req_ids(value, attr_name, seen))
             return ids
 
+        def _save_ctrl_latency(nblocks):
+            """Fixed-ish control-plane save/seal latency (seconds).
+
+            Production only seals (and thus announces to the tracker, making
+            the blocks visible cross-instance) after the worker's DMA + seal
+            round-trip completes -- measured at ~70 ms + ~6 ms/block on this
+            setup (weak block dependence, Pearson r=0.27). The simulation
+            skips the worker DMA, so without this its seal fires ~7 ms after
+            bind and blocks become visible far too early. Env-gated; unset
+            (both 0) keeps the previous behaviour exactly.
+            """
+            floor_ms = float(os.environ.get(
+                "SGLANG_SIMULATOR_SAVE_CTRL_FLOOR_MS", "0") or 0)
+            per_blk_ms = float(os.environ.get(
+                "SGLANG_SIMULATOR_SAVE_CTRL_PER_BLK_MS", "0") or 0)
+            if floor_ms <= 0 and per_blk_ms <= 0:
+                return 0.0
+            return (floor_ms + per_blk_ms * max(0, nblocks)) / 1000.0
+
+        def _sim_block_count(groups_data):
+            """Blocks one swap call would move for this request.
+
+            The real start_load_kv / start_store_kv merge every group's keys
+            into a single ops.v6d_swap_blocks call, so the block count is the
+            sum across groups.
+            """
+            try:
+                return sum(len(keys) for keys, _gids in groups_data.values())
+            except Exception:
+                return 0
+
         def override_bind_connector_metadata(self, metadata):
             original_bind(self, metadata)
             backend_meta = getattr(metadata, "reqs", None)
@@ -122,12 +158,47 @@ class C_HybridConnectorHook(BaseHook):
                 if groups_data
             }
             load_reqs = _collect_req_ids(metadata, "reqs_to_load")
-            self._sim_finished_store_reqs = (
-                getattr(self, "_sim_finished_store_reqs", set()) | store_reqs
-            )
-            self._sim_finished_load_reqs = (
-                getattr(self, "_sim_finished_load_reqs", set()) | load_reqs
-            )
+            # Production reports a store through finished_sending only once
+            # its DMA event completes, and the scheduler frees the request's
+            # GPU blocks at that point. Record when the modelled copy would
+            # finish instead of completing it in the same step; get_finished()
+            # releases it later. With the model disabled the deadline is now,
+            # so behaviour is unchanged.
+            _bw = BandwidthModel.get()
+            _now = time.perf_counter()
+            _pending = getattr(self, "_sim_pending_store", {})
+            for _rid, (_groups, _isl) in reqs_to_store.items():
+                if not _groups:
+                    continue
+                _nblk = _sim_block_count(_groups)
+                _lat = (_bw.latency_for(_nblk, False)
+                        + _bw.save_completion_latency(_nblk))
+                _pending[_rid] = max(_pending.get(_rid, 0.0), _now + _lat)
+            self._sim_pending_store = _pending
+            # Loads get the same treatment: production only reports one
+            # through finished_recving once its DMA event fires, and the
+            # request cannot enter running before that.
+            _reqs_to_load = getattr(metadata, "reqs_to_load", None)
+            if _reqs_to_load is None and backend_meta is not None:
+                _reqs_to_load = getattr(backend_meta, "reqs_to_load", None)
+                if _reqs_to_load is None:
+                    _inner = getattr(backend_meta, "inner", None)
+                    _reqs_to_load = (getattr(_inner, "reqs_to_load", None)
+                                     if _inner is not None else None)
+            _pending_l = getattr(self, "_sim_pending_load", {})
+            _ext_tok = getattr(metadata, "external_tokens", None) or {}
+            for _rid in load_reqs:
+                _groups = (_reqs_to_load.get(_rid)
+                           if isinstance(_reqs_to_load, dict) else None)
+                _nload = _sim_block_count(_groups or {})
+                # A remote (cross-node) hit must first be fetched
+                # peer v6d -> local v6d (seg1) before the local load
+                # (seg2). external_tokens>0 marks a remote hit; seg1 is
+                # a placeholder (0) until calibrated on real hardware.
+                _rblk = _nload if int(_ext_tok.get(_rid, 0) or 0) > 0 else 0
+                _lat = _bw.latency_for(_nload, True) + _bw.seg1_latency(_rblk)
+                _pending_l[_rid] = max(_pending_l.get(_rid, 0.0), _now + _lat)
+            self._sim_pending_load = _pending_l
             if store_reqs or load_reqs:
                 logger.debug(
                     "[V6D Hijack] HybridConnector bind metadata: "
@@ -140,10 +211,20 @@ class C_HybridConnectorHook(BaseHook):
             return None
 
         def override_get_finished(self, finished_req_ids):
-            store_reqs = set(getattr(self, "_sim_finished_store_reqs", set()))
-            load_reqs = set(getattr(self, "_sim_finished_load_reqs", set()))
-            self._sim_finished_store_reqs = set()
-            self._sim_finished_load_reqs = set()
+            # Stores are held until their modelled DMA deadline passes, which
+            # is what defers the scheduler's _free_blocks() and creates the
+            # same L1 back-pressure production has.
+            _now = time.perf_counter()
+            _pending = getattr(self, "_sim_pending_store", {})
+            store_reqs = {r for r, deadline in _pending.items() if _now >= deadline}
+            for r in store_reqs:
+                _pending.pop(r, None)
+            self._sim_pending_store = _pending
+            _pending_l = getattr(self, "_sim_pending_load", {})
+            load_reqs = {r for r, deadline in _pending_l.items() if _now >= deadline}
+            for r in load_reqs:
+                _pending_l.pop(r, None)
+            self._sim_pending_load = _pending_l
             if store_reqs or load_reqs:
                 logger.debug(
                     "[V6D Hijack] get_finished: store=%s load=%s "
@@ -281,16 +362,25 @@ class C_V6dObjectBackendHook(BaseHook):
             meta = m.inner
             if not meta or not getattr(meta, "reqs_to_load", None):
                 return
+            # Do NOT await here. BLOCKING mode advances the clock with a
+            # plain time.sleep() on the same thread, so a coroutine parked on
+            # asyncio.sleep() never gets resumed -- an earlier attempt that
+            # awaited the modelled latency here starved the load pipeline and
+            # three of four phases produced no output at all. The load latency
+            # is applied through the same deadline mechanism as the store,
+            # in bind_connector_metadata + get_finished.
             for req_id in meta.reqs_to_load:
                 n = (m.external_tokens or {}).get(req_id, 0)
                 logger.debug(
-                    "[V6D Hijack] async_load_kv: simulating instant load "
-                    "completion for req=%s n=%d", req_id, n)
+                    "[V6D Hijack] async_load_kv: yielding IoRet req=%s n=%d",
+                    req_id, n)
                 yield IoRet(reqid=req_id, n=n)
 
         target.async_load_kv = override_async_load_kv
 
-        logger.info("[V6D Hijack] V6dObjectBackend hook installed")
+        _bwm = BandwidthModel.get()
+        logger.info("[V6D Hijack] V6dObjectBackend hook installed "
+                    "(transfer-latency model enabled=%s)", _bwm.enabled)
 
 
 class _DummyBladeKVTModule:
