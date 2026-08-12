@@ -196,6 +196,18 @@ class ConfigManager:
                 logprobs_cost_us_per_token=predictor_config.get(
                     "logprobs_cost_us_per_token", 0.0
                 ),
+                sample_tokens_base_ms=predictor_config.get(
+                    "sample_tokens_base_ms", 0.0
+                ),
+                sample_tokens_lo_us_per_token=predictor_config.get(
+                    "sample_tokens_lo_us_per_token", 0.0
+                ),
+                sample_tokens_hi_us_per_token=predictor_config.get(
+                    "sample_tokens_hi_us_per_token", 0.0
+                ),
+                sample_tokens_breakpoint_tokens=predictor_config.get(
+                    "sample_tokens_breakpoint_tokens", 0
+                ),
             )
         else:
             raise ValueError(

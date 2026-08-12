@@ -298,6 +298,32 @@ class C_VLLMSchedulerHook(BaseHook):
                         if _sp is not None and getattr(_sp, "logprobs", None):
                             _logprobs_tokens += _ntok
 
+                # sample_tokens (RPC-2) compensation, kept as a SEPARATE term
+                # from predicted_latency: the predictor's label covers only
+                # RPC-1 (execute_model), while the real engine additionally
+                # spends the RPC-2 span (sampler + speculative draft propose +
+                # bookkeeping D2H + output construction) on GPU every step.
+                # Deliberately not folded into predicted_latency so that the
+                # iter_latency semantics of the trained label stay intact and
+                # both components remain separately auditable in
+                # iteration.jsonl. Driven by this step's scheduled token count,
+                # mirroring the GPU-side ``total_tokens`` field.
+                _total_tokens = sum(num_scheduled_tokens.values())
+                sample_tokens_latency = 0.0
+                if _predictor is not None and hasattr(
+                    _predictor, "predict_sample_tokens_time"
+                ):
+                    sample_tokens_latency = float(
+                        _predictor.predict_sample_tokens_time(_total_tokens)
+                    )
+
+                # Full GPU span actually occupied by this step, matching the
+                # GPU-side ``full_step_latency`` = iter + sample_tokens.
+                logprobs_latency = _lp_cost * _logprobs_tokens
+                full_step_latency = (
+                    predicted_latency + sample_tokens_latency + logprobs_latency
+                )
+
                 if cls.SIM_MODE == SimulationMode.BLOCKING:
                     # One-time engine cold start (CUDA graph capture / kernel
                     # JIT / first allocation). Measured on RTX PRO 6000: the
@@ -319,30 +345,33 @@ class C_VLLMSchedulerHook(BaseHook):
                             time.sleep(_cs)
                     # BLOCKING: real wall clock. Engine-side per-step CPU
                     # overhead (schedule/update/dispatch/post_step) is
-                    # naturally consumed by the real engine loop, so nothing
-                    # besides the predicted GPU time (+ logprobs term) needs
-                    # to be slept for.
-                    time.sleep(abs(predicted_latency) + _lp_cost * _logprobs_tokens)
+                    # naturally consumed by the real engine loop, so only the
+                    # GPU span (RPC-1 + RPC-2 + logprobs term) is slept for.
+                    time.sleep(abs(full_step_latency))
                     event_time = time.time()
                 else:
-                    # OFFLINE: the virtual clock accumulates only the
-                    # predicted GPU time. Known diff vs real, deliberately NOT
-                    # compensated: the engine residual (~2.5ms/step = RPC
-                    # transfers + EngineCore bookkeeping, outside the X1
-                    # label) is unmodellable wall-clock time; back-filling it
-                    # from real measurements would smuggle in an unjustified
+                    # OFFLINE: the virtual clock accumulates the full GPU span.
+                    # Known diff vs real, deliberately NOT compensated: the
+                    # engine residual (~2.5ms/step = RPC transfers +
+                    # EngineCore bookkeeping, outside the X1 label) is
+                    # unmodellable wall-clock time; back-filling it from real
+                    # measurements would smuggle in an unjustified
                     # calibration. OFFLINE duration is expected to run
                     # ~2.5ms/step shorter than real; treat it as a known diff
                     # item when interpreting results, not a bug.
-                    predicted_latency += _lp_cost * _logprobs_tokens
-                    StateManager.set_current_inference_dur(predicted_latency)
-                    StateManager.step_global_clock(predicted_latency)
+                    StateManager.set_current_inference_dur(full_step_latency)
+                    StateManager.step_global_clock(full_step_latency)
                     event_time = StateManager.get_global_clock()
 
                 cls.ITERATION_STATS.append(
                     {
                         "requests": simulation_batch.request_info(),
+                        # RPC-1 only, matching the predictor's training label.
                         "forward_latency": predicted_latency,
+                        "sample_tokens_latency": sample_tokens_latency,
+                        "logprobs_latency": logprobs_latency,
+                        "full_step_latency": full_step_latency,
+                        "total_tokens": _total_tokens,
                         "l2_load_latency": 0.0,
                         "l2_backup_latency": 0.0,
                     }

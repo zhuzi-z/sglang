@@ -54,6 +54,10 @@ class MLTimePredictor(InferTimePredictor):
         database_path: str,
         latency_scale: float = 1.0,
         logprobs_cost_us_per_token: float = 0.0,
+        sample_tokens_base_ms: float = 0.0,
+        sample_tokens_lo_us_per_token: float = 0.0,
+        sample_tokens_hi_us_per_token: float = 0.0,
+        sample_tokens_breakpoint_tokens: int = 0,
         **kwargs,
     ):
         super().__init__(model, hw, config)
@@ -98,6 +102,33 @@ class MLTimePredictor(InferTimePredictor):
         # baseline was collected without logprobs but the target deployment
         # enables them; must be calibrated from independent measurement.
         self.logprobs_cost_s_per_token = float(logprobs_cost_us_per_token) / 1e6
+
+        # RPC-2 (sample_tokens) compensation. The trained label above covers
+        # only the first RPC (execute_model / main-model forward), so the
+        # second RPC -- sampler + speculative draft propose + bookkeeping D2H
+        # + output construction -- is missing from the predicted step time.
+        # It is modelled as a continuous piecewise-linear (hinge) function of
+        # this step's scheduled token count:
+        #
+        #   sample_tokens_s = base + a_lo * tt + (a_hi - a_lo) * max(0, tt - s)
+        #
+        # ``base`` is the token-independent RPC-2 floor, ``a_lo`` the marginal
+        # cost while the sampling pipeline is not yet saturated and ``a_hi``
+        # the steeper post-saturation slope. Kept as a SEPARATE term: it is
+        # never folded into the predictor's own output so the iter_latency
+        # label semantics stay intact. Disabled by default (base == 0 and
+        # both slopes == 0 leave the value at zero).
+        self.sample_tokens_base_s = float(sample_tokens_base_ms) / 1e3
+        self.sample_tokens_lo_s_per_token = float(sample_tokens_lo_us_per_token) / 1e6
+        self.sample_tokens_hi_s_per_token = float(sample_tokens_hi_us_per_token) / 1e6
+        self.sample_tokens_breakpoint_tokens = max(
+            0, int(sample_tokens_breakpoint_tokens)
+        )
+        self._sample_tokens_enabled = (
+            self.sample_tokens_base_s > 0.0
+            or self.sample_tokens_lo_s_per_token > 0.0
+            or self.sample_tokens_hi_s_per_token > 0.0
+        )
         logger.info(
             "MLTimePredictor loaded from %s (prefill=%s, decode=%s, "
             "n_features=%d, latency_scale=%.4f)",
@@ -107,6 +138,16 @@ class MLTimePredictor(InferTimePredictor):
             len(saved_features),
             self._latency_scale,
         )
+        if self._sample_tokens_enabled:
+            logger.info(
+                "MLTimePredictor sample_tokens compensation enabled: "
+                "base=%.3fms a_lo=%.4fus/token a_hi=%.4fus/token "
+                "breakpoint=%d tokens",
+                self.sample_tokens_base_s * 1e3,
+                self.sample_tokens_lo_s_per_token * 1e6,
+                self.sample_tokens_hi_s_per_token * 1e6,
+                self.sample_tokens_breakpoint_tokens,
+            )
 
     @staticmethod
     def _extract_features(batch: ScheduleBatch) -> list[float]:
@@ -153,4 +194,26 @@ class MLTimePredictor(InferTimePredictor):
         is_decode = features[-2] == 1
         model = self._decode_model if is_decode else self._prefill_model
         latency = float(model.predict([features])[0]) * self._latency_scale
+        return max(latency, 0.0)
+
+    def predict_sample_tokens_time(self, total_tokens: int) -> float:
+        """Return the RPC-2 (sample_tokens) duration in seconds.
+
+        ``total_tokens`` is this step's scheduled token count, matching the
+        ``total_tokens`` field written by the GPU-side collection hook.
+        Returns 0.0 when the compensation is not configured.
+
+        The calibration was fitted on mixed (chunked-prefill) steps only, so
+        applying it to a hypothetical decode-only deployment extrapolates the
+        token-independent floor beyond its measured domain.
+        """
+        if not self._sample_tokens_enabled or total_tokens <= 0:
+            return 0.0
+
+        tt = float(total_tokens)
+        latency = self.sample_tokens_base_s + self.sample_tokens_lo_s_per_token * tt
+        if tt > self.sample_tokens_breakpoint_tokens:
+            latency += (
+                self.sample_tokens_hi_s_per_token - self.sample_tokens_lo_s_per_token
+            ) * (tt - self.sample_tokens_breakpoint_tokens)
         return max(latency, 0.0)
