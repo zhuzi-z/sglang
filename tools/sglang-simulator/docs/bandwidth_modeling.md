@@ -73,3 +73,20 @@ seg1 是唯一跨网络的段。CPU 仿真里 SRPC/RDMA 数据面被 stub，**�
 ## 验证
 
 sf=0.2 / N=100 ABAB 跨节点：前缀命中逐请求 **200/200 对齐实测**（连续 3 次）。默认（env 全未设）复现建模前行为。
+
+## save_completion 校准说明与"控制面 gap"（重要）
+
+save_completion（sim 使用，70ms+6ms/blk）**不是** v6d 控制面 RPC 的耗时，而是"store 到跨节点可见"的**整体尾巴**（worker 侧异步 save 流水线 + 负载争用 + confirm）。
+
+采集器新增 --v6d-endpoint 真实测量**隔离的 create+seal 控制面 RPC**（镜像连接器 batch_allocate/seal），记为 control_plane.save_completion_measured：
+
+    python collect_bandwidth.py --gpu 0 --v6d-endpoint http://localhost:7890 --out profile.json
+
+本环境实测（RTX PRO 6000）：create+seal = 1.31ms + 0.083ms/blk（约 2ms）。
+
+**gap 结论**：隔离 RPC（约 2ms）与日志尾巴（70+6/blk，实测个别 158-3099ms）相差 50-100 倍。差值来自 worker 侧异步 save 排队与争用（引擎忙于其他请求 forward 时 save 排队），采集器在无负载下测不到这部分。
+
+**配参指引**：
+- DMA 两段（seg2 load/store）：用 collect_bandwidth.py 直接实测，忠实可靠。
+- save_completion：保持日志推导值（它才能复现真实可见时序，已由命中率验证）；save_completion_measured（约 2ms）仅作控制面下界/健全性参考，不要用它替换 save_completion。
+- 换环境重标定 save_completion：从该环境真实运行日志回归 mark_saved 减 V6D_swap_region，而非用隔离 RPC。

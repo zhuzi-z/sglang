@@ -118,6 +118,44 @@ def gib(x):
     return x / (1 << 30)
 
 
+def measure_save_completion(v6d_url, blocks, seg2_bytes, iters, warmup):
+    """Real control-plane latency: time client.create + obj.seal against a
+    running v6d daemon, mirroring the connector's batch_allocate/seal path.
+    This is the isolated seal/announce RPC cost (NOT the worker-side async-save
+    pipeline tail that the log-derived save_completion captures)."""
+    import v6d
+    from v6d.data.tensor import Tensor
+    try:
+        import torch as _t
+        dt = _t.int8
+    except Exception:
+        dt = "int8"
+    client = v6d.connect(v6d_url)
+    otype = Tensor.type(shape=[seg2_bytes], dtype=dt)
+    rows = []
+    for nb in blocks:
+        ts = []
+        for it in range(iters + warmup):
+            keys = [f"bwcal_{nb}_{it}_{i}" for i in range(nb)]
+            t0 = time.perf_counter()
+            objs = client.create(keys=keys, sizes=[seg2_bytes] * nb,
+                                 object_types=[otype] * nb, ignore_existing=True)
+            for o in objs:
+                if o is not None:
+                    o.seal()
+            if it >= warmup:
+                ts.append(time.perf_counter() - t0)
+        med = statistics.median(ts)
+        rows.append({"blocks": nb, "median_s": med, "median_ms": med * 1e3})
+        print(f"  save_ctrl  {nb:2d} blk  create+seal {med * 1e3:.3f} ms")
+    b0, b1 = rows[0]["blocks"], rows[-1]["blocks"]
+    m0, m1 = rows[0]["median_s"], rows[-1]["median_s"]
+    per_blk_ms = (m1 - m0) / (b1 - b0) * 1e3 if b1 > b0 else 0.0
+    floor_ms = m0 * 1e3 - per_blk_ms * b0
+    return {"floor_ms": round(max(0.0, floor_ms), 3),
+            "per_block_ms": round(per_blk_ms, 4), "samples": rows}
+
+
 def run(args):
     blocks = [int(b) for b in args.blocks.split(",")]
     out = {
@@ -249,6 +287,23 @@ def run(args):
                   f"solo {solo * 1e3:.3f} ms  slowdown {per / solo:.3f}x  "
                   f"aggregate {gib(2 * a['nbytes']) / per:.2f} GiB/s")
 
+    # ---- optional: real control-plane (create+seal) measurement ----
+    if getattr(args, "v6d_endpoint", None):
+        print(f"\nmeasuring save_completion control-plane on {args.v6d_endpoint} ...")
+        try:
+            seg2 = args.num_layers * args.page_size
+            meas = measure_save_completion(args.v6d_endpoint, blocks, seg2,
+                                           args.iters, args.warmup)
+            meas["source"] = f"measured: v6d create+seal RPC on {args.v6d_endpoint}"
+            out["control_plane"]["save_completion_measured"] = meas
+            lg = out["control_plane"]["save_completion"]
+            print(f"  GAP: measured create+seal floor={meas['floor_ms']:.2f}ms "
+                  f"per_blk={meas['per_block_ms']:.3f}ms  VS  log-derived "
+                  f"save_completion floor={lg['floor_ms']:.1f}ms "
+                  f"per_blk={lg['per_block_ms']:.1f}ms")
+        except Exception as e:
+            print(f"  save_completion measurement FAILED: {e}")
+
     with open(args.out, "w") as f:
         json.dump(out, f, indent=2)
     print(f"\nwrote {args.out}")
@@ -283,6 +338,11 @@ def main():
                    help="cross-node fetch fixed latency (0=placeholder, needs real HW)")
     p.add_argument("--seg1-per-blk-ms", type=float, default=0.0,
                    help="cross-node fetch per-block latency (0=placeholder)")
+    p.add_argument("--v6d-endpoint", default=None,
+                   help="v6d daemon URL (e.g. http://localhost:7890); if set, "
+                        "measures the real create+seal control-plane latency "
+                        "and records it as save_completion_measured for gap "
+                        "analysis (does NOT overwrite the log-derived value)")
     p.add_argument("--out", default="/root/workspace/server/bandwidth_profile.json")
     run(p.parse_args())
 
