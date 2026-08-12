@@ -74,19 +74,41 @@ seg1 是唯一跨网络的段。CPU 仿真里 SRPC/RDMA 数据面被 stub，**�
 
 sf=0.2 / N=100 ABAB 跨节点：前缀命中逐请求 **200/200 对齐实测**（连续 3 次）。默认（env 全未设）复现建模前行为。
 
-## save_completion 校准说明与"控制面 gap"（重要）
+## save_completion 参数说明（重要）
 
-save_completion（sim 使用，70ms+6ms/blk）**不是** v6d 控制面 RPC 的耗时，而是"store 到跨节点可见"的**整体尾巴**（worker 侧异步 save 流水线 + 负载争用 + confirm）。
+### 物理含义
 
-采集器新增 --v6d-endpoint 真实测量**隔离的 create+seal 控制面 RPC**（镜像连接器 batch_allocate/seal），记为 control_plane.save_completion_measured：
+save_completion（70ms + 6ms/blk）**不是 DMA 拷贝耗时，也不是控制面 RPC 耗时**。
 
+在真实系统中，store 的完整链路是：
+    bind_connector_metadata → forward（GPU计算）→ clear_backend_metadata
+    → _async_do_store（事件循环）→ async_get → DMA(~11ms) → seal → 跨节点可见
+
+其中 DMA 只有 ~11ms（实测打点），隔离 create+seal RPC 只有 ~2ms。但从
+build_connector_meta（bind 时刻）到 seal 可见，实测中位 315ms（主要是等 forward
+完成 + 事件循环调度延迟）。
+
+仿真 BLOCKING 模式里 store 的 deadline 从 **bind 时刻**（forward 前）起算，
+get_finished 在 **forward 后** 检查。这意味着：
+- forward > save_completion 时：deadline 在 forward 期间到期 → 当步释放 seal
+- forward < save_completion 时：deadline 未到期 → 延后到后续步
+
+save_completion 的数值（70+6/blk）标定的是：**在仿真单线程 BLOCKING 架构下，
+store→seal 可见需要额外延后多少才对齐真实系统中 forward 后的异步 store 链路时延
+（约 39ms 中位：async_get + DMA + 10ms 轮询 + rank 同步）**。它是时序补偿参数，
+不是独立的物理测量值。
+
+### 采集器的控制面测量（参考）
+
+采集器 --v6d-endpoint 测量的是**隔离的 create+seal RPC**（无并发负载）：
     python collect_bandwidth.py --gpu 0 --v6d-endpoint http://localhost:7890 --out profile.json
+结果记为 profile 的 control_plane.save_completion_measured（约 1.3ms + 0.08ms/blk）。
+这是控制面 RPC 的下界参考，**不用于仿真建模**。
 
-本环境实测（RTX PRO 6000）：create+seal = 1.31ms + 0.083ms/blk（约 2ms）。
+### 配参指引
 
-**gap 结论**：隔离 RPC（约 2ms）与日志尾巴（70+6/blk，实测个别 158-3099ms）相差 50-100 倍。差值来自 worker 侧异步 save 排队与争用（引擎忙于其他请求 forward 时 save 排队），采集器在无负载下测不到这部分。
-
-**配参指引**：
-- DMA 两段（seg2 load/store）：用 collect_bandwidth.py 直接实测，忠实可靠。
-- save_completion：保持日志推导值（它才能复现真实可见时序，已由命中率验证）；save_completion_measured（约 2ms）仅作控制面下界/健全性参考，不要用它替换 save_completion。
-- 换环境重标定 save_completion：从该环境真实运行日志回归 mark_saved 减 V6D_swap_region，而非用隔离 RPC。
+- DMA 两段（seg2 load/store）：用 collect_bandwidth.py 直接实测，物理量忠实。
+- save_completion：保持日志推导值（从 build_connector_meta 到 mark_saved 的中位，
+  190 样本回归 70+6/blk）。已由 9 组测试验证命中率偏差 <=0.68pp。
+- 换环境重标定 save_completion：从该环境真实运行日志回归 mark_saved 减
+  build_connector_meta(末store) 的中位/分桶拟合。不要用隔离 RPC 值替换。
