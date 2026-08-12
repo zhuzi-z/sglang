@@ -128,70 +128,90 @@ def _build_kv_cache_spec(vllm_config) -> dict:
         _fa_kwargs["block_size"] = block_size
 
     full_attn_spec = FullAttentionSpec(**_fa_kwargs)
+    attn_page_size = full_attn_spec.page_size_bytes
 
     if layer_types is None:
         # Pure MHA model - use layer name format matching vLLM convention
-        return {
+        kv_cache_spec: dict = {
             f"model.layers.{i}": full_attn_spec
             for i in range(num_hidden_layers)
         }
+    else:
+        # Hybrid model: build per-layer specs with uniform page size.
+        mamba_block_size = getattr(cache_config, "mamba_block_size", None)
+        if mamba_block_size is None:
+            mamba_block_size = block_size
 
-    # Hybrid model: build per-layer specs with uniform page size.
-    attn_page_size = full_attn_spec.page_size_bytes
+        # Build MambaSpec
+        mamba_kwargs = dict(
+            block_size=mamba_block_size,
+            shapes=((1, 1), (1, 1, 1)),
+            dtypes=(dtype, dtype),
+            page_size_padded=attn_page_size,
+            mamba_cache_mode=getattr(cache_config, "mamba_cache_mode", "none"),
+        )
+        # Forward num_speculative_blocks (MTP/EAGLE) so light-mode runtime
+        # block accounting matches the real deployment: the fork's
+        # MambaManager uses _num_runtime_blocks = 1 + num_speculative_blocks
+        # per request.  Leaving it at the default 0 makes each request hold
+        # 3 fewer blocks than real (MTP k=3), underestimating pool eviction
+        # pressure and letting cached mamba state snapshots live too long
+        # (task29: prefix-cache hit ratio overestimated by up to +10.3pp on
+        # node1_0047).
+        _mamba_fields = {f.name for f in dataclasses.fields(MambaSpec)}
+        if "num_speculative_blocks" in _mamba_fields:
+            spec_cfg = getattr(vllm_config, "speculative_config", None)
+            num_spec_tokens = (
+                getattr(spec_cfg, "num_speculative_tokens", 0) or 0
+            ) if spec_cfg is not None else 0
+            mamba_kwargs["num_speculative_blocks"] = num_spec_tokens
+        mamba_type_field = next(
+            (f for f in dataclasses.fields(MambaSpec) if f.name == "mamba_type"),
+            None,
+        )
+        if mamba_type_field is not None:
+            if mamba_type_field.type == str or mamba_type_field.type == "str":
+                mamba_kwargs["mamba_type"] = "gdn_attention"
+            elif _mamba_gdn_type is not None:
+                mamba_kwargs["mamba_type"] = _mamba_gdn_type
 
-    mamba_block_size = getattr(cache_config, "mamba_block_size", None)
-    if mamba_block_size is None:
-        mamba_block_size = block_size
+        mamba_spec = MambaSpec(**mamba_kwargs)
 
-    # Build MambaSpec
-    mamba_kwargs = dict(
-        block_size=mamba_block_size,
-        shapes=((1, 1), (1, 1, 1)),
-        dtypes=(dtype, dtype),
-        page_size_padded=attn_page_size,
-        mamba_cache_mode=getattr(cache_config, "mamba_cache_mode", "none"),
+        kv_cache_spec = {}
+        for i, layer_type in enumerate(layer_types):
+            layer_name = f"model.layers.{i}"
+            if layer_type == "full_attention":
+                kv_cache_spec[layer_name] = full_attn_spec
+            elif layer_type == "linear_attention":
+                kv_cache_spec[layer_name] = mamba_spec
+            else:
+                kv_cache_spec[layer_name] = full_attn_spec
+
+    # Speculative draft model layers: the real server's get_kv_cache_spec()
+    # walks static_forward_context, which also contains the draft model's
+    # attention layers — qwen3_5_mtp registers mtp_num_hidden_layers
+    # full-attention layers (same head config as the main model) under
+    # model.mtp.layers.<num_hidden_layers + idx>.  Mirror that here so the
+    # v6d attention group has the same layer count; otherwise every block
+    # object is under-sized by mtp_num_hidden_layers pages (real server:
+    # 16 attn layers = 132 MiB/block, sim was 15 = 123.75 MiB/block).
+    spec_cfg = getattr(vllm_config, "speculative_config", None)
+    spec_method = getattr(spec_cfg, "method", None) if spec_cfg else None
+    num_mtp_layers = (
+        getattr(hf_config, "mtp_num_hidden_layers", 0) or 0
+        if spec_method not in (None, "ngram", "suffix")
+        else 0
     )
-    # Forward num_speculative_blocks (MTP/EAGLE) so light-mode runtime block
-    # accounting matches the real deployment: the fork's MambaManager uses
-    # _num_runtime_blocks = 1 + num_speculative_blocks per request.  Leaving
-    # it at the default 0 makes each request hold 3 fewer blocks than real
-    # (MTP k=3), underestimating pool eviction pressure and letting cached
-    # mamba state snapshots live too long (task29: prefix-cache hit ratio
-    # overestimated by up to +10.3pp on node1_0047).
-    _mamba_fields = {f.name for f in dataclasses.fields(MambaSpec)}
-    if "num_speculative_blocks" in _mamba_fields:
-        spec_cfg = getattr(vllm_config, "speculative_config", None)
-        num_spec_tokens = (
-            getattr(spec_cfg, "num_speculative_tokens", 0) or 0
-        ) if spec_cfg is not None else 0
-        mamba_kwargs["num_speculative_blocks"] = num_spec_tokens
-    mamba_type_field = next(
-        (f for f in dataclasses.fields(MambaSpec) if f.name == "mamba_type"), None
-    )
-    if mamba_type_field is not None:
-        if mamba_type_field.type == str or mamba_type_field.type == "str":
-            mamba_kwargs["mamba_type"] = "gdn_attention"
-        elif _mamba_gdn_type is not None:
-            mamba_kwargs["mamba_type"] = _mamba_gdn_type
-
-    mamba_spec = MambaSpec(**mamba_kwargs)
-
-    kv_cache_spec: dict = {}
-    for i, layer_type in enumerate(layer_types):
-        layer_name = f"model.layers.{i}"
-        if layer_type == "full_attention":
-            kv_cache_spec[layer_name] = full_attn_spec
-        elif layer_type == "linear_attention":
-            kv_cache_spec[layer_name] = mamba_spec
-        else:
-            kv_cache_spec[layer_name] = full_attn_spec
+    for idx in range(num_mtp_layers):
+        layer_name = f"model.mtp.layers.{num_hidden_layers + idx}"
+        kv_cache_spec[layer_name] = full_attn_spec
 
     logger.info(
-        "[V6D Hijack] Built KV cache spec: %d layers, "
+        "[V6D Hijack] Built KV cache spec: %d layers (incl. %d MTP draft), "
         "num_kv_heads=%d (total=%d, tp=%d), head_size=%d, block_size=%d, "
         "page_size=%d bytes",
-        len(kv_cache_spec), num_kv_heads, total_num_kv_heads, tp_size,
-        head_size, block_size, attn_page_size,
+        len(kv_cache_spec), num_mtp_layers, num_kv_heads, total_num_kv_heads,
+        tp_size, head_size, block_size, attn_page_size,
     )
     return kv_cache_spec
 
