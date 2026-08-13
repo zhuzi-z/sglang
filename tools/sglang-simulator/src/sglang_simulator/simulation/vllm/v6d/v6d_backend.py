@@ -128,51 +128,42 @@ class C_HybridConnectorHook(BaseHook):
             # v6d save_count=1: the worker signals once, on the LAST save
             # of the request (_is_last_save=True).  Empty groups_data is
             # the noop last-save marker and must signal as well.
+            # Record store-completion deadlines. The actual
+            # mark_backend_save_done signal is sent by get_finished()
+            # at the next step boundary where now >= deadline, preserving
+            # step-aligned timing (matches production: seal only at
+            # schedule→update_connector_output). Uses the production RPC
+            # channel (mark_backend_save_done) to keep mamba block release.
             _bw = BandwidthModel.get()
+            _now = time.perf_counter()
+            _pending = getattr(self, "_sim_pending_store", {})
             save_done_reqs = {
                 req_id
                 for req_id, (_groups_data, is_last_save) in reqs_to_store.items()
                 if is_last_save
             }
             if save_done_reqs:
-                try:
-                    # sched_get_req looks up the live Scheduler's requests
-                    # dict (engine_proxy); HybridConnector itself has no
-                    # get_request() — same pattern as v6d_manager.py.
-                    from vllm.v1.hybrid_connector import (
-                        mark_backend_save_done,
-                        sched_get_req,
+                from vllm.v1.hybrid_connector import sched_get_req
+                for req_id in sorted(save_done_reqs):
+                    req = sched_get_req(req_id)
+                    if req is None:
+                        logger.warning(
+                            "[V6D Hijack] save_done: request %s not "
+                            "found in scheduler, skipping", req_id)
+                        continue
+                    _groups = reqs_to_store[req_id][0]
+                    _nblk = _sim_block_count(_groups) if _groups else 0
+                    delay_s = _bw.store_completion_latency(_nblk)
+                    _pending[req_id] = (
+                        max(_pending.get(req_id, (0.0,))[0] if req_id in _pending else 0.0,
+                            _now + delay_s),
+                        req,
                     )
-                    for req_id in sorted(save_done_reqs):
-                        req = sched_get_req(req_id)
-                        if req is None:
-                            logger.warning(
-                                "[V6D Hijack] save_done: request %s not "
-                                "found in scheduler, skipping", req_id)
-                            continue
-                        # Model the real async save latency structurally:
-                        #   max(DMA(nblk), poll_granularity) + rank_sync
-                        # (BandwidthModel.store_completion_latency).
-                        # For noop saves (empty groups) this is 0 → instant.
-                        _groups = reqs_to_store[req_id][0]
-                        _nblk = _sim_block_count(_groups) if _groups else 0
-                        delay_s = _bw.store_completion_latency(_nblk)
-                        if delay_s > 0:
-                            threading.Timer(
-                                delay_s,
-                                mark_backend_save_done, args=(req,),
-                            ).start()
-                        else:
-                            mark_backend_save_done(req)
-                    logger.debug(
-                        "[V6D Hijack] scheduled save_done: %s",
-                        sorted(save_done_reqs),
-                    )
-                except Exception:
-                    logger.exception(
-                        "[V6D Hijack] failed to signal save_done: %s",
-                        sorted(save_done_reqs),
-                    )
+                logger.debug(
+                    "[V6D Hijack] store deadlines set: %s",
+                    sorted(save_done_reqs),
+                )
+            self._sim_pending_store = _pending
             load_reqs = _collect_req_ids(metadata, "reqs_to_load")
             # Loads: production only reports finished_recving once its DMA
             # event fires, and the request cannot enter running before that.
@@ -213,19 +204,31 @@ class C_HybridConnectorHook(BaseHook):
             return None
 
         def override_get_finished(self, finished_req_ids):
-            # Fidelity: in hybrid mode the v6d save completion travels via
-            # the _SAVE_DONE_REQ RPC (simulated by mark_backend_save_done
-            # above), NOT via kv_connector_output.finished_sending — so no
-            # store reqs are reported here.
+            # Store completion is signalled via mark_backend_save_done (real
+            # _SAVE_DONE_REQ RPC channel, preserves mamba block release).
+            # We harvest the deadline here (step boundary = main thread) so
+            # the timing is step-aligned, matching production: seal/save-done
+            # only becomes visible at the scheduler's next get_finished call.
             _now = time.perf_counter()
+            _pending = getattr(self, "_sim_pending_store", {})
+            _done_rids = {rid for rid, (deadline, _req) in _pending.items()
+                          if _now >= deadline}
+            if _done_rids:
+                from vllm.v1.hybrid_connector import mark_backend_save_done
+                for rid in sorted(_done_rids):
+                    _deadline, _req = _pending.pop(rid)
+                    mark_backend_save_done(_req)
+            self._sim_pending_store = _pending
             _pending_l = getattr(self, "_sim_pending_load", {})
             load_reqs = {r for r, deadline in _pending_l.items() if _now >= deadline}
             for r in load_reqs:
                 _pending_l.pop(r, None)
             self._sim_pending_load = _pending_l
-            if load_reqs:
+            if _done_rids or load_reqs:
                 logger.debug(
-                    "[V6D Hijack] get_finished: load=%s finished_req_ids=%s",
+                    "[V6D Hijack] get_finished: save_done=%s load=%s "
+                    "finished_req_ids=%s",
+                    sorted(_done_rids),
                     sorted(load_reqs),
                     sorted(finished_req_ids or []),
                 )
