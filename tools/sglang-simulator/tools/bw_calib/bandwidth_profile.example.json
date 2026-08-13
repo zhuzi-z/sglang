@@ -132,16 +132,22 @@
   },
   "control_plane": {
     "save_completion": {
-      "floor_ms": 70.0,
-      "per_block_ms": 6.0,
-      "calibrated": true,
-      "source": "real-run log analysis: mark_saved-last_store, 190 samples, Pearson r=0.27"
+      "floor_ms": 0.0,
+      "per_block_ms": 0.0,
+      "calibrated": false,
+      "source": "DEPRECATED: replaced by store_completion (max(DMA,poll)+rank_sync); no longer used by store deadline"
     },
     "seg1_cross_node": {
       "floor_ms": 0.0,
       "per_block_ms": 0.0,
       "calibrated": false,
       "source": "PLACEHOLDER: SRPC/RDMA data path stubbed in CPU sim; measure with collect_remote.py on real hardware"
+    },
+    "store_completion": {
+      "poll_granularity_ms": 10.0,
+      "rank_sync_ms": 1.0,
+      "calibrated": true,
+      "source": "poll_granularity=code const asyncio.sleep(0.01); rank_sync from SIMPROBE copy_done->mark_saved (~1ms)"
     }
   }
 }

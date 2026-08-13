@@ -112,3 +112,26 @@ store→seal 可见需要额外延后多少才对齐真实系统中 forward 后�
   190 样本回归 70+6/blk）。已由 9 组测试验证命中率偏差 <=0.68pp。
 - 换环境重标定 save_completion：从该环境真实运行日志回归 mark_saved 减
   build_connector_meta(末store) 的中位/分桶拟合。不要用隔离 RPC 值替换。
+
+## L1<->L2 搬运排队建模（TODO，当前未实现）
+
+**现状**：`v6d_backend.py` 的 store/load deadline 为 `max(pending.get(rid,0), now + lat)` ——
+每个请求的完成时刻是各自独立的 `now + lat`，请求之间**不串行累加**。即多个
+并发的 store/load 在仿真中被视为**并行完成**，未建模"DMA 通道被占用、后来的
+搬运需排队等待"的行为。
+
+**真实系统**：async_swap 协程都跑在单一事件循环线程上（v6d_object_backend
+_async_do_store），存在真实排队；高负载下 mark_saved 尾巴可达数百 ms 部分源于此。
+
+**何时需要建模排队**：
+- 当前 loopback + 大 prefill（每步 forward 数百 ms）场景不需要——排队被 step 粒度吸收。
+- 超长请求（数千 block）+ 高并发场景需要——多个大 store 挤占同一通道。
+
+**TODO 实现思路**（共享通道串行累加）：
+```
+channel_free_time = max(channel_free_time, now) + DMA(nblk)
+deadline = channel_free_time + poll_granularity + rank_sync
+```
+即用一个 `channel_free_time` 游标表示 DMA 通道下次空闲时刻，新搬运排在其后。
+load / store 可各自一个通道，或共享（取决于 PCIe 是否全双工——实测双向基本全双工，
+可各自独立通道）。

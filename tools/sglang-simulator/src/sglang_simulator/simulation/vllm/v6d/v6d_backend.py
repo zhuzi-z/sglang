@@ -171,8 +171,7 @@ class C_HybridConnectorHook(BaseHook):
                 if not _groups:
                     continue
                 _nblk = _sim_block_count(_groups)
-                _lat = (_bw.latency_for(_nblk, False)
-                        + _bw.save_completion_latency(_nblk))
+                _lat = _bw.store_completion_latency(_nblk)
                 _pending[_rid] = max(_pending.get(_rid, 0.0), _now + _lat)
             self._sim_pending_store = _pending
             # Loads get the same treatment: production only reports one

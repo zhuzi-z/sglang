@@ -110,6 +110,15 @@ class BandwidthModel:
         _s1 = cp.get("seg1_cross_node", {})
         self._seg1_floor_ms = float(_s1.get("floor_ms", 0) or 0)
         self._seg1_per_blk_ms = float(_s1.get("per_block_ms", 0) or 0)
+        # Store completion structure (see store_completion_latency):
+        #   poll_granularity_ms: the async_swap loop polls the CUDA event with
+        #     `await asyncio.sleep(0.01)` (v6d_object_connector async_swap), so
+        #     completion is detected at 10 ms granularity regardless of DMA size.
+        #   rank_sync_ms: extra delay from all-TP-rank save_done aggregation
+        #     (_do_save_done try_advance) + cross-process notify.
+        _st = cp.get("store_completion", {})
+        self._poll_granularity_ms = float(_st.get("poll_granularity_ms", 10.0))
+        self._rank_sync_ms = float(_st.get("rank_sync_ms", 1.0))
         segs = profile.get("segments", {})
         if "local_load" in segs and "local_store" in segs:
             self.local_load = SegmentModel.from_samples("local_load", segs["local_load"])
@@ -134,6 +143,31 @@ class BandwidthModel:
             return 0.0
         seg = self.local_load if swap_in else self.local_store
         return seg.latency(self.seg2_bytes(num_blocks)) if seg else 0.0
+
+    def store_completion_latency(self, num_blocks: int) -> float:
+        """Wall-clock from store submit (bind) to it being harvestable by
+        get_finished, matching production's async save pipeline:
+
+            max(DMA(nblk), poll_granularity) + rank_sync
+
+        - DMA(nblk): the actual GPU->host copy (seg2 store bandwidth).
+        - poll_granularity (~10 ms): production polls the CUDA completion event
+          with `await asyncio.sleep(0.01)`, so even a 3 ms copy is only seen at
+          the next 10 ms tick.  For very large stores DMA dominates and the
+          max() switches over automatically.
+        - rank_sync (~1 ms): all-TP-rank save_done aggregation + notify.
+
+        Measured (SIMPROBE, 6 blk): copy_submitted->copy_done ~11 ms (=max(3,10)+1),
+        constant across 3-17 blk -> poll-granularity bound, as this formula
+        reproduces.  env overrides profile for the two structural constants."""
+        if not self.enabled or num_blocks <= 0:
+            return 0.0
+        dma_s = self.latency_for(num_blocks, False)
+        _p = os.environ.get("SGLANG_SIMULATOR_STORE_POLL_MS")
+        _r = os.environ.get("SGLANG_SIMULATOR_STORE_RANK_SYNC_MS")
+        poll_s = (float(_p) if _p is not None else self._poll_granularity_ms) / 1000.0
+        rank_s = (float(_r) if _r is not None else self._rank_sync_ms) / 1000.0
+        return max(dma_s, poll_s) + rank_s
 
     # -- control-plane latencies (env overrides profile) --------------------
 

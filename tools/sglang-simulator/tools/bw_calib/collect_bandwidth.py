@@ -188,6 +188,17 @@ def run(args):
                 "source": ("measured" if args.seg1_floor_ms > 0
                            else "PLACEHOLDER: data path stubbed; use collect_remote.py on real HW"),
             },
+            # Store completion = max(DMA, poll_granularity) + rank_sync.
+            # poll_granularity is a code constant (async_swap polls the CUDA
+            # event via asyncio.sleep(0.01)); rank_sync is the all-TP-rank
+            # save_done aggregation cost.  Both are structural, not bandwidth.
+            "store_completion": {
+                "poll_granularity_ms": args.store_poll_ms,
+                "rank_sync_ms": args.store_rank_sync_ms,
+                "calibrated": True,
+                "source": ("poll_granularity=code const asyncio.sleep(0.01); "
+                           "rank_sync from real-run SIMPROBE copy_done->mark_saved"),
+            },
         },
         "segments": {},
         "concurrency": {},
@@ -338,6 +349,10 @@ def main():
                    help="cross-node fetch fixed latency (0=placeholder, needs real HW)")
     p.add_argument("--seg1-per-blk-ms", type=float, default=0.0,
                    help="cross-node fetch per-block latency (0=placeholder)")
+    p.add_argument("--store-poll-ms", type=float, default=10.0,
+                   help="store completion poll granularity (code const asyncio.sleep(0.01)=10ms)")
+    p.add_argument("--store-rank-sync-ms", type=float, default=1.0,
+                   help="store completion all-rank save_done sync (~1ms from SIMPROBE)")
     p.add_argument("--v6d-endpoint", default=None,
                    help="v6d daemon URL (e.g. http://localhost:7890); if set, "
                         "measures the real create+seal control-plane latency "
