@@ -553,5 +553,163 @@ class TestPlatformHookAdditions:
         assert mem == 80 * (1 << 30)
 
 
+# ============================================================
+# Test: HybridConnector hook — mamba block protection release
+# (regression for the block-pool leak livelock, see
+#  docs/v6d_mamba_block_leak_hang_report.md)
+# ============================================================
+
+class TestHybridConnectorLeakFix:
+    """Verify save completion travels the REAL production channel.
+
+    In hybrid mode the v6d save-done is signalled via the worker's
+    _SAVE_DONE_REQ RPC (simulated by mark_backend_save_done), which drives
+    _do_save_done -> _saved/_try_teardown_save + async_cleanup (seal v6d
+    objects + release mamba protected blocks).  It does NOT travel via
+    kv_connector_output.finished_sending / update_connector_output —
+    both are upstream no-ops for hybrid and must stay untouched.
+
+    1. bind_connector_metadata resolves reqs_to_store through the
+       v6d_object+kvt combo nesting (meta.reqs.v6d.inner.reqs_to_store)
+       and fires mark_backend_save_done for last-save events.
+    2. Non-last saves do not signal (v6d save_count=1 semantics).
+    3. BandwidthModel.store_completion_latency defers the signal to
+       model the real async save latency (max(DMA, poll) + rank_sync).
+    4. get_finished never reports store reqs; update_connector_output and
+       request_finished_all_groups are left untouched (fidelity).
+    """
+
+    def _make_hooked_connector_cls(self):
+        from sglang_simulator.simulation.vllm.v6d.v6d_backend import (
+            C_HybridConnectorHook,
+        )
+
+        class FakeHybridConnector:
+            def bind_connector_metadata(self, metadata):
+                pass
+
+            def clear_connector_metadata(self):
+                pass
+
+            def request_finished_all_groups(self, request, block_ids):
+                return False, {"kv_transfer_pending": True}
+
+        C_HybridConnectorHook.hook(FakeHybridConnector)
+        return FakeHybridConnector
+
+    def _make_kvt_combo_meta(self, reqs_to_store):
+        # Mirrors HybridMetadata -> V6dObjectKVTMeta -> V6dObjectBackendMeta
+        # -> V6dObjectConnectorMetadata nesting for backend "v6d_object+kvt".
+        inner = SimpleNamespace(reqs_to_store=reqs_to_store, reqs_to_load={})
+        v6d = SimpleNamespace(inner=inner)
+        return SimpleNamespace(reqs=SimpleNamespace(v6d=v6d, kvt=None))
+
+    def _attach_nested_scheduler(self, connector):
+        scheduler = MagicMock()
+        backend = SimpleNamespace(_v6d=SimpleNamespace(_scheduler=scheduler))
+        connector._sched = SimpleNamespace(_backend=backend)
+        return scheduler
+
+    def _patch_save_done(self, requests):
+        # bind_connector_metadata imports mark_backend_save_done and
+        # sched_get_req from vllm.v1.hybrid_connector at call time.
+        mark = patch("vllm.v1.hybrid_connector.mark_backend_save_done")
+        get_req = patch("vllm.v1.hybrid_connector.sched_get_req",
+                        side_effect=lambda rid: requests.get(rid))
+        return mark, get_req
+
+    def test_last_save_fires_save_done_via_real_channel(self):
+        cls = self._make_hooked_connector_cls()
+        connector = cls()
+        req = SimpleNamespace(request_id="req-1")
+        meta = self._make_kvt_combo_meta(
+            {"req-1": ({0: (["hash_0"], [19])}, True)}   # is_last_save=True
+        )
+
+        mark, get_req = self._patch_save_done({"req-1": req})
+        with mark as mark_mock, get_req:
+            connector.bind_connector_metadata(meta)
+
+        mark_mock.assert_called_once_with(req)
+        # Fidelity: save completion must NOT surface as finished_sending
+        store, _ = connector.get_finished(set())
+        assert store == set()
+
+    def test_intermediate_save_does_not_signal(self):
+        cls = self._make_hooked_connector_cls()
+        connector = cls()
+        req = SimpleNamespace(request_id="req-1")
+        meta = self._make_kvt_combo_meta(
+            {"req-1": ({0: (["hash_0"], [19])}, False)}  # is_last_save=False
+        )
+
+        mark, get_req = self._patch_save_done({"req-1": req})
+        with mark as mark_mock, get_req:
+            connector.bind_connector_metadata(meta)
+
+        mark_mock.assert_not_called()
+
+    def test_noop_empty_last_save_still_signals(self):
+        cls = self._make_hooked_connector_cls()
+        connector = cls()
+        req = SimpleNamespace(request_id="req-1")
+        # Empty groups_data marks the noop last save — must still signal
+        meta = self._make_kvt_combo_meta({"req-1": ({}, True)})
+
+        mark, get_req = self._patch_save_done({"req-1": req})
+        with mark as mark_mock, get_req:
+            connector.bind_connector_metadata(meta)
+
+        mark_mock.assert_called_once_with(req)
+
+    def test_save_done_delay_defers_signal(self):
+        cls = self._make_hooked_connector_cls()
+        connector = cls()
+        req = SimpleNamespace(request_id="req-1")
+        meta = self._make_kvt_combo_meta(
+            {"req-1": ({0: (["hash_0"], [19])}, True)}
+        )
+
+        mark, get_req = self._patch_save_done({"req-1": req})
+        _bw_mock = MagicMock()
+        _bw_mock.store_completion_latency.return_value = 0.05  # 50ms
+        with mark as mark_mock, get_req, \
+                patch(
+                    "sglang_simulator.simulation.vllm.v6d.v6d_backend"
+                    ".BandwidthModel.get",
+                    return_value=_bw_mock,
+                ):
+            connector.bind_connector_metadata(meta)
+            # Not fired yet: models the in-flight async save holding
+            # block protection for the save duration
+            mark_mock.assert_not_called()
+
+            import time as _time
+            _time.sleep(0.08)
+            mark_mock.assert_called_once_with(req)
+
+    def test_update_connector_output_left_untouched(self):
+        """Fidelity: upstream HybridConnector has no update_connector_output
+        (base no-op); the hook must not add one."""
+        cls = self._make_hooked_connector_cls()
+        assert "update_connector_output" not in cls.__dict__
+
+    def test_request_finished_left_untouched(self):
+        """Fidelity: upstream has no finish-time release; the hook must
+        preserve the original request_finished_all_groups untouched (the
+        finish-time safety net is expected to be fixed upstream)."""
+        cls = self._make_hooked_connector_cls()
+        connector = cls()
+        scheduler = self._attach_nested_scheduler(connector)
+
+        request = SimpleNamespace(request_id="req-1")
+        should_wait, params = connector.request_finished_all_groups(
+            request, ([1, 2],))
+
+        assert should_wait is False
+        assert params == {"kv_transfer_pending": True}
+        scheduler.request_finished_all_groups.assert_not_called()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
