@@ -210,6 +210,19 @@ class C_VLLMSchedulerHook(BaseHook):
             # --- Call original schedule ---
             scheduler_output = original_schedule(self)
 
+            # Real-time per-request hit-rate log at inference end: vLLM reports
+            # requests finished in the previous step via finished_req_ids.
+            for fin_id in getattr(scheduler_output, "finished_req_ids", None) or ():
+                st = request_stats_manager.stats.get(fin_id)
+                if st is not None:
+                    logger.info(
+                        "[HitRate] rid=%s input_len=%d local_hit=%d ext_hit=%d",
+                        st.rid,
+                        st.input_length,
+                        st.local_kv_hit_len,
+                        st.ext_kv_hit_len,
+                    )
+
             # --- Build ScheduleBatch and predict inference time ---
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens
             if not num_scheduled_tokens:
