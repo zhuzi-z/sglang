@@ -214,10 +214,23 @@ class C_HybridConnectorHook(BaseHook):
             _done_rids = {rid for rid, (deadline, _req) in _pending.items()
                           if _now >= deadline}
             if _done_rids:
-                from vllm.v1.hybrid_connector import mark_backend_save_done
+                from vllm.v1.hybrid_connector import (
+                    HB_SAVE_SOURCES,
+                    get_param,
+                    mark_backend_save_done,
+                )
                 for rid in sorted(_done_rids):
                     _deadline, _req = _pending.pop(rid)
-                    mark_backend_save_done(_req)
+                    # Save-done is tracked per backend source (v6d_object,
+                    # kvt, ...): the scheduler registers the expected labels
+                    # at save-prepare time and only seals the store once every
+                    # one of them has signalled, so echo them all here.
+                    _sources = tuple(get_param(_req, HB_SAVE_SOURCES, ()) or ())
+                    if _sources:
+                        for _source in _sources:
+                            mark_backend_save_done(_req, source=_source)
+                    else:
+                        mark_backend_save_done(_req)
             self._sim_pending_store = _pending
             _pending_l = getattr(self, "_sim_pending_load", {})
             load_reqs = {r for r, deadline in _pending_l.items() if _now >= deadline}
