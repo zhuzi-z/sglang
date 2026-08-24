@@ -711,5 +711,439 @@ class TestHybridConnectorLeakFix:
         scheduler.request_finished_all_groups.assert_not_called()
 
 
+# ============================================================
+# Test: V6dObjectManager hook — write-path dedup (P0-A) and
+# short-circuit holder registration (P0-B)
+# ============================================================
+
+class TestV6dManagerRealLookupPath:
+    """The manager hook must NOT override the real read-path methods.
+
+    After the real-path alignment, lookup/async_lookup/get_key/
+    async_get_key/prepare_batch_allocate are the production connector
+    methods (batch ``client.get``, ``_cached_objs`` skip, holder
+    registration); the hook only touches __init__/_async_connect and the
+    batch_allocate dead-daemon fallback.
+    """
+
+    def _make_hooked_manager_cls(self):
+        from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
+            C_V6dObjectManagerHook,
+        )
+
+        class FakeV6dObjectManager:
+            def __init__(self):
+                self._group_id = 0
+                self._pending_objs = {}
+                self._cached_objs = {}
+                self._cached_objs_reqs = {}
+                self.client = None
+
+            def _make_key(self, h):
+                return f"key-{h}"
+
+            def lookup(self, block_hashes, request_id=None,
+                       unfetched_objs=None):
+                raise NotImplementedError
+
+            async def async_lookup(self, block_hashes, request_id=None,
+                                   unfetched_objs=None):
+                raise NotImplementedError
+
+            def get_key(self, block_hash, request_id=None):
+                raise NotImplementedError
+
+            async def async_get_key(self, block_hash, request_id=None):
+                raise NotImplementedError
+
+            def prepare_batch_allocate(self, block_hashes):
+                raise NotImplementedError
+
+            def batch_allocate(self, *args, **kwargs):
+                raise NotImplementedError
+
+        originals = {
+            name: getattr(FakeV6dObjectManager, name)
+            for name in ("lookup", "async_lookup", "get_key",
+                         "async_get_key", "prepare_batch_allocate")
+        }
+        C_V6dObjectManagerHook.hook(FakeV6dObjectManager)
+        return FakeV6dObjectManager, originals
+
+    def test_read_path_methods_not_overridden(self):
+        cls, originals = self._make_hooked_manager_cls()
+        for name, fn in originals.items():
+            assert getattr(cls, name) is fn, (
+                f"{name} must stay the real connector method")
+
+    def test_batch_allocate_fallback_for_dead_client(self):
+        from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
+            _DeadClient,
+        )
+        cls, _ = self._make_hooked_manager_cls()
+        mgr = cls()
+        mgr.client = _DeadClient("fake://0")
+
+        result = mgr.batch_allocate(["a", "b"], 1, (), None,
+                                    request_id="r1")
+
+        assert result == {"a": "key-a", "b": "key-b"}
+        assert mgr._pending_objs == {"a": "key-a", "b": "key-b"}
+
+    def test_batch_allocate_delegates_for_live_client(self):
+        cls, _ = self._make_hooked_manager_cls()
+        mgr = cls()
+        mgr.client = object()  # live client -> real batch_allocate
+
+        with pytest.raises(NotImplementedError):
+            mgr.batch_allocate(["a"], 1, (), None, request_id="r1")
+
+    def test_dead_client_reads_miss(self):
+        import asyncio
+        from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
+            _DeadClient,
+        )
+
+        client = _DeadClient("fake://0")
+        assert client.get(["k"]) is None
+        assert asyncio.run(client.async_get(["k"])) is None
+
+    def test_async_connect_failure_installs_dead_client(self):
+        # FakeV6dObjectManager lives in the test module, which has no
+        # _connect_v6d_with_retry -> the override's failure path runs.
+        from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
+            _DeadClient,
+        )
+        cls, _ = self._make_hooked_manager_cls()
+        mgr = cls()
+        mgr._v6d_url = "fake://0"
+        mgr._v6d_backend = None
+        mgr._async_connect()
+
+        assert isinstance(mgr.client, _DeadClient)
+
+
+class TestSchedulerRealLookupPath:
+    """The scheduler hook must NOT override the real lookup entry points."""
+
+    def test_get_num_new_matched_tokens_not_overridden(self):
+        from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
+            C_V6dObjectConnectorSchedulerHook,
+        )
+
+        class FakeScheduler:
+            def get_num_new_matched_tokens(self, request, n):
+                raise NotImplementedError
+
+            async def async_get_num_new_matched_tokens(self, request, n):
+                raise NotImplementedError
+
+            def request_finished(self, request, block_ids):
+                return False, None
+
+            def request_finished_all_groups(self, request, block_ids):
+                return False, None
+
+        orig_sync = FakeScheduler.get_num_new_matched_tokens
+        orig_async = FakeScheduler.async_get_num_new_matched_tokens
+        C_V6dObjectConnectorSchedulerHook.hook(FakeScheduler)
+
+        assert FakeScheduler.get_num_new_matched_tokens is orig_sync
+        assert FakeScheduler.async_get_num_new_matched_tokens is orig_async
+
+    def test_request_finished_wrapped_for_cpu_noop_store(self):
+        from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
+            C_V6dObjectConnectorSchedulerHook,
+        )
+
+        class FakeScheduler:
+            def request_finished(self, request, block_ids):
+                return False, None
+
+            def request_finished_all_groups(self, request, block_ids):
+                return False, None
+
+        C_V6dObjectConnectorSchedulerHook.hook(FakeScheduler)
+        sched = FakeScheduler()
+
+        class _Req:
+            request_id = "r1"
+
+        # should_wait=False -> no store completion, passthrough.
+        assert sched.request_finished(_Req(), []) == (False, None)
+        assert sched.request_finished_all_groups(_Req(), []) == (False, None)
+
+
+# ============================================================
+# Test: sim fetch = seal-only (no data movement)
+# ============================================================
+
+class TestSimFetchSealOnly:
+    """C_V6dObjectFetchHelperHook.start_fetch completes lazy placeholders
+    via the real seal protocol (set_seal_target + complete -> client.seal)
+    without touching BlockReceiver or blob data."""
+
+    def _make_hooked_helper_cls(self):
+        from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
+            C_V6dObjectFetchHelperHook,
+        )
+
+        class FakeFetchHelper:
+            def start_fetch(self, objs):
+                raise NotImplementedError
+
+        C_V6dObjectFetchHelperHook.hook(FakeFetchHelper)
+        return FakeFetchHelper
+
+    @staticmethod
+    def _make_objs(specs):
+        """specs: list of (key, location); one shared lease + client."""
+
+        class FakeLease:
+            def __init__(self):
+                self.seal_count = 0
+                self.seal_target_count = 0
+                self.completed_object_keys = []
+
+        class FakeClient:
+            def __init__(self):
+                self.seal_calls = []
+
+            def seal(self, lease_id, seal_object_keys=None):
+                self.seal_calls.append((lease_id, list(seal_object_keys)))
+
+        class FakeObj:
+            def __init__(self, key, location, lease, client):
+                self.key = key
+                self.meta = {"location": location}
+                self._lease = lease
+                self._lease_id = "L1"
+                self._client = client
+                self.seal_target_set = None
+
+            def set_seal_target(self, count):
+                self.seal_target_set = count
+                self._lease.seal_target_count = count
+
+            def complete(self):
+                # Mirror v6d Object.complete(): mark local, bump the shared
+                # lease counter, and fire client.seal when the target is met.
+                self.meta["location"] = "local"
+                self._lease.seal_count += 1
+                self._lease.completed_object_keys.append(self.key)
+                if self._lease.seal_count == self._lease.seal_target_count:
+                    self._client.seal(
+                        self._lease_id,
+                        seal_object_keys=self._lease.completed_object_keys)
+
+        lease = FakeLease()
+        client = FakeClient()
+        objs = [FakeObj(k, loc, lease, client) for k, loc in specs]
+        return objs, lease, client
+
+    def test_lazy_placeholders_sealed(self):
+        helper = self._make_hooked_helper_cls()()
+        objs, lease, client = self._make_objs(
+            [("k1", "10.0.0.2:9600"), ("k2", "sharedfs")])
+
+        assert helper.start_fetch(objs) is None
+
+        # Seal target narrowed to the fetched subset, then both completed
+        # and the lease sealed once with both keys.
+        assert objs[0].seal_target_set == 2
+        assert client.seal_calls == [("L1", ["k1", "k2"])]
+        assert all(o.meta["location"] == "local" for o in objs)
+
+    def test_local_objs_untouched(self):
+        helper = self._make_hooked_helper_cls()()
+        objs, lease, client = self._make_objs([("k1", "local")])
+
+        assert helper.start_fetch(objs) is None
+        assert client.seal_calls == []
+        assert objs[0].seal_target_set is None
+
+    def test_empty_and_none(self):
+        helper = self._make_hooked_helper_cls()()
+        assert helper.start_fetch([]) is None
+        assert helper.start_fetch(None) is None
+        assert helper.start_fetch([None]) is None
+
+
+# ============================================================
+# Test: daemon [V6D HitSource] — port of production v6d_hitsource_patch
+# ============================================================
+
+class TestAcquireTieredReadHitSource:
+    """One [V6D HitSource] line per _acquire_tiered_read batch, with the
+    daemon's own record_*_hit classification feeding the bag."""
+
+    @staticmethod
+    def _cap_sim_logs(caplog, level):
+        """Capture sglang_simulator records even when propagate=False."""
+        import contextlib
+        import logging
+
+        @contextlib.contextmanager
+        def _ctx():
+            sim_logger = logging.getLogger("sglang_simulator")
+            sim_logger.addHandler(caplog.handler)
+            try:
+                with caplog.at_level(level, logger="sglang_simulator"):
+                    yield
+            finally:
+                sim_logger.removeHandler(caplog.handler)
+
+        return _ctx()
+
+    @staticmethod
+    def _make_peer(plan):
+        """Hooked fake peer whose read batch records hits per *plan*."""
+        from sglang_simulator.simulation.vllm.v6d import v6d_capacity as cap
+
+        class FakeStats:
+            def record_local_vineyard_hit(self, size=0):
+                pass
+
+            def record_remote_vineyard_hit(self, size=0):
+                pass
+
+            def record_sharedfs_hit(self, size=0):
+                pass
+
+            def record_tair_kvcm_hit(self, size=0):
+                pass
+
+        cap.C_HitRateStatsHook.hook(FakeStats)
+
+        class FakePeer:
+            def __init__(self):
+                self._hit_stats = FakeStats()
+
+            async def _acquire_tiered_read(self, object_keys, term,
+                                           peer=None, request_id=None,
+                                           best_effort=False):
+                stats = self._hit_stats
+                for _ in range(plan.get("local", 0)):
+                    stats.record_local_vineyard_hit(1)
+                for _ in range(plan.get("p2p", 0)):
+                    stats.record_remote_vineyard_hit(1)
+                for _ in range(plan.get("sharedfs", 0)):
+                    stats.record_sharedfs_hit(1)
+                for _ in range(plan.get("tair_kvcm", 0)):
+                    stats.record_tair_kvcm_hit(1)
+                if plan.get("raise"):
+                    raise RuntimeError("boom")
+                return None, []
+
+        cap.C_TieredVineyardPeerHook.hook(FakePeer)
+        return FakePeer()
+
+    @staticmethod
+    def _hit_source_lines(caplog):
+        return [r.getMessage() for r in caplog.records
+                if "[V6D HitSource]" in r.getMessage()]
+
+    def test_per_batch_source_split(self, caplog):
+        import asyncio
+        import logging
+
+        peer = self._make_peer({"local": 2, "p2p": 1})
+        with self._cap_sim_logs(caplog, logging.INFO):
+            asyncio.run(peer._acquire_tiered_read(
+                ["a", "b", "c", "d", "e"], None, request_id="r1"))
+        lines = self._hit_source_lines(caplog)
+        assert len(lines) == 1
+        assert lines[0] == (
+            "[V6D HitSource] request_id=r1 queried=5 local=2 p2p=1 "
+            "sharedfs=0 tair_kvcm=0 miss=2")
+
+    def test_error_suffix_and_reraise(self, caplog):
+        import asyncio
+        import logging
+
+        peer = self._make_peer({"local": 1, "raise": True})
+        with self._cap_sim_logs(caplog, logging.INFO):
+            with pytest.raises(RuntimeError):
+                asyncio.run(peer._acquire_tiered_read(
+                    ["a", "b"], None, request_id="r2"))
+        lines = self._hit_source_lines(caplog)
+        assert len(lines) == 1
+        assert "error=RuntimeError" in lines[0]
+        assert "miss=1" in lines[0]
+
+    def test_disabled_by_env(self, caplog, monkeypatch):
+        import asyncio
+        import logging
+
+        monkeypatch.setenv("V6D_HITSOURCE_LOG", "0")
+        peer = self._make_peer({"local": 1})
+        with self._cap_sim_logs(caplog, logging.INFO):
+            asyncio.run(peer._acquire_tiered_read(
+                ["a"], None, request_id="r3"))
+        assert self._hit_source_lines(caplog) == []
+
+    def test_record_outside_read_not_counted(self, caplog):
+        import logging
+
+        peer = self._make_peer({})
+        with self._cap_sim_logs(caplog, logging.INFO):
+            # No bag active outside _acquire_tiered_read: no line, no error.
+            peer._hit_stats.record_local_vineyard_hit(1)
+        assert self._hit_source_lines(caplog) == []
+
+
+# ============================================================
+# Test: remote data-plane stubs (metadata only, no transfer)
+# ============================================================
+
+class TestTransferStubs:
+
+    def teardown_method(self):
+        from sglang_simulator.simulation.vllm.v6d.v6d_capacity import (
+            VirtualCapacityManager,
+        )
+        VirtualCapacityManager.reset()
+
+    def test_fabricated_metas_use_page_size(self):
+        from sglang_simulator.simulation.vllm.v6d.v6d_capacity import (
+            VirtualCapacityManager,
+            _sim_get_metas_by_names,
+        )
+        mgr = VirtualCapacityManager.get_or_create(1 << 30)
+        mgr.record_allocate([51511296])  # first store teaches the page size
+
+        metas = _sim_get_metas_by_names(["a", "b"], "10.0.0.2:9600")
+
+        assert len(metas) == 2
+        assert [m.size for m in metas] == [51511296, 51511296]
+        assert metas[0].buffer_num == 1
+        # C++ create_data behind seal() rejects metas without these fields.
+        meta_dict = metas[0].get_dict()
+        assert meta_dict["typename"] == "vineyard::Object"
+        assert meta_dict["instance_id"] == 0
+        assert meta_dict["transient"] is False
+        # buffer_0 carries a parseable placeholder object id; reconstruct_meta
+        # replaces it with the local blob before seal.
+        metas[0].buffer[0].object_id.to_string()
+
+    def test_unknown_page_size_fails_like_remote_miss(self):
+        from sglang_simulator.simulation.vllm.v6d.v6d_capacity import (
+            VirtualCapacityManager,
+            _sim_get_metas_by_names,
+        )
+        VirtualCapacityManager.get_or_create(1 << 30)  # no store yet
+
+        with pytest.raises(KeyError):
+            _sim_get_metas_by_names(["a"], "10.0.0.2:9600")
+
+    def test_load_data_noop(self):
+        from sglang_simulator.simulation.vllm.v6d.v6d_capacity import (
+            _sim_async_load_data_noop,
+            _sim_load_data_noop,
+        )
+        assert _sim_load_data_noop([[1]], [[2]], [[0]], [[4]], "x:1") is None
+        assert _sim_async_load_data_noop([[1]], [[2]], [[0]], [[4]], "x:1") == []
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

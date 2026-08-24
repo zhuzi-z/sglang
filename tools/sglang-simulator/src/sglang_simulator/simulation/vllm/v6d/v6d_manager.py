@@ -1,23 +1,25 @@
-"""
-V6D Object Manager hooks for native control-plane P2P ownership simulation.
+"""V6D Object Manager hooks for native control-plane P2P ownership simulation.
 
 In native V6D control-plane mode this module keeps the real vLLM
-V6dObjectManager/V6dObjectConnectorScheduler classes in the request path, but
-bypasses the unavailable CPU-only data plane:
+V6dObjectManager/V6dObjectConnectorScheduler classes in the request path.
+The lookup path is the REAL one — ``lookup``/``get_key`` issue
+``client.get()`` reads that run the daemon's real
+``TieredVineyardPeer._acquire_tiered_read`` (LRU touch, lease pin, tracker
+P2P probe, tiered fetch admission, re-ANNOUNCE).  Only the data plane is
+stubbed:
 
-1. Tag each manager with `_SIM_V6D_ACTIVE_WORKER_ID`.
-2. Resolve lookup hits through real v6d daemon P2P path (client.exists →
-   Redis tracker), without attempting SRPC/CUDA data transfer.
-3. Bypass scheduler-side `client.create()` while preserving cross-group
-   allocation semantics.
+1. Daemon side (v6d_capacity.py): remote SRPC meta/data transfer replaced
+   by fabricated metas + no-op loads.
+2. Connector side (here): ``V6dObjectFetchHelper.start_fetch`` skips
+   BlockReceiver (SRPC -> GPU) and only completes the lazy-seal protocol.
+3. Worker side (v6d_worker.py): load/store handlers stay CPU no-ops.
 
-NOTE: The legacy etcd-backed # V6dBlockOwnershipTracker (removed) and V6DCacheStorage
-have been removed. The P2P path (client.exists via Redis tracker) is the
-only supported cross-node matching mechanism.
+NOTE: The legacy etcd-backed V6dBlockOwnershipTracker (removed) and
+V6DCacheStorage have been removed. The P2P path (client.get via Redis
+tracker) is the only supported cross-node matching mechanism.
 """
 
 from __future__ import annotations
-import asyncio
 import os
 import sys
 
@@ -27,21 +29,24 @@ from sglang_simulator.utils import get_logger
 logger = get_logger()
 
 
-def _sim_client_exists(client, key: str, request_id=None) -> bool:
-    """Plain client.exists() with per-request diagnostics on failure.
+class _DeadClient:
+    """Stand-in for a v6d client whose daemon never came up.
 
-    Matches the production lookup path (no protocol extensions).
-    *request_id* is used only for log attribution.
+    Keeps the real read path alive instead of crashing on
+    ``assert self.client is not None``: every read misses (``get`` returns
+    None, exactly like a daemon that has no data), so the scheduler simply
+    observes 0 external hits.  Store calls are routed to the manager's
+    local-key fallback by ``override_batch_allocate``.
     """
-    try:
-        return bool(client.exists(key))
-    except Exception as e:
-        logger.warning(
-            "[V6D DIAG] exists() failed req=%s key=%s: %r -> treated as MISS",
-            request_id, key, e)
-        return False
 
+    def __init__(self, url):
+        self._url = url
 
+    def get(self, object_key, **kwargs):
+        return None
+
+    async def async_get(self, object_key, **kwargs):
+        return None
 
 
 
@@ -83,7 +88,11 @@ class C_V6dObjectManagerHook(BaseHook):
                     self._group_id, self._v6d_url,
                 )
             except Exception as e:
-                self.client = None
+                # Non-None stand-in: the real lookup path asserts
+                # ``self.client is not None``; a _DeadClient misses every
+                # read, which is exactly what a dead-but-connected daemon
+                # looks like to the scheduler.
+                self.client = _DeadClient(getattr(self, "_v6d_url", "?"))
                 logger.warning(
                     "[V6D P2P] Manager group=%d cannot connect to v6d daemon "
                     "at %s: %s. Cross-node lookup will return 0 hits.",
@@ -116,139 +125,15 @@ class C_V6dObjectManagerHook(BaseHook):
 
         target.__init__ = override_init
 
-        def _lookup_loop(self, block_hashes, request_id, exists_fn):
-            """Shared hit-counting loop for lookup/async_lookup.
-
-            *exists_fn* performs the (possibly awaited-elsewhere) exists
-            check for one key; the loop truncates at the first miss.
-            """
-            hits = 0
-            total = 0
-            stop_reason = "all_hit"
-            for h in block_hashes:
-                total += 1
-                key = self._make_key(h)
-                if key in self._cached_objs:
-                    hits += 1
-                    continue
-                try:
-                    if exists_fn(key):
-                        self._cached_objs[key] = key
-                        if request_id is not None:
-                            self._hold_key_for_req(key, request_id)
-                        hits += 1
-                    else:
-                        stop_reason = f"miss@{hits} key={key}"
-                        break
-                except Exception as e:
-                    stop_reason = f"exception@{hits} key={key}: {e!r}"
-                    break
-            return hits, total, stop_reason
-
-        def override_lookup(self, block_hashes, request_id=None,
-                            unfetched_objs=None):
-            if getattr(self, "client", None) is None:
-                return 0
-            hits, total, stop_reason = _lookup_loop(
-                self, block_hashes, request_id,
-                lambda key: _sim_client_exists(self.client, key, request_id))
-            if stop_reason != "all_hit":
-                logger.info(
-                    "[V6D DIAG] lookup group=%s req=%s hits=%d/%d stop=%s",
-                    self._group_id, request_id, hits, total, stop_reason)
-            return hits * getattr(self, "_group_block_size", 1)
-
-        async def override_async_lookup(self, block_hashes, request_id=None,
-                                        unfetched_objs=None):
-            if getattr(self, "client", None) is None:
-                return 0
-            loop = asyncio.get_running_loop()
-            hits = 0
-            total = 0
-            stop_reason = "all_hit"
-            for h in block_hashes:
-                total += 1
-                key = self._make_key(h)
-                if key in self._cached_objs:
-                    hits += 1
-                    continue
-                try:
-                    exists = await loop.run_in_executor(
-                        None, _sim_client_exists, self.client, key, request_id)
-                    if exists:
-                        self._cached_objs[key] = key
-                        if request_id is not None:
-                            self._hold_key_for_req(key, request_id)
-                        hits += 1
-                    else:
-                        stop_reason = f"miss@{hits} key={key}"
-                        break
-                except Exception as e:
-                    stop_reason = f"exception@{hits} key={key}: {e!r}"
-                    break
-            if stop_reason != "all_hit":
-                logger.info(
-                    "[V6D DIAG] async_lookup group=%s req=%s hits=%d/%d stop=%s",
-                    self._group_id, request_id, hits, total, stop_reason)
-            return hits * getattr(self, "_group_block_size", 1)
-
-        def override_get_key(self, block_hash, request_id=None):
-            key = self._make_key(block_hash)
-            if key in self._cached_objs:
-                if request_id is not None:
-                    self._hold_key_for_req(key, request_id)
-                return key
-            # P2P mode: use client.exists() to check tracker without
-            # attempting client.get() which fails under -rpc=false.
-            # Simulate "data transferred" by returning a fake key;
-            # actual KV data is not needed in CPU simulation.
-            try:
-                if self.client is not None and self.client.exists(key):
-                    self._cached_objs[key] = key
-                    if request_id is not None:
-                        self._hold_key_for_req(key, request_id)
-                    return key
-            except Exception:
-                pass
-            return None
-
-        async def override_async_get_key(self, block_hash, request_id=None):
-            return override_get_key(self, block_hash, request_id=request_id)
-
-        original_lookup = target.lookup
-        original_async_lookup = target.async_lookup
-        original_get_key = target.get_key
-        original_async_get_key = target.async_get_key
-        target.lookup = override_lookup
-        target.async_lookup = override_async_lookup
-        target.get_key = override_get_key
-        target.async_get_key = override_async_get_key
-
-        # ---- Override prepare_batch_allocate to not skip _cached_objs ----
-        # The original prepare_batch_allocate skips hashes that are already
-        # in _cached_objs.  However, _cached_objs persists across v6d
-        # restarts (vLLM is not restarted between slowdown factors), so
-        # hashes found by Phase 2 lookup in sf=0.2 would cause saves to be
-        # skipped in sf=0.8 even though the tracker was flushed.
-        # Fix: only skip _pending_objs (in-flight creates), not _cached_objs
-        # (stale lookup cache).  client.create(ignore_existing=True) handles
-        # the actual dedup against the live tracker.
-        original_prepare_batch_allocate = getattr(target, 'prepare_batch_allocate', None)
-        if original_prepare_batch_allocate is not None:
-            def override_prepare_batch_allocate(self, block_hashes):
-                to_create_hashes = []
-                to_create_keys = []
-                for h in block_hashes:
-                    if h in self._pending_objs:
-                        continue
-                    key = self._make_key(h)
-                    to_create_hashes.append(h)
-                    to_create_keys.append(key)
-                return to_create_hashes, to_create_keys
-            target.prepare_batch_allocate = override_prepare_batch_allocate
-            logger.info("[V6D P2P] Manager group hook: prepare_batch_allocate "
-                        "override installed (skips _pending_objs only)")
-
+        # NOTE: lookup/async_lookup/get_key/async_get_key and
+        # prepare_batch_allocate are NOT overridden — the real connector
+        # methods run unchanged.  ``client.get()`` is metadata-only RPC plus
+        # an Object wrapper (no payload movement), so it is CPU-safe; the
+        # daemon side is stubbed at the transfer layer instead
+        # (v6d_capacity.py).  This also retires the sim's P0-A/P0-B fixes:
+        # the real ``prepare_batch_allocate`` already skips ``_cached_objs``
+        # and the real ``_process_lookup``/``get_key`` already register
+        # holders on the short-circuit path.
 
         # ---- Override batch_allocate to record ownership ----
         if hasattr(target, 'batch_allocate'):
@@ -257,7 +142,8 @@ class C_V6dObjectManagerHook(BaseHook):
             def override_batch_allocate(self, block_hashes, size, shape,
                                         dtype, request_id=None):
                 """Allocate simulated V6D keys without v6d client data-plane."""
-                if getattr(self, "client", None) is not None:
+                client = getattr(self, "client", None)
+                if client is not None and not isinstance(client, _DeadClient):
                     return original_batch_allocate(
                         self, block_hashes, size, shape, dtype,
                         request_id=request_id)
@@ -282,8 +168,77 @@ class C_V6dObjectManagerHook(BaseHook):
                     "(real v6d P2P path)")
 
 
+class C_V6dObjectFetchHelperHook(BaseHook):
+    """Replace the BlockReceiver data plane with the bare seal protocol.
+
+    Real ``start_fetch`` hands the hit objects to ``BlockReceiver``, which
+    SRPC-loads remote/sharedfs payloads into the local blobs and then seals
+    the lazy placeholders (``set_seal_target`` + ``Object.complete()`` per
+    external obj).  In simulation the local blobs are 4K stubs that already
+    occupy the right virtual capacity, so only the seal protocol runs — no
+    bytes move.  Returning None makes the real ``wait()`` report zero tier
+    counts; ``_promote_fetched_objs`` then runs unchanged.
+    """
+
+    HOOK_CLASS_NAME = "V6dObjectFetchHelper"
+    HOOK_MODULE_NAME = (
+        "vllm.distributed.kv_transfer.kv_connector.v1.v6d_object_connector"
+    )
+
+    @classmethod
+    def hook(cls, target):
+        def override_start_fetch(self, objs):
+            objs = [o for o in (objs or ()) if o is not None]
+            if not objs:
+                return None
+            by_lease: dict = {}
+            for o in objs:
+                lease_id = getattr(o, "_lease_id", None)
+                if lease_id:
+                    by_lease.setdefault(lease_id, []).append(o)
+            for lease_id, group in by_lease.items():
+                pending = [
+                    o for o in group
+                    if getattr(o, "meta", {}).get("location", "local") != "local"
+                ]
+                if not pending:
+                    continue
+                try:
+                    # Narrow the lease's seal target to the fetched subset —
+                    # the same lease may also cover probe-only objects that
+                    # were dropped after mamba boundary selection.
+                    pending[0].set_seal_target(len(pending))
+                except Exception as e:
+                    logger.warning(
+                        "[V6D Hijack] sim fetch: set_seal_target failed "
+                        "lease=%s: %r; %d placeholder(s) left to the "
+                        "daemon's release/discard path",
+                        lease_id, e, len(pending))
+                    continue
+                for o in pending:
+                    try:
+                        o.complete()
+                    except Exception as e:
+                        logger.warning(
+                            "[V6D Hijack] sim fetch: complete failed "
+                            "key=%s: %r", getattr(o, "key", "?"), e)
+            return None
+
+        target.start_fetch = override_start_fetch
+        logger.info(
+            "[V6D Hijack] V6dObjectFetchHelper hook installed "
+            "(seal-only fetch, no data movement)"
+        )
+
+
 class C_V6dObjectConnectorSchedulerHook(BaseHook):
-    """Hook scheduler cross-group allocation to avoid real v6d client.create."""
+    """Hook scheduler cross-group allocation to avoid real v6d client.create.
+
+    ``get_num_new_matched_tokens``/``async_get_num_new_matched_tokens`` are
+    NOT overridden: the real scheduler lookup (batch ``client.get`` +
+    ``_fetch_intersection_blocks`` + promote) runs unchanged, with the data
+    plane removed by C_V6dObjectFetchHelperHook.
+    """
 
     HOOK_CLASS_NAME = "V6dObjectConnectorScheduler"
     HOOK_MODULE_NAME = (
@@ -292,213 +247,6 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        module = sys.modules.get(target.__module__)
-        block_hash_list_with_block_size = getattr(
-            module, "BlockHashListWithBlockSize", None
-        )
-
-        def _group_block_hashes(self, block_hashes, group_block_size):
-            if group_block_size == self.hash_block_size:
-                return block_hashes
-            if block_hash_list_with_block_size is None:
-                return block_hashes
-            return block_hash_list_with_block_size(
-                block_hashes, self.hash_block_size, group_block_size
-            )
-
-        def _num_hash_blocks(self, request):
-            spec_cfg = getattr(self.vllm_config, "speculative_config", None)
-            use_eagle = bool(spec_cfg and spec_cfg.use_eagle())
-            if getattr(self, "_is_hybrid_backend", False) or use_eagle:
-                return max((request.num_tokens - 1) // self.hash_block_size, 0)
-            return max(request.num_tokens // self.hash_block_size, 0)
-
-        def _all_group_ids(self):
-            return sorted(
-                set(getattr(self, "full_attention_group_ids", set()))
-                | set(getattr(self, "mamba_group_ids", set()))
-            )
-
-        def _finalize_hit(self, request, num_computed_tokens, num_hash_blocks,
-                          hit_length):
-            lcm_block_size = getattr(self, "lcm_block_size", self.hash_block_size)
-            if lcm_block_size > 0:
-                hit_length = hit_length // lcm_block_size * lcm_block_size
-            if hit_length <= 0:
-                logger.info(
-                    "[V6D DIAG] Request %s: scheduler lookup MISS "
-                    "(final hit_length=%d) from num_computed_tokens=%d",
-                    request.request_id, hit_length, num_computed_tokens)
-                return 0, False
-            if hasattr(self, "_to_load_token_idx"):
-                self._to_load_token_idx[request.request_id] = num_computed_tokens
-            if hasattr(self, "_hit_stats"):
-                self._hit_stats.record(
-                    total_tokens=num_hash_blocks * self.hash_block_size,
-                    hit_tokens=hit_length,
-                )
-            logger.debug(
-                "[V6D RPC Bypass] Request %s: scheduler lookup hit %d "
-                "tokens from num_computed_tokens=%d",
-                request.request_id,
-                hit_length,
-                num_computed_tokens,
-            )
-            return hit_length, True
-
-        def _mamba_validate(self, block_hashes, num_computed_tokens, fa_hit_length):
-            """Validate mamba state at aligned boundaries.
-
-            Mirrors the original V6dObjectConnectorScheduler logic:
-            search aligned boundaries from right to left, find the first
-            boundary where ALL mamba groups have a matching block in etcd.
-            If no boundary matches, return 0.
-            """
-            mamba_group_ids = sorted(getattr(self, "mamba_group_ids", set()))
-            if not mamba_group_ids:
-                return fa_hit_length
-
-            lcm_block_size = getattr(self, "lcm_block_size", self.hash_block_size)
-            if lcm_block_size <= 0:
-                return fa_hit_length
-
-            max_mamba_hit_length = (
-                fa_hit_length // lcm_block_size * lcm_block_size)
-            if max_mamba_hit_length <= 0:
-                return 0
-
-            aligned_hit_lengths = list(range(
-                max_mamba_hit_length, 0, -lcm_block_size))
-
-            first_fail_reason = None
-            for aligned_hit_length in aligned_hit_lengths:
-                all_match = True
-                fail_reason = None
-                for group_id in mamba_group_ids:
-                    manager = self.managers[group_id]
-                    group_block_size = self.group_block_sizes[group_id]
-                    group_hashes = _group_block_hashes(
-                        self, block_hashes, group_block_size)
-                    abs_idx = (
-                        (num_computed_tokens + aligned_hit_length)
-                        // group_block_size - 1
-                    )
-                    if abs_idx < 0 or abs_idx >= len(group_hashes):
-                        fail_reason = (
-                            f"idx_out_of_range group={group_id} "
-                            f"abs_idx={abs_idx} n={len(group_hashes)}")
-                        all_match = False
-                        break
-                    key = manager._make_key(group_hashes[abs_idx])
-                    # P2P mode: use client.exists() to check Redis tracker
-                    try:
-                        client = getattr(manager, "client", None)
-                        if client is None or not client.exists(key):
-                            fail_reason = (
-                                f"exists=False group={group_id} key={key}")
-                            all_match = False
-                            break
-                    except Exception as e:
-                        fail_reason = (
-                            f"exists_exception group={group_id} "
-                            f"key={key}: {e!r}")
-                        all_match = False
-                        break
-                if all_match:
-                    if aligned_hit_length != max_mamba_hit_length:
-                        logger.info(
-                            "[V6D DIAG] mamba_validate: degraded "
-                            "%d -> %d (first_fail: %s)",
-                            max_mamba_hit_length, aligned_hit_length,
-                            first_fail_reason)
-                    return aligned_hit_length
-                if first_fail_reason is None:
-                    first_fail_reason = (
-                        f"boundary={aligned_hit_length}: {fail_reason}")
-
-            logger.info(
-                "[V6D DIAG] mamba_validate: ALL boundaries failed, "
-                "fa_hit=%d max_mamba=%d num_computed=%d first_fail: %s",
-                fa_hit_length, max_mamba_hit_length, num_computed_tokens,
-                first_fail_reason)
-            return 0
-
-        def _fa_lookup_plan(self, block_hashes, num_computed_tokens):
-            """Yield (manager, group_block_size, tail_hashes) per FA group.
-
-            Shared between the sync and async get_num_new_matched_tokens
-            overrides — only the lookup call itself differs.
-            """
-            fa_group_ids = sorted(
-                getattr(self, "full_attention_group_ids", set()))
-            for group_id in fa_group_ids:
-                manager = self.managers[group_id]
-                group_block_size = self.group_block_sizes[group_id]
-                group_hashes = _group_block_hashes(
-                    self, block_hashes, group_block_size
-                )
-                start_block_idx = num_computed_tokens // group_block_size
-                yield manager, group_block_size, group_hashes[start_block_idx:]
-
-        def override_get_num_new_matched_tokens(
-            self, request, num_computed_tokens
-        ):
-            num_hash_blocks = _num_hash_blocks(self, request)
-            block_hashes = request.block_hashes[:num_hash_blocks]
-            if not block_hashes:
-                return 0, False
-
-            # Step 1: full attention groups — take min
-            hit_length = num_hash_blocks * self.hash_block_size
-            for manager, group_block_size, tail_hashes in _fa_lookup_plan(
-                self, block_hashes, num_computed_tokens
-            ):
-                group_hits = manager.lookup(
-                    tail_hashes,
-                    request_id=request.request_id,
-                    unfetched_objs={},
-                )
-                hit_length = min(hit_length, group_hits * group_block_size)
-
-            # Step 2: mamba aligned boundary validation (matches original vLLM)
-            hit_length = _mamba_validate(
-                self, block_hashes, num_computed_tokens, hit_length)
-
-            return _finalize_hit(
-                self, request, num_computed_tokens, num_hash_blocks, hit_length
-            )
-
-        async def override_async_get_num_new_matched_tokens(
-            self, request, num_computed_tokens
-        ):
-            num_hash_blocks = _num_hash_blocks(self, request)
-            block_hashes = request.block_hashes[:num_hash_blocks]
-            if not block_hashes:
-                return 0, False
-
-            # Step 1: full attention groups — take min
-            hit_length = num_hash_blocks * self.hash_block_size
-            for manager, group_block_size, tail_hashes in _fa_lookup_plan(
-                self, block_hashes, num_computed_tokens
-            ):
-                group_hits = await manager.async_lookup(
-                    tail_hashes,
-                    request_id=request.request_id,
-                    unfetched_objs={},
-                )
-                hit_length = min(hit_length, group_hits * group_block_size)
-
-            # Step 2: mamba aligned boundary validation (matches original vLLM)
-            hit_length = _mamba_validate(
-                self, block_hashes, num_computed_tokens, hit_length)
-
-            return _finalize_hit(
-                self, request, num_computed_tokens, num_hash_blocks, hit_length
-            )
-
-        target.get_num_new_matched_tokens = override_get_num_new_matched_tokens
-        target.async_get_num_new_matched_tokens = override_async_get_num_new_matched_tokens
-
         original_request_finished = getattr(target, "request_finished", None)
         original_request_finished_all_groups = getattr(
             target, "request_finished_all_groups", None
@@ -569,7 +317,8 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
             client = None
             if getattr(self, "managers", None):
                 client = next(iter(self.managers.values())).client
-            if client is not None and original_cross_group_batch_allocate is not None:
+            if (client is not None and not isinstance(client, _DeadClient)
+                    and original_cross_group_batch_allocate is not None):
                 result = original_cross_group_batch_allocate(
                     self, group_candidates, request_id=request_id
                 )

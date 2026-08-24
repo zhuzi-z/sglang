@@ -6,12 +6,20 @@ Applied by ``install_v6d_runtime_hooks()`` at vineyardd startup.  Core idea:
 polling + ``NotEnoughMemoryException`` → emergency eviction), while physical
 allocation stays minimal (1G mmap, 4K per blob).
 
+The read path is the REAL ``TieredVineyardPeer._acquire_tiered_read``
+(reached via ``client.get`` from the connector): only the two remote SRPC
+entry points in ``v6d.common.transfer`` are stubbed so P2P reads move
+metadata only, and a ``[V6D HitSource]`` line per read batch is logged
+(port of the production v6d_hitsource_patch; see tmp.out/bugfix/
+hit_stats.sh).  Only ``--peer=tiered_vineyard`` daemon mode is supported.
+
 ``SGLANG_SIMULATOR_V6D_LOGICAL_CAPACITY`` (bytes) overrides the capacity
 derived from ``--vineyard-size``.
 """
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import threading
@@ -35,6 +43,103 @@ _DEFAULT_CAPACITY = 1 << 30   # 1 GB (default virtual capacity)
 
 _REAL_MEMORY_BYTES = 1 << 30  # Real mmap size passed to C++ backend (1G)
 _REAL_BLOB_SIZE = 4096        # Real allocation per blob in C++ backend (4K)
+
+# ---------------------------------------------------------------------------
+# [V6D HitSource] observability — sim port of the production daemon patch
+# ---------------------------------------------------------------------------
+#
+# Byte-identical port of ``v6d_hitsource_patch`` (tmp.out/bugfix/hit_stats.sh):
+# a contextvar counter bag is pushed around
+# ``TieredVineyardPeer._acquire_tiered_read`` and bumped from
+# ``HitRateStats.record_*_hit``; one line is logged per read batch:
+#
+#   [V6D HitSource] request_id=<rid> queried=N local=N p2p=N \
+#       sharedfs=N tair_kvcm=N miss=N[ error=E]
+#
+# Only Scope.READ acquires reach ``_acquire_tiered_read``, so store-side
+# creates stay silent.  Keys short-circuited by the connector's
+# ``_cached_objs`` never reach the daemon and are not counted — same as
+# production.  Contextvars are asyncio-task-local, so per-batch attribution
+# stays exact even when the daemon interleaves concurrent acquires.
+
+_ENV_HITSOURCE_LOG = "V6D_HITSOURCE_LOG"
+
+_HITSOURCE_COUNTERS = ("local", "p2p", "sharedfs", "tair_kvcm")
+
+# None -> outside a tracked read; dict -> current read's counter bag.
+_hit_bag: contextvars.ContextVar = contextvars.ContextVar(
+    "v6d_sim_hitsource_bag", default=None)
+
+
+def _hitsource_enabled() -> bool:
+    return os.environ.get(_ENV_HITSOURCE_LOG, "1") not in ("0", "false", "False")
+
+
+# ---------------------------------------------------------------------------
+# Remote data-plane stubs (no real data movement in simulation)
+# ---------------------------------------------------------------------------
+#
+# A P2P read in the real daemon resolves to two SRPC calls into the remote
+# peer: ``transfer.get_metas_by_names`` (metadata probe, also used by
+# ``VineyardPeer.get_remote_object_sizes`` for the eviction check) and
+# ``transfer.load_data`` (the actual blob copy).  Sim daemons run with the
+# SRPC engine disabled, so both are stubbed:
+#
+#   * ``get_metas_by_names`` fabricates the meta locally.  The declared size
+#     is the cluster-wide uniform page size learned from local stores, which
+#     keeps ``_check_and_evict`` and the follow-up local ``create_blobs``
+#     (virtual capacity accounting) exactly as in production.  The tracker
+#     lookup in ``_acquire_tiered_read`` (the real metadata P2P probe) is
+#     untouched.
+#   * ``load_data``/``async_load_data`` are no-ops.  They are only reached by
+#     eager fetch strategies; the default lazy strategy never calls them
+#     (data load is client-side, and the sim connector never loads).
+
+
+def _sim_get_metas_by_names(names, endpoint, trace_id=""):
+    """Fabricate remote object metas in place of the SRPC meta probe."""
+    size = VirtualCapacityManager.get_or_create().page_size()
+    if size <= 0:
+        # No local store yet: the uniform page size is unknown, so no
+        # faithful meta can be fabricated.  Fail like a real remote miss.
+        raise KeyError(
+            f"[v6d-sim] remote meta probe {endpoint}: page size unknown "
+            f"(no local store yet), {len(names)} keys treated as unfetchable"
+        )
+    from v6d.lite.common.type import ObjectID, ObjectMeta
+    blob_meta = {
+        "id": ObjectID.invalid_object_id().to_string(),
+        "length": size,
+        "nbytes": size,
+        "transient": False,
+        "instance_id": 0,
+        "typename": "vineyard::Blob",
+    }
+    return [
+        ObjectMeta.from_dict({
+            "size": size,
+            # Mirror the field defaults _check_meta_data() applies to local
+            # stores — the C++ create_data behind seal() rejects metas that
+            # lack them ("Metatree invalid: No 'typename' field").
+            "typename": "vineyard::Object",
+            "instance_id": 0,
+            "transient": False,
+            "user_name": "",
+            "buffer_num": 1,
+            "buffer_0": dict(blob_meta),
+        })
+        for _ in names
+    ]
+
+
+def _sim_load_data_noop(*args, **kwargs):
+    """Skip the remote blob copy (eager strategies only; lazy never calls)."""
+    logger.debug("[v6d-sim] skip remote blob data transfer (no data plane)")
+    return None
+
+
+def _sim_async_load_data_noop(*args, **kwargs):
+    return []
 
 
 def _env_int(name: str, default: int) -> int:
@@ -298,15 +403,22 @@ class C_VineyardRunnerHook(BaseHook):
 
 
 # ---------------------------------------------------------------------------
-# C_TieredVineyardPeerHook — LRU touch on exists() local hit
+# C_TieredVineyardPeerHook — real read path + hit-source stats + data stubs
 # ---------------------------------------------------------------------------
 
 class C_TieredVineyardPeerHook(BaseHook):
-    """Refresh LRU order on ``exists()`` local hits.
+    """Keep the real ``_acquire_tiered_read`` on the CPU read path.
 
-    The real daemon touches the LRU in the read data plane after every
-    lookup hit; the sim connector never loads, so hits must touch here or
-    eviction runs in insertion order and inflates replay hit rates.
+    Two pieces, both daemon-process only (this class is defined only where
+    the tiered peer module is imported, i.e. the daemon):
+
+    1. Observability: wrap ``_acquire_tiered_read`` with a contextvar
+       counter bag and log one ``[V6D HitSource]`` line per read batch — a
+       direct port of the production ``v6d_hitsource_patch`` (hit_stats.sh).
+    2. Data-plane stubs: replace the two remote SRPC entry points in
+       ``v6d.common.transfer`` so P2P reads move only metadata.  Everything
+       else on the read path (LRU touch, lease pin, tracker probe, eviction
+       check, local admit + re-ANNOUNCE, ``record_*_hit``) runs unmodified.
     """
 
     HOOK_CLASS_NAME = "TieredVineyardPeer"
@@ -314,62 +426,89 @@ class C_TieredVineyardPeerHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        original_exists = target.exists
+        original_acquire_tiered_read = target._acquire_tiered_read
 
-        async def _admit_remote_fetch(peer_self, object_key):
-            """Mirror the local copy ``_acquire_remote_read`` leaves behind.
-
-            The real daemon fetches from the remote peer and *caches the
-            result locally* (see ``_acquire_remote_read``), so a cross-node
-            hit consumes local vineyard capacity just like a store does. The
-            sim connector never issues a read, so without admitting it here
-            the sim under-counts residency and evicts far later than
-            production at the same nominal capacity.
-            """
-            manager = VirtualCapacityManager.get_or_create()
-            size = manager.page_size()
-            if size <= 0:
-                logger.warning(
-                    "[v6d-sim] remote hit on %s before any local store: "
-                    "page size unknown, capacity not charged", object_key,
-                )
-                return
-            lease = None
+        async def wrapped_acquire_tiered_read(self, *args, **kwargs):
+            if not _hitsource_enabled():
+                return await original_acquire_tiered_read(self, *args, **kwargs)
+            object_keys = args[0] if args else kwargs.get("object_keys") or ()
+            request_id = kwargs.get("request_id")
+            bag = dict.fromkeys(_HITSOURCE_COUNTERS, 0)
+            token = _hit_bag.set(bag)
+            error = None
             try:
-                lease, _objs = await peer_self._acquire_create(
-                    [object_key], None, [{"size": size}],
-                    ignore_existing=True,
-                    request_id="sim-remote-fetch",
-                )
-                await peer_self.seal(lease.lease_id, request_id="sim-remote-fetch")
+                return await original_acquire_tiered_read(self, *args, **kwargs)
             except Exception as exc:
-                logger.debug(
-                    "[v6d-sim] remote-fetch admit skipped for %s: %s",
-                    object_key, exc,
-                )
+                error = type(exc).__name__
+                raise
             finally:
-                if lease is not None:
-                    try:
-                        await peer_self.release(
-                            lease.lease_id, request_id="sim-remote-fetch"
-                        )
-                    except Exception:
-                        pass
+                _hit_bag.reset(token)
+                queried = len(object_keys)
+                if queried:
+                    hits = sum(bag.values())
+                    logger.info(
+                        "[V6D HitSource] request_id=%s queried=%d local=%d p2p=%d "
+                        "sharedfs=%d tair_kvcm=%d miss=%d%s",
+                        request_id, queried, bag["local"], bag["p2p"],
+                        bag["sharedfs"], bag["tair_kvcm"],
+                        max(queried - hits, 0),
+                        f" error={error}" if error else "",
+                    )
 
-        async def patched_exists(self, object_key, peer=None):
-            if self._is_in_vineyard(object_key):
-                self._touch_access(object_key)
-                return True
-            found = await original_exists(self, object_key, peer)
-            if (found and not self._is_in_vineyard(object_key)
-                    and not self._is_evicted(object_key)):
-                await _admit_remote_fetch(self, object_key)
-            return found
+        target._acquire_tiered_read = wrapped_acquire_tiered_read
 
-        target.exists = patched_exists
+        # The tiered peer module already imports v6d.common.transfer (through
+        # v6d.server.peers.vineyard.peer), so this import is a sys.modules
+        # lookup; the stubs apply process-wide, which is fine: the client
+        # side never transfers data either (fetch is stubbed there).
+        import v6d.common.transfer as transfer
+        transfer.get_metas_by_names = _sim_get_metas_by_names
+        transfer.load_data = _sim_load_data_noop
+        transfer.async_load_data = _sim_async_load_data_noop
+
         logger.info(
-            "[v6d-sim] C_TieredVineyardPeerHook installed: "
-            "LRU touch on exists() local hit + local admit on remote hit"
+            "[v6d-sim] C_TieredVineyardPeerHook installed: real "
+            "_acquire_tiered_read + [V6D HitSource] stats + remote "
+            "data-plane stubs (meta fabricate / load no-op)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# C_HitRateStatsHook — feed the per-read hit-source bag
+# ---------------------------------------------------------------------------
+
+class C_HitRateStatsHook(BaseHook):
+    """Bump the contextvar bag from ``HitRateStats.record_*_hit``.
+
+    Direct port of the production ``v6d_hitsource_patch`` stats hook; the
+    daemon's own classification (local / remote / sharedfs / tair_kvcm) is
+    reused unchanged, so the sim's split is defined by the same code as
+    production.
+    """
+
+    HOOK_CLASS_NAME = "HitRateStats"
+    HOOK_MODULE_NAME = "v6d.server.peers.tiered_vineyard.stats"
+
+    @classmethod
+    def hook(cls, target):
+        def wrap(name, counter):
+            original = getattr(target, name)
+
+            def wrapped(self, size: int = 0):
+                bag = _hit_bag.get()
+                if bag is not None:
+                    bag[counter] += 1
+                return original(self, size)
+
+            setattr(target, name, wrapped)
+
+        wrap("record_local_vineyard_hit", "local")
+        wrap("record_remote_vineyard_hit", "p2p")
+        wrap("record_sharedfs_hit", "sharedfs")
+        wrap("record_tair_kvcm_hit", "tair_kvcm")
+        logger.info(
+            "[v6d-sim] C_HitRateStatsHook installed: record_*_hit -> "
+            "[V6D HitSource] bag"
         )
 
 
@@ -477,5 +616,6 @@ def install_v6d_runtime_hooks():
         C_VineyardPeerHook,
         C_VineyardRunnerHook,
         C_TieredVineyardPeerHook,
+        C_HitRateStatsHook,
         C_VineyardServerHook,
     ])
