@@ -268,3 +268,162 @@ class C_SchedulerHook(BaseHook):
         target.schedule = wrapped_schedule
         target._free_request = wrapped_free_request
 
+
+# ===================== HCDETECT: hybrid-connector admission deadlock =====================
+# Detects the admission-time full-preallocation pin deadlock (see
+# root_cause_analysis.md): _step_waiting preallocates + pins full-prompt blocks
+# per request at admission; prefill needs a SECOND allocation; when pins
+# exhaust the free pool nothing can prefill, save receipts never fire and the
+# pins are never freed -> livelock.
+#
+# Additive-only: wraps HybridScheduler._step_waiting, swallows its own
+# exceptions, and rate-limits every log level (time-monotonic gates), so the
+# high-frequency spin during the deadlock cannot flood the log:
+#   main gate 10s (state read at most 1/10s; every other call returns in O(1))
+#   WARN 10s/条, ERROR 60s/条, INFO 60s/条  ->  worst case ~480 条/hour.
+
+import time as _hcd_time
+import logging as _hcd_log
+
+_hcd_logger = _hcd_log.getLogger("vllm.hcdetect")
+
+_HCD_GATE_S = 10.0   # main gate: full state read at most once per 10s
+_HCD_WARN_S = 10.0   # WARN min interval
+_HCD_ERR_S = 60.0    # ERROR min interval
+_HCD_INFO_S = 60.0   # INFO min interval
+_HCD_SNAP_S = 30.0   # no-progress snapshot window
+
+
+def _hcd_sched():
+    """V1Scheduler via engine_proxy global (EngineCore process only)."""
+    from vllm.v1.hybrid_connector import engine_proxy
+    core = getattr(engine_proxy, "_g_core", None)
+    return getattr(core, "scheduler", None)
+
+
+def _hcd_state(hs):
+    """Full snapshot; returns dict or None on any failure."""
+    sched = _hcd_sched()
+    if sched is None:
+        return None
+    bp = sched.kv_cache_manager.block_pool
+    # NOTE: bp.free_blocks is a *method* (freeing blocks), NOT the free
+    # count. Free count = len(bp.free_block_queue); total = len(bp.blocks).
+    fq = getattr(bp, "free_block_queue", None)
+    try:
+        free_b = len(fq) if fq is not None else -1
+    except TypeError:
+        free_b = getattr(fq, "num_free_blocks", -1)
+    total_b = len(getattr(bp, "blocks", ()) or ())
+    saving = hs._saving          # dict reqid -> _SavingReq
+    waiting = hs._waiting        # deque of (req, load_count, save_count)
+    pin_blks = 0
+    pin_prompt = 0
+    np_reqs = 0
+    items = []
+    for rid, sreq in saving.items():
+        req = getattr(sreq, "_req", None)
+        kvblks = getattr(sreq, "kvblks", None)
+        nb = sum(len(g) for g in getattr(kvblks, "blocks", ()) or ()) \
+            if kvblks is not None else 0
+        pin_blks += nb
+        pt = getattr(req, "num_prompt_tokens", 0) or 0
+        pin_prompt += pt
+        computed = getattr(req, "num_computed_tokens", None)
+        if computed is None or computed == 0:
+            np_reqs += 1
+        items.append((pt, nb, computed or 0, rid))
+    items.sort(reverse=True)
+    n_run = len(getattr(sched, "running", ()) or ())
+    n_ws = len(getattr(sched, "waiting", ()) or ())
+    n_wc = len(waiting)
+    head_ask = None
+    if waiting:
+        req0 = waiting[0][0]
+        head_ask = ((getattr(req0, "num_prompt_tokens", 0) or 0)
+                    - (getattr(req0, "num_computed_tokens", 0) or 0))
+    ncfg = getattr(getattr(sched, "kv_cache_config", None),
+                   "num_gpu_blocks", None)
+    return dict(
+        total_b=total_b, free_b=free_b, ncfg=ncfg,
+        pin_blks=pin_blks, pin_prompt=pin_prompt, n_save=len(saving),
+        np_reqs=np_reqs, items=items, n_run=n_run, n_ws=n_ws, n_wc=n_wc,
+        head_ask=head_ask,
+    )
+
+
+def _hcd_detect(hs, st):
+    """Called after each _step_waiting; rate-limited; never raises."""
+    now = _hcd_time.monotonic()
+    if now - st["gate"] < _HCD_GATE_S:
+        return
+    st["gate"] = now
+    s = _hcd_state(hs)
+    if s is None:
+        return
+    # ---- INFO: periodic snapshot (60s) ----
+    if now - st["info"] >= _HCD_INFO_S:
+        st["info"] = now
+        _hcd_logger.info(
+            "[HCDETECT] free=%d/%d blk | pinned=%d blk (%d reqs, np=%d, "
+            "prompt=%d tok) | run=%d | wait sched=%d conn=%d",
+            s["free_b"], s["total_b"], s["pin_blks"], s["n_save"],
+            s["np_reqs"], s["pin_prompt"], s["n_run"], s["n_ws"], s["n_wc"])
+    # ---- WARN: admission backpressure (10s) ----
+    np_ratio = (s["np_reqs"] / s["n_save"]) if s["n_save"] else 0.0
+    if (s["n_wc"] > 0 and s["head_ask"] is not None and s["n_save"] > 0
+            and now - st["warn"] >= _HCD_WARN_S):
+        st["warn"] = now
+        _hcd_logger.warning(
+            "[HCDETECT] admission backpressure: head asks %d tok, "
+            "free=%d/%d blk, save_pinned=%d blk in %d reqs (np=%d), "
+            "run=%d, wait sched=%d conn=%d",
+            s["head_ask"], s["free_b"], s["total_b"], s["pin_blks"],
+            s["n_save"], s["np_reqs"], s["n_run"], s["n_ws"], s["n_wc"])
+    # ---- ERROR: deadlock verdict (60s) ----
+    # free nearly exhausted (<5%) + most pins never prefilled + nothing
+    # running + no progress vs snapshot >=30s old.
+    free_ok = s["total_b"] > 0 and s["free_b"] * 20 < s["total_b"]
+    snap = (s["free_b"], s["n_save"], s["n_run"])
+    no_progress = False
+    if st["snap"] is not None and now - st["snap_t"] >= _HCD_SNAP_S:
+        no_progress = (snap == st["snap"])
+    if now - st["snap_t"] >= _HCD_SNAP_S:
+        st["snap"], st["snap_t"] = snap, now
+    if (free_ok and np_ratio >= 0.8 and s["n_run"] == 0 and no_progress
+            and now - st["err"] >= _HCD_ERR_S):
+        st["err"] = now
+        top = ", ".join("%s p=%d blk=%d c=%d" % (r[:12], p, b, c)
+                        for p, b, c, r in s["items"][:5])
+        _hcd_logger.error(
+            "[HCDETECT] HYBRID-CONNECTOR DEADLOCK SUSPECTED: save-pinned "
+            "blocks exhausted free pool, no progress in %ds (pinned requests "
+            "can never prefill -> save receipt never fires -> pinned blocks "
+            "never freed). L1_total=%d blk (cfg num_gpu_blocks=%s) free=%d "
+            "blk | save_pinned(v6d)=%d blk in %d reqs, never-prefilled=%d/%d, "
+            "prompt_sum=%d tok | running(prefill)=%d | waiting: sched=%d "
+            "conn=%d head_ask=%d tok | top5_stuck: %s",
+            _HCD_SNAP_S, s["total_b"], s["ncfg"], s["free_b"], s["pin_blks"],
+            s["n_save"], s["np_reqs"], s["n_save"], s["pin_prompt"],
+            s["n_run"], s["n_ws"], s["n_wc"], s["head_ask"] or 0, top)
+
+
+class C_HybridSchedulerHook(BaseHook):
+    HOOK_CLASS_NAME = "HybridScheduler"
+    HOOK_MODULE_NAME = "vllm.v1.hybrid_connector"
+
+    @classmethod
+    def hook(cls, target) -> None:
+        original_step_waiting = target._step_waiting
+        st = {"gate": 0.0, "warn": 0.0, "err": 0.0, "info": 0.0,
+              "snap": None, "snap_t": 0.0}
+
+        def wrapped_step_waiting(self):
+            ret = original_step_waiting(self)
+            try:
+                _hcd_detect(self, st)
+            except Exception:
+                pass
+            return ret
+
+        target._step_waiting = wrapped_step_waiting
