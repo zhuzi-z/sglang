@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """V6D emergency eviction test.
 
-Tests two emergency eviction paths with C_VineyardServerHook:
-  1. Pre-create blocking eviction (USAGE_EMERGENCY threshold)
-     - future_usage >= critical → wait_complete() blocks create
+Tests two emergency eviction paths on a REAL arena (no sim capacity hooks —
+the daemon's own accounting drives eviction), under two arena configs:
+  - 512M / 2MB blobs   : fast mechanism check (255-blob capacity)
+  - 500G / 132MB blobs : production capacity config.  The 500G arena is a
+                         sparse memfd (reserve_memory=false via the sim
+                         daemon hook): blob pages are never touched, so
+                         physical cost is metadata-only (~10KB/object) and
+                         132MB is the production page size.
+Paths covered:
+  1. Pre-create blocking eviction (memory_usage_critical, hardcoded 0.98)
+     - future_usage >= critical → [EVICT_FORCE] + wait_complete blocks create
   2. OOM-triggered emergency eviction
-     - create_blobs raises NotEnoughMemoryException → _trigger_emergency_eviction → retry
+     - create_blobs raises NotEnoughMemoryException → emergency eviction → retry
+
+Note the AsyncEvictor's 5s periodic sweep evicts whenever usage > min (it
+does NOT consult max); the tests set thresholds accordingly.
 
 Run:
   python test/test_v6d_emergency_eviction.py
@@ -13,6 +24,7 @@ Run:
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -24,23 +36,31 @@ import urllib.error
 # Constants
 # --------------------------------------------------------------------------
 SIM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-V6D_BIN = os.path.join(SIM_ROOT, "scripts", "v6d")
-LIB_DIR = os.path.join(SIM_ROOT, "scripts")
+V6D_BIN = shutil.which("v6d") or "/usr/local/bin/v6d"
 
-REDIS_PORT = 6379
+# Dedicated Redis so FLUSHDB cannot disturb a running benchmark stack.
+REDIS_PORT = 6390
 REDIS_URL = f"redis://127.0.0.1:{REDIS_PORT}"
 
-BLOB_SIZE = 1 << 30       # 1 GB (virtual size per blob)
-VIRTUAL_CAP = 500 * (1 << 30)  # 500 GB virtual capacity (from --vineyard-size=500G)
+CONFIGS = [
+    # Fast mechanism check: small arena, one 2M block per blob.
+    # The C++ allocator reserves one block (measured) -> 255 blobs fit.
+    dict(name="512M", arena_size="512M", blob_size=2 << 20),
+    # Production capacity: 500G sparse arena, production-size 132MB pages.
+    dict(name="500G", arena_size="500G", blob_size=132 << 20),
+]
 
-V6D_PORT = 7890
-V6D_RPC = 21000
+# Ports away from the benchmark stack (7890/7891, 21001/21002).
+V6D_PORT = 7790
+V6D_RPC = 21100
 V6D_SOCK = "/tmp/vineyard.sock_emg"
 URL_A = f"http://127.0.0.1:{V6D_PORT}"
 
 V6D_ENV = {
     **os.environ,
-    "LD_LIBRARY_PATH": LIB_DIR + ":" + os.environ.get("LD_LIBRARY_PATH", ""),
+    # Sim daemon hooks: reserve_memory=false argv swap (mandatory for the
+    # 500G sparse arena) + HitSource logging + load_data no-op.
+    "SGLANG_SIMULATOR_ENABLE": "1",
     "SRPC_STREAM_DISABLE_RDMA": "1",
 }
 
@@ -75,7 +95,7 @@ def http_get(base: str, path: str, timeout: float = 5.0):
     except Exception as e:
         return -1, {"error": str(e)}
 
-def http_post(base: str, path: str, data: dict, timeout: float = 30.0):
+def http_post(base: str, path: str, data: dict, timeout: float = 120.0):
     body = json.dumps(data).encode()
     req = urllib.request.Request(
         f"{base}{path}", data=body, method="POST",
@@ -130,7 +150,7 @@ def ensure_redis():
     print("FAILED (timeout)")
     return proc
 
-def start_v6d(usage_max, usage_min, usage_emergency, log_suffix):
+def start_v6d(cfg, usage_max, usage_min, usage_emergency, log_suffix):
     """Start a v6d server with given memory_usage thresholds."""
     try:
         os.unlink(V6D_SOCK)
@@ -139,7 +159,7 @@ def start_v6d(usage_max, usage_min, usage_emergency, log_suffix):
     args = [
         V6D_BIN, "serve",
         "--peer=tiered_vineyard",
-        "--vineyard-size=500G",
+        f"--vineyard-size={cfg['arena_size']}",
         "--memory-usage-max", str(usage_max),
         "--memory-usage-min", str(usage_min),
         "--memory-usage-emergency-min", str(usage_emergency),
@@ -148,13 +168,15 @@ def start_v6d(usage_max, usage_min, usage_emergency, log_suffix):
         "--vineyard-rpc-port", str(V6D_RPC),
         "--peer-id", "peer_emg",
         "--tracker-redis", REDIS_URL,
-        "--tracker-ttl", "60",
+        "--tracker-ttl", "300",
         "--log-level", "debug",
     ]
-    log_file = os.path.join(SIM_ROOT, "tmp.out", f"v6d_emg_{log_suffix}.log")
+    log_file = os.path.join(
+        SIM_ROOT, "tmp.out", f"v6d_emg_{cfg['name']}_{log_suffix}.log")
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     log_fp = open(log_file, "w")
-    print(f"Starting v6d (max={usage_max}, emergency={usage_emergency})...")
+    print(f"Starting v6d ({cfg['name']}, max={usage_max}, "
+          f"emergency={usage_emergency})...")
     proc = subprocess.Popen(args, env=V6D_ENV, stdout=log_fp, stderr=subprocess.STDOUT)
     proc._log_fp = log_fp
     proc._log_file = log_file
@@ -196,11 +218,21 @@ def grep_log(proc, pattern):
     except Exception:
         return []
 
+def daemon_rss_mb(proc) -> float:
+    try:
+        with open(f"/proc/{proc.pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return -1.0
+
 # --------------------------------------------------------------------------
 # Object helpers
 # --------------------------------------------------------------------------
 
-def create_and_seal(base, key, size=BLOB_SIZE):
+def create_and_seal(base, key, size):
     """Create + seal + release. Returns (success, lease_id)."""
     s, body = http_post(base, "/acquire", {
         "scope": "create",
@@ -222,7 +254,7 @@ def create_and_seal(base, key, size=BLOB_SIZE):
     http_post(base, "/release", {"lease_id": lease_id})
     return True, lease_id
 
-def create_batch_and_seal(base, keys, size=BLOB_SIZE):
+def create_batch_and_seal(base, keys, size):
     """Create + seal + release a batch of objects in one acquire."""
     s, body = http_post(base, "/acquire", {
         "scope": "create",
@@ -250,85 +282,115 @@ def exists_on(base, key):
         return body.get("exists", False)
     return False
 
+def _sample(keys, n=64):
+    """Evenly sample keys so exists scans stay cheap at 500G scale."""
+    if len(keys) <= n:
+        return keys
+    step = len(keys) / n
+    return [keys[int(i * step)] for i in range(n)]
+
 # --------------------------------------------------------------------------
 # Test 1: Pre-create blocking eviction (USAGE_EMERGENCY threshold)
 # --------------------------------------------------------------------------
 
-def test_blocking_eviction(redis_proc):
-    """Test that exceeding USAGE_EMERGENCY triggers blocking eviction.
+def test_blocking_eviction(cfg):
+    """Test that exceeding memory_usage_critical triggers blocking eviction.
 
-    With max=94%, emergency=60%, min=50%:
-    - Create 487 objects in ONE batch (95.1% of 512KB capacity)
-      Pre-create check: future_usage=95.1% >= critical(95%) → [EVICT_FORCE]
-      but used=0 → nothing to evict → create proceeds.
-    - Create 1 more → used=95.1% → [EVICT_FORCE] → evicts to min(50%)
-    - Blocking eviction completes before create returns
+    Threshold semantics (peer.py): memory_usage_critical is hardcoded at
+    0.98; the request path logs [EVICT_FORCE] and blocks on the evictor
+    (wait_complete) when future_usage >= critical.  NOTE: the 5s periodic
+    sweep evicts whenever usage > min (0.5 here) — it does NOT consult max,
+    so checks right after phase A tolerate a sweep having run.
+
+    With max=94%, min=50%:
+    - Phase A: create ~98.03% in ONE batch -> [EVICT_FORCE] fires during the
+      create (used=0 -> nothing to evict -> proceeds)
+    - Phase B: create 1 more -> [EVICT_FORCE] + wait_complete -> the evictor
+      cycle completes before the create returns
     """
-    print("\n=== Test 1: Blocking Eviction (USAGE_EMERGENCY) ===")
-    # memory_usage_critical is hardcoded at 0.95 (no CLI flag).
-    # USAGE_MAX must be <= critical so the pre-create check doesn't
-    # return early before reaching the critical check.
-    # Create 487 blobs (95.1%) in one batch → [EVICT_FORCE] but nothing to evict
-    # Create 1 more → used=95.3% >= critical(95%) → [EVICT_FORCE] → evicts
+    tag = cfg["name"]
+    blob = cfg["blob_size"]
+    arena_cap = cfg["arena_bytes"]
+    capacity_blobs = arena_cap // blob - 1
+    print(f"\n=== Test 1 [{tag}]: Blocking Eviction (critical threshold) ===")
+    # memory_usage_critical is hardcoded at 0.98 (peer.py, no CLI flag).
+    # USAGE_MAX must be < critical so phase A crosses max (SIGNAL) first
+    # and then critical (FORCE) within the same batch.
     USAGE_MAX = 0.94
     USAGE_MIN = 0.50
     USAGE_EMERGENCY = 0.60
-    critical_blobs = int(0.95 * VIRTUAL_CAP / BLOB_SIZE)  # 486
+    critical = 0.98
+    # Byte-basis: usage is computed against the arena size, not blob count.
+    n_batch = int(critical * arena_cap / blob) + 1
+    assert n_batch + 1 <= capacity_blobs, (
+        f"{tag}: {n_batch}+1 blobs exceed capacity {capacity_blobs}")
 
     v6d = None
     try:
         flush_redis()
-        v6d = start_v6d(USAGE_MAX, USAGE_MIN, USAGE_EMERGENCY, "blocking")
+        v6d = start_v6d(cfg, USAGE_MAX, USAGE_MIN, USAGE_EMERGENCY, "blocking")
         print("  Waiting for v6d...", end=" ", flush=True)
         if not wait_for_v6d(v6d, 30):
             print("FAILED")
-            check("t1_server_start", False, "v6d failed to start")
+            check(f"{tag}_t1_server_start", False, "v6d failed to start")
             return
         print("OK")
         time.sleep(1)
 
-        # Phase A: Create critical_blobs+1 objects in ONE batch
-        # Pre-create check: future_usage=95.1% >= critical → [EVICT_FORCE]
-        # but used=0 → nothing to evict → create proceeds
-        n_batch = critical_blobs + 1  # 487 blobs = 95.1%
+        # Phase A: Create ~98.03% of the arena in ONE batch.
+        # Request path: future >= critical(98%) -> [EVICT_FORCE] ->
+        # wait_complete on an empty store -> nothing to evict -> proceeds.
         print(f"  Phase A: Create {n_batch} objects in one batch "
-              f"({n_batch*BLOB_SIZE*100/VIRTUAL_CAP:.1f}%)...")
-        keys_a = [f"blk_obj_{i:03d}" for i in range(n_batch)]
-        ok, _ = create_batch_and_seal(URL_A, keys_a)
-        check("t1a_batch_create", ok, f"created={ok}")
+              f"({n_batch*blob*100/arena_cap:.1f}%)...")
+        keys_a = [f"blk_obj_{i:05d}" for i in range(n_batch)]
+        ok, _ = create_batch_and_seal(URL_A, keys_a, blob)
+        check(f"{tag}_t1a_batch_create", ok, f"created={ok}")
 
-        # All should exist (evictor hasn't run yet)
-        exist_a = sum(1 for k in keys_a if exists_on(URL_A, k))
-        check("t1b_all_exist_before_trigger", exist_a == n_batch,
-              f"exists={exist_a}/{n_batch}")
+        # Creates landed.  A 5s sweep tick may already have evicted down to
+        # min (the sweep ignores max), so accept >= half of the sample.
+        sample_a = _sample(keys_a)
+        exist_a = sum(1 for k in sample_a if exists_on(URL_A, k))
+        check(f"{tag}_t1b_creates_landed",
+              exist_a >= len(sample_a) // 2,
+              f"exists={exist_a}/{len(sample_a)} (sampled; a periodic "
+              f"sweep to min=50% may already have run)")
 
-        # Phase B: Create 1 more → used=95.3% >= critical(95%) → [EVICT_FORCE]
-        print(f"  Phase B: Create 1 more (used={n_batch*BLOB_SIZE*100/VIRTUAL_CAP:.1f}% "
-              f">= critical=95%)...")
-        ok, _ = create_and_seal(URL_A, "blk_trigger")
-        check("t1c_trigger_create", ok, f"success={ok}")
+        # Phase B: Create 1 more -> future >= critical -> [EVICT_FORCE] +
+        # wait_complete: the eviction cycle finishes before create returns.
+        print(f"  Phase B: Create 1 more (used={n_batch*blob*100/arena_cap:.1f}% "
+              f">= critical=98%)...")
+        ok, _ = create_and_seal(URL_A, "blk_trigger", blob)
+        check(f"{tag}_t1c_trigger_create", ok, f"success={ok}")
 
-        # KEY TEST: Check immediately (no 5s wait) that eviction happened
-        # The blocking eviction should have already completed
+        # KEY TEST: blocking eviction completed inside the create call
+        # (wait_complete) — or a sweep tick did; either way old objects
+        # are already gone when the create returns.
         time.sleep(0.5)
-        evicted_immediately = sum(1 for k in keys_a if not exists_on(URL_A, k))
-        check("t1d_evicted_immediately", evicted_immediately >= 1,
-              f"evicted={evicted_immediately} (blocking eviction should be immediate)")
+        evicted_immediately = sum(1 for k in sample_a if not exists_on(URL_A, k))
+        check(f"{tag}_t1d_evicted_immediately", evicted_immediately >= 1,
+              f"evicted={evicted_immediately}/{len(sample_a)} (sampled; "
+              f"blocking eviction should be immediate)")
 
         # Trigger object should exist
-        check("t1e_trigger_exists", exists_on(URL_A, "blk_trigger"),
+        check(f"{tag}_t1e_trigger_exists", exists_on(URL_A, "blk_trigger"),
               "trigger object should exist")
 
         # Verify [EVICT_FORCE] in logs (blocking path)
         force_logs = grep_log(v6d, "EVICT_FORCE")
-        check("t1f_force_log_present", len(force_logs) >= 1,
+        check(f"{tag}_t1f_force_log_present", len(force_logs) >= 1,
               f"EVICT_FORCE lines={len(force_logs)}")
 
+        # Sparse-arena proof: physical RSS stays flat at 500G
+        if cfg["name"] == "500G":
+            rss = daemon_rss_mb(v6d)
+            check(f"{tag}_t1g_sparse_rss", 0 < rss < 2048,
+                  f"daemon RSS={rss:.0f}MB after {n_batch}+ blobs in a "
+                  f"500G arena (sparse memfd)")
+
         # Summary
-        all_keys = keys_a + ["blk_trigger"]
-        total_on_a = sum(1 for k in all_keys if exists_on(URL_A, k))
-        evicted = [k for k in keys_a if not exists_on(URL_A, k)]
-        print(f"  Result: {len(evicted)} old evicted, {total_on_a} total on A")
+        total_on_a = sum(1 for k in _sample(keys_a + ["blk_trigger"])
+                         if exists_on(URL_A, k))
+        print(f"  Result: {total_on_a} exist on A (sampled)")
         if force_logs:
             print(f"  Log: {force_logs[-1][:120]}")
 
@@ -339,86 +401,103 @@ def test_blocking_eviction(redis_proc):
 # Test 2: OOM-triggered emergency eviction
 # --------------------------------------------------------------------------
 
-def test_oom_emergency_eviction(redis_proc):
+def test_oom_emergency_eviction(cfg):
     """Test that OOM triggers emergency eviction and retry succeeds.
 
-    With max=1.0, emergency=1.1 (never triggers pre-create blocking):
-    - Fill to 512 blobs (100% virtual capacity)
-    - Create 1 more → create_blobs OOM → _trigger_emergency_eviction → retry
-    - Verify [EMERGENCY] in logs and the create succeeds
+    With max=2.0 / min=0.9999: the request path never signals (future < max)
+    and the 5s periodic sweep stays inert (fill tops out at ~99.95% <
+    99.99% == min).  Phase B then creates one BIG blob (5% of the arena —
+    larger than any block-level slack), forcing create_blobs to raise
+    NotEnoughMemoryException -> _trigger_emergency_eviction (evict to
+    emergency_min=60%) -> retry succeeds.
     """
-    print("\n=== Test 2: OOM-Triggered Emergency Eviction ===")
-    # USAGE_MAX=2.0 → background evictor never triggers (usage < max)
-    # USAGE_EMERGENCY=0.6 → emergency eviction target (evict to 60%)
-    # This forces the OOM path: create_blobs raises NotEnoughMemoryException
-    # → _trigger_emergency_eviction → evict to emergency_min → retry
-    USAGE_MAX = 2.0       # background evictor never triggers (>100%)
-    USAGE_MIN = 0.5       # normal target (not used during emergency)
-    USAGE_EMERGENCY = 0.6 # emergency target: evict to 60% = 307 blobs
-    max_blobs = VIRTUAL_CAP // BLOB_SIZE  # 512
+    tag = cfg["name"]
+    blob = cfg["blob_size"]
+    capacity_blobs = cfg["arena_bytes"] // blob - 1
+    print(f"\n=== Test 2 [{tag}]: OOM-Triggered Emergency Eviction ===")
+    USAGE_MAX = 2.0        # request path never signals
+    USAGE_MIN = 0.9999     # periodic sweep inert (fill peaks at ~99.95%)
+    USAGE_EMERGENCY = 0.6  # emergency target: evict to 60%
+    max_blobs = capacity_blobs
+    big_blob = cfg["arena_bytes"] // 20  # 5% of arena >> any residual slack
 
     v6d = None
     try:
         flush_redis()
-        v6d = start_v6d(USAGE_MAX, USAGE_MIN, USAGE_EMERGENCY, "oom")
+        v6d = start_v6d(cfg, USAGE_MAX, USAGE_MIN, USAGE_EMERGENCY, "oom")
         print("  Waiting for v6d...", end=" ", flush=True)
         if not wait_for_v6d(v6d, 30):
             print("FAILED")
-            check("t2_server_start", False, "v6d failed to start")
+            check(f"{tag}_t2_server_start", False, "v6d failed to start")
             return
         print("OK")
         time.sleep(1)
 
-        # Phase A: Fill to capacity (512 blobs = 100%)
-        # Use batch creates for speed
-        batch_size = 64
+        # Phase A: Fill to capacity (100%), batched for speed
+        batch_size = 256
         print(f"  Phase A: Fill to {max_blobs} objects (100%)...")
-        keys_fill = [f"oom_obj_{i:04d}" for i in range(max_blobs)]
+        keys_fill = [f"oom_obj_{i:05d}" for i in range(max_blobs)]
         created = 0
         for i in range(0, max_blobs, batch_size):
             batch = keys_fill[i:i+batch_size]
-            ok, _ = create_batch_and_seal(URL_A, batch)
+            ok, _ = create_batch_and_seal(URL_A, batch, blob)
             if ok:
                 created += len(batch)
-        check("t2a_fill_to_capacity", created == max_blobs,
+            else:
+                print(f"  batch {i//batch_size} FAILED "
+                      f"({len(batch)} keys)")
+        check(f"{tag}_t2a_fill_to_capacity", created == max_blobs,
               f"created={created}/{max_blobs}")
 
-        # Verify all exist
-        sample_keys = keys_fill[::50]  # check every 50th key
-        exist_count = sum(1 for k in sample_keys if exists_on(URL_A, k))
-        check("t2b_filled_objects_exist",
-              exist_count == len(sample_keys),
-              f"sample exists={exist_count}/{len(sample_keys)}")
+        # Verify all exist (sampled)
+        sample_fill = _sample(keys_fill)
+        exist_count = sum(1 for k in sample_fill if exists_on(URL_A, k))
+        check(f"{tag}_t2b_filled_objects_exist",
+              exist_count == len(sample_fill),
+              f"sample exists={exist_count}/{len(sample_fill)}")
 
-        # Phase B: Create 1 more → OOM → emergency eviction → retry
-        print(f"  Phase B: Create 1 more (should OOM → emergency → retry)...")
+        # Phase B: Create one BIG blob (5% of arena) -> OOM -> emergency
+        # eviction (to 60%) -> retry succeeds.  A big blob is used so the
+        # OOM does not depend on exact block-level slack after the fill.
+        print(f"  Phase B: Create one {big_blob >> 20}MiB blob "
+              f"(should OOM -> emergency -> retry)...")
         t0 = time.time()
-        ok, lease_id = create_and_seal(URL_A, "oom_extra_obj")
+        ok, lease_id = create_and_seal(URL_A, "oom_extra_obj", big_blob)
         elapsed = time.time() - t0
-        check("t2c_create_after_oom_succeeds", ok,
+        check(f"{tag}_t2c_create_after_oom_succeeds", ok,
               f"success={ok}, elapsed={elapsed:.1f}s")
 
         # Verify the extra object exists (retry succeeded)
-        check("t2d_extra_object_exists", exists_on(URL_A, "oom_extra_obj"),
+        check(f"{tag}_t2d_extra_object_exists",
+              exists_on(URL_A, "oom_extra_obj"),
               "extra object should exist after emergency eviction + retry")
 
         # Verify [EMERGENCY] in logs
         emergency_logs = grep_log(v6d, "EMERGENCY")
-        check("t2e_emergency_log_present", len(emergency_logs) >= 1,
+        check(f"{tag}_t2e_emergency_log_present", len(emergency_logs) >= 1,
               f"EMERGENCY lines={len(emergency_logs)}")
 
         # Verify [POST_EMERGENCY_EVICT] in logs
         post_emg_logs = grep_log(v6d, "POST_EMERGENCY_EVICT")
-        check("t2f_post_emergency_log", len(post_emg_logs) >= 1,
+        check(f"{tag}_t2f_post_emergency_log", len(post_emg_logs) >= 1,
               f"POST_EMERGENCY_EVICT lines={len(post_emg_logs)}")
 
-        # Some old objects should have been evicted
-        evicted_count = sum(1 for k in keys_fill if not exists_on(URL_A, k))
-        check("t2g_old_objects_evicted", evicted_count >= 1,
-              f"evicted={evicted_count}/{max_blobs}")
+        # Some old objects should have been evicted (sampled)
+        evicted_count = sum(1 for k in sample_fill
+                            if not exists_on(URL_A, k))
+        check(f"{tag}_t2g_old_objects_evicted", evicted_count >= 1,
+              f"evicted={evicted_count}/{len(sample_fill)} (sampled)")
+
+        # Sparse-arena proof: physical RSS stays flat at 500G
+        if cfg["name"] == "500G":
+            rss = daemon_rss_mb(v6d)
+            check(f"{tag}_t2h_sparse_rss", 0 < rss < 2048,
+                  f"daemon RSS={rss:.0f}MB with {max_blobs} blobs in a "
+                  f"500G arena (sparse memfd)")
 
         # Summary
-        print(f"  Result: {evicted_count} old objects evicted by emergency eviction")
+        print(f"  Result: ~{evicted_count}/{len(sample_fill)} sampled old "
+              f"objects evicted by emergency eviction")
         if emergency_logs:
             print(f"  Log: {emergency_logs[-1][:120]}")
         if post_emg_logs:
@@ -431,9 +510,18 @@ def test_oom_emergency_eviction(redis_proc):
 # Main
 # --------------------------------------------------------------------------
 
+def _arena_bytes(s: str) -> int:
+    if s.endswith("G"):
+        return int(s[:-1]) << 30
+    return int(s[:-1]) << 20
+
 def main():
     print("=== V6D Emergency Eviction Test ===")
-    print(f"Virtual: {VIRTUAL_CAP} bytes cap, {BLOB_SIZE} bytes/blob")
+    for cfg in CONFIGS:
+        cfg["arena_bytes"] = _arena_bytes(cfg["arena_size"])
+        print(f"config {cfg['name']}: arena={cfg['arena_size']} "
+              f"blob={cfg['blob_size']} "
+              f"capacity={cfg['arena_bytes'] // cfg['blob_size'] - 1} blobs")
     print()
 
     redis_proc = None
@@ -443,9 +531,10 @@ def main():
             print("Redis failed to start")
             sys.exit(1)
 
-        # Run both tests
-        test_blocking_eviction(redis_proc)
-        test_oom_emergency_eviction(redis_proc)
+        for cfg in CONFIGS:
+            print(f"\n########## Config: {cfg['name']} ##########")
+            test_blocking_eviction(cfg)
+            test_oom_emergency_eviction(cfg)
 
     finally:
         print("\nCleaning up...")

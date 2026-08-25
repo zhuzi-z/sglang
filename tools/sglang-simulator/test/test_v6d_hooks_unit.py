@@ -5,8 +5,7 @@ a V6D daemon or vLLM engine. They test:
 1. DummyStream/DummyEvent behavior
 2. head_dim=1 injection logic
 3. KV cache spec construction with real num_kv_heads
-4. ops monkey-patching (v6d_swap_blocks CPU memcpy)
-5. Hook class installation mechanics
+4. Hook class installation mechanics
 """
 
 import os
@@ -30,7 +29,7 @@ class TestDummyPrimitives:
     """Test DummyStream and DummyEvent mock CUDA primitives."""
 
     def setup_method(self):
-        from sglang_simulator.simulation.vllm.v6d.v6d_swap import (
+        from sglang_simulator.simulation.vllm.cpu_stubs import (
             DummyStream, DummyEvent,
         )
         self.DummyStream = DummyStream
@@ -221,239 +220,6 @@ class TestBuildKVCacheSpec:
 
 
 # ============================================================
-# Test 4: ops monkey-patching
-# ============================================================
-
-class TestOpsPatch:
-    """Test _patch_v6d_ops correctly replaces CUDA ops."""
-
-    def test_patch_replaces_swap_blocks(self):
-        """After patching, v6d_swap_blocks should be a Python function."""
-        from sglang_simulator.simulation.vllm.v6d import v6d_swap
-
-        # Reset patch state
-        v6d_swap._OPS_PATCHED = False
-
-        # Create a mock _custom_ops module
-        mock_ops = MagicMock()
-        with patch.dict(sys.modules, {"vllm._custom_ops": mock_ops, "vllm": MagicMock(_custom_ops=mock_ops)}):
-            v6d_swap._patch_v6d_ops()
-
-        assert v6d_swap._OPS_PATCHED is True
-        # The mock should have had its functions replaced
-        assert mock_ops.v6d_swap_blocks is not None
-        assert mock_ops.v6d_register_host_memory is not None
-        assert mock_ops.v6d_unregister_host_memory is not None
-
-
-# ============================================================
-# Test 5: CPU memcpy via mock_v6d_swap_blocks
-# ============================================================
-
-class TestMockSwapBlocks:
-    """Test the CPU memcpy implementation of v6d_swap_blocks."""
-
-    def test_swap_in_copies_data_correctly(self):
-        """Swap-in: copy from V6D mmap (src) to KV cache (dst)."""
-        num_layers = 2
-        num_blocks = 3
-        page_size = 64  # bytes per block per layer
-
-        # Allocate KV cache (destination) - zeros initially
-        kv_cache = torch.zeros(
-            num_layers * num_blocks * page_size, dtype=torch.uint8
-        )
-        # Allocate V6D mmap objects (source) - filled with data
-        v6d_objs = [
-            torch.arange(num_layers * page_size, dtype=torch.uint8) + (i + 1)
-            for i in range(num_blocks)
-        ]
-
-        # Build pointer tensors
-        layer_ptrs = torch.zeros(num_layers, dtype=torch.long)
-        for layer_idx in range(num_layers):
-            layer_ptrs[layer_idx] = (
-                kv_cache.data_ptr() + layer_idx * num_blocks * page_size
-            )
-
-        cpu_block_ptrs = torch.zeros(num_blocks, dtype=torch.long)
-        for i in range(num_blocks):
-            cpu_block_ptrs[i] = v6d_objs[i].data_ptr()
-
-        gpu_block_ids = torch.arange(num_blocks, dtype=torch.long)
-
-        # Perform swap-in
-        from sglang_simulator.simulation.vllm.v6d.v6d_swap import _patch_v6d_ops
-        # Get the mock function directly
-        import sglang_simulator.simulation.vllm.v6d.v6d_swap as swap_mod
-
-        # Call internal mock directly
-        # We need to test the actual memcpy logic
-        for i in range(num_blocks):
-            cpu_base = cpu_block_ptrs[i].item()
-            block_id = gpu_block_ids[i].item()
-            for layer_idx in range(num_layers):
-                layer_ptr = layer_ptrs[layer_idx].item()
-                kv_ptr = layer_ptr + block_id * page_size
-                obj_ptr = cpu_base + layer_idx * page_size
-                ctypes.memmove(kv_ptr, obj_ptr, page_size)
-
-        # Verify: KV cache should now contain V6D data
-        for i in range(num_blocks):
-            for layer_idx in range(num_layers):
-                offset = layer_idx * num_blocks * page_size + i * page_size
-                expected_start = layer_idx * page_size
-                expected_end = (layer_idx + 1) * page_size
-                actual = kv_cache[offset : offset + page_size]
-                expected = v6d_objs[i][expected_start:expected_end]
-                assert torch.equal(actual, expected), (
-                    f"Mismatch at block={i}, layer={layer_idx}"
-                )
-
-    def test_swap_out_copies_data_correctly(self):
-        """Swap-out: copy from KV cache (src) to V6D mmap (dst)."""
-        num_layers = 2
-        num_blocks = 2
-        page_size = 32
-
-        # KV cache with data
-        kv_cache = torch.arange(
-            num_layers * num_blocks * page_size, dtype=torch.uint8
-        )
-        # V6D objects (destination) - zeros initially
-        v6d_objs = [
-            torch.zeros(num_layers * page_size, dtype=torch.uint8)
-            for _ in range(num_blocks)
-        ]
-
-        # Build pointer tensors
-        layer_ptrs = torch.zeros(num_layers, dtype=torch.long)
-        for layer_idx in range(num_layers):
-            layer_ptrs[layer_idx] = (
-                kv_cache.data_ptr() + layer_idx * num_blocks * page_size
-            )
-
-        cpu_block_ptrs = torch.zeros(num_blocks, dtype=torch.long)
-        for i in range(num_blocks):
-            cpu_block_ptrs[i] = v6d_objs[i].data_ptr()
-
-        gpu_block_ids = torch.arange(num_blocks, dtype=torch.long)
-
-        # Perform swap-out (swap_in=False)
-        for i in range(num_blocks):
-            cpu_base = cpu_block_ptrs[i].item()
-            block_id = gpu_block_ids[i].item()
-            for layer_idx in range(num_layers):
-                layer_ptr = layer_ptrs[layer_idx].item()
-                kv_ptr = layer_ptr + block_id * page_size
-                obj_ptr = cpu_base + layer_idx * page_size
-                # swap_out: kv -> obj
-                ctypes.memmove(obj_ptr, kv_ptr, page_size)
-
-        # Verify: V6D objects should now contain KV cache data
-        for i in range(num_blocks):
-            for layer_idx in range(num_layers):
-                kv_offset = layer_idx * num_blocks * page_size + i * page_size
-                obj_offset = layer_idx * page_size
-                actual = v6d_objs[i][obj_offset : obj_offset + page_size]
-                expected = kv_cache[kv_offset : kv_offset + page_size]
-                assert torch.equal(actual, expected), (
-                    f"Mismatch at block={i}, layer={layer_idx}"
-                )
-
-
-# ============================================================
-# Test 6: V6dSwapHandler hook mechanics
-# ============================================================
-
-class TestV6dSwapHandlerHook:
-    """Test that the hook correctly installs overrides on target class."""
-
-    def test_hook_installs_init_override(self):
-        from sglang_simulator.simulation.vllm.v6d.v6d_swap import (
-            C_V6dSwapHandlerHook, DummyStream,
-        )
-
-        # Create a mock target class
-        class MockV6dSwapHandler:
-            def __init__(self):
-                pass
-
-            def _validate_swap(self, *args):
-                return True
-
-            def _process_swap_batch(self, *args):
-                return []
-
-        # Apply hook
-        C_V6dSwapHandlerHook.hook(MockV6dSwapHandler)
-
-        # Verify: __init__ was replaced
-        mock_client = MagicMock()
-        handler = MockV6dSwapHandler.__new__(MockV6dSwapHandler)
-        MockV6dSwapHandler.__init__(handler, 0, 4, mock_client, True, 0)
-
-        assert isinstance(handler._stream, DummyStream)
-        assert handler._rank_id == 0
-        assert handler._swap_in is True
-        assert handler._gpu_device == torch.device("cpu")
-
-    def test_hook_installs_swap_override(self):
-        from sglang_simulator.simulation.vllm.v6d.v6d_swap import (
-            C_V6dSwapHandlerHook,
-        )
-
-        class MockV6dSwapHandler:
-            def __init__(self):
-                pass
-
-            def _validate_swap(self, *args):
-                return True
-
-            def _process_swap_batch(self, *args, **kwargs):
-                return ["obj1"]
-
-        C_V6dSwapHandlerHook.hook(MockV6dSwapHandler)
-
-        # Verify swap method exists and doesn't use torch.cuda
-        assert hasattr(MockV6dSwapHandler, "swap")
-        assert hasattr(MockV6dSwapHandler, "async_swap")
-
-    def test_hook_get_finished_returns_all_immediately(self):
-        from collections import deque
-        from sglang_simulator.simulation.vllm.v6d.v6d_swap import (
-            C_V6dSwapHandlerHook, DummyEvent,
-        )
-
-        class MockV6dSwapHandler:
-            def __init__(self):
-                pass
-
-            def _validate_swap(self, *args):
-                return True
-
-            def _process_swap_batch(self, *args, **kwargs):
-                return []
-
-        C_V6dSwapHandlerHook.hook(MockV6dSwapHandler)
-
-        handler = MockV6dSwapHandler.__new__(MockV6dSwapHandler)
-        handler._event_jobs = deque()
-        handler._job_objs = {}
-
-        # Simulate some pending events
-        handler._event_jobs.append((DummyEvent(), 1))
-        handler._event_jobs.append((DummyEvent(), 2))
-        handler._event_jobs.append((DummyEvent(), 3))
-        handler._job_objs = {1: [], 2: [], 3: []}
-
-        # All should finish immediately (DummyEvent.query() is True)
-        finished = handler.get_finished()
-        assert finished == [1, 2, 3]
-        assert len(handler._event_jobs) == 0
-
-
-# ============================================================
 # Test 7: V6dObjectConnectorWorker hook mechanics
 # ============================================================
 
@@ -493,7 +259,7 @@ class TestV6dObjectBackendHook:
         from sglang_simulator.simulation.vllm.v6d.v6d_backend import (
             C_V6dObjectBackendHook,
         )
-        from sglang_simulator.simulation.vllm.v6d.v6d_swap import DummyEvent
+        from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent
 
         class MockV6dObjectBackend:
             def __init__(self):
@@ -717,13 +483,14 @@ class TestHybridConnectorLeakFix:
 # ============================================================
 
 class TestV6dManagerRealLookupPath:
-    """The manager hook must NOT override the real read-path methods.
+    """The manager hook must NOT override the real connector methods.
 
     After the real-path alignment, lookup/async_lookup/get_key/
-    async_get_key/prepare_batch_allocate are the production connector
-    methods (batch ``client.get``, ``_cached_objs`` skip, holder
-    registration); the hook only touches __init__/_async_connect and the
-    batch_allocate dead-daemon fallback.
+    async_get_key/prepare_batch_allocate/batch_allocate are the production
+    connector methods (batch ``client.get``, ``_cached_objs`` skip, holder
+    registration); the hook only touches ``_async_connect`` (skip
+    ``_on_connected``).  Daemon-down semantics are production's: the
+    connect failure is logged and ``client`` stays unset.
     """
 
     def _make_hooked_manager_cls(self):
@@ -765,7 +532,8 @@ class TestV6dManagerRealLookupPath:
         originals = {
             name: getattr(FakeV6dObjectManager, name)
             for name in ("lookup", "async_lookup", "get_key",
-                         "async_get_key", "prepare_batch_allocate")
+                         "async_get_key", "prepare_batch_allocate",
+                         "batch_allocate")
         }
         C_V6dObjectManagerHook.hook(FakeV6dObjectManager)
         return FakeV6dObjectManager, originals
@@ -776,51 +544,46 @@ class TestV6dManagerRealLookupPath:
             assert getattr(cls, name) is fn, (
                 f"{name} must stay the real connector method")
 
-    def test_batch_allocate_fallback_for_dead_client(self):
-        from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
-            _DeadClient,
-        )
-        cls, _ = self._make_hooked_manager_cls()
-        mgr = cls()
-        mgr.client = _DeadClient("fake://0")
+    def test_async_connect_failure_leaves_client_unset(self, monkeypatch):
+        # Production semantics: connect failure is logged and the manager
+        # keeps client=None (the first lookup then fails loudly, exactly
+        # like production with a dead daemon) — no fallback client.
+        import sys as _sys
 
-        result = mgr.batch_allocate(["a", "b"], 1, (), None,
-                                    request_id="r1")
+        def _boom(url):
+            raise RuntimeError("connection refused")
 
-        assert result == {"a": "key-a", "b": "key-b"}
-        assert mgr._pending_objs == {"a": "key-a", "b": "key-b"}
-
-    def test_batch_allocate_delegates_for_live_client(self):
-        cls, _ = self._make_hooked_manager_cls()
-        mgr = cls()
-        mgr.client = object()  # live client -> real batch_allocate
-
-        with pytest.raises(NotImplementedError):
-            mgr.batch_allocate(["a"], 1, (), None, request_id="r1")
-
-    def test_dead_client_reads_miss(self):
-        import asyncio
-        from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
-            _DeadClient,
-        )
-
-        client = _DeadClient("fake://0")
-        assert client.get(["k"]) is None
-        assert asyncio.run(client.async_get(["k"])) is None
-
-    def test_async_connect_failure_installs_dead_client(self):
-        # FakeV6dObjectManager lives in the test module, which has no
-        # _connect_v6d_with_retry -> the override's failure path runs.
-        from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
-            _DeadClient,
-        )
+        monkeypatch.setattr(_sys.modules[__name__], "_connect_v6d_with_retry",
+                            _boom, raising=False)
         cls, _ = self._make_hooked_manager_cls()
         mgr = cls()
         mgr._v6d_url = "fake://0"
         mgr._v6d_backend = None
         mgr._async_connect()
 
-        assert isinstance(mgr.client, _DeadClient)
+        assert mgr.client is None
+
+    def test_async_connect_success_marks_connected(self, monkeypatch):
+        import sys as _sys
+
+        sentinel_client = object()
+        monkeypatch.setattr(_sys.modules[__name__], "_connect_v6d_with_retry",
+                            lambda url: sentinel_client, raising=False)
+        cls, _ = self._make_hooked_manager_cls()
+        mgr = cls()
+        mgr._v6d_url = "fake://0"
+
+        class FakeBackend:
+            marked = []
+
+            def mark_manager_connected(self, group_id):
+                self.marked.append(group_id)
+
+        mgr._v6d_backend = FakeBackend()
+        mgr._async_connect()
+
+        assert mgr.client is sentinel_client
+        assert mgr._v6d_backend.marked == [0]
 
 
 class TestSchedulerRealLookupPath:
@@ -1096,45 +859,125 @@ class TestAcquireTieredReadHitSource:
 # Test: remote data-plane stubs (metadata only, no transfer)
 # ============================================================
 
+# ============================================================
+# Test: daemon argv/options hooks (reserve_memory, sparse mmap)
+# ============================================================
+
+
+class TestVineyardPeerArgvHook:
+    """C_VineyardPeerHook: swap reserve_memory=true->false, keep 2M
+    alignment (real SRPC), and make init_srpc soft-fail."""
+
+    @staticmethod
+    def _fake_transfer_module(monkeypatch, **attrs):
+        """Substitute v6d.common.transfer with a fake module.
+
+        Must patch BOTH sys.modules and the parent package attribute:
+        ``import v6d.common.transfer as t`` resolves via getattr on the
+        parent package, which still points at the real module otherwise.
+        """
+        import sys
+        import types
+
+        import v6d.common
+
+        fake_transfer = types.SimpleNamespace(**attrs)
+        monkeypatch.setitem(sys.modules, "v6d.common.transfer", fake_transfer)
+        monkeypatch.setattr(v6d.common, "transfer", fake_transfer,
+                            raising=False)
+        return fake_transfer
+
+    @staticmethod
+    def _make_fake_peer(monkeypatch, init_srpc):
+        from sglang_simulator.simulation.vllm.v6d import v6d_capacity as cap
+
+        fake_transfer = TestVineyardPeerArgvHook._fake_transfer_module(
+            monkeypatch, init_srpc_transfer=init_srpc)
+
+        class FakePeer:
+            def __init__(self, argc=0, argv=None, *args, **kwargs):
+                self.argv = argv
+
+        cap.C_VineyardPeerHook.hook(FakePeer)
+        return FakePeer, fake_transfer
+
+    def test_reserve_memory_swapped_alignment_untouched(self, monkeypatch):
+        calls = []
+        FakePeer, _ = self._make_fake_peer(
+            monkeypatch, lambda *a, **k: calls.append((a, k)))
+
+        peer = FakePeer(3, ["v6d", "--reserve_memory=true",
+                            "-2M_alignment=true"])
+
+        assert "--reserve_memory=false" in peer.argv
+        assert "--reserve_memory=true" not in peer.argv
+        assert "-2M_alignment=true" in peer.argv  # 2M alignment kept: real SRPC
+
+    def test_srpc_init_soft_fail(self, monkeypatch):
+        def _boom(*a, **k):
+            raise RuntimeError("MEM_ALIGN")
+
+        FakePeer, fake_transfer = self._make_fake_peer(monkeypatch, _boom)
+        FakePeer(1, ["v6d"])
+
+        # init_srpc_transfer was replaced by the soft-fail wrapper: calling
+        # it logs and returns None instead of raising.
+        assert fake_transfer.init_srpc_transfer(1, 2) is None
+
+    def test_srpc_init_success_passthrough(self, monkeypatch):
+        calls = []
+        FakePeer, fake_transfer = self._make_fake_peer(
+            monkeypatch, lambda addr, size: calls.append((addr, size)) or "ok")
+        FakePeer(1, ["v6d"])
+
+        assert fake_transfer.init_srpc_transfer(123, 4096) == "ok"
+        assert calls == [(123, 4096)]
+
+
+class TestV6dMmapManagerHook:
+    """C_V6dMmapManagerHook: skip the populating C++ init_mmap on client
+    connect, keep the real handshake socket."""
+
+    def test_create_mmap_skips_population(self, monkeypatch):
+        import os
+
+        from sglang_simulator.simulation.vllm.v6d import v6d_manager as mgr
+
+        # Import the real module chain BEFORE faking v6d.common.transfer —
+        # v6d.client.peers.vineyard.__init__ pulls blob_view, which imports
+        # transfer.load_data and would choke on the fake module.
+        import v6d.client.peers.vineyard.mmap_manager  # noqa: F401
+
+        r_fd, w_fd = os.pipe()
+        connect_calls = []
+
+        def _fake_connect(socket_path):
+            connect_calls.append(socket_path)
+            return r_fd, 500 << 30, 0, object()  # real fd so os.close works
+
+        TestVineyardPeerArgvHook._fake_transfer_module(
+            monkeypatch, _vineyard_connect=_fake_connect)
+
+        class FakeMgr:
+            pass
+
+        mgr.C_V6dMmapManagerHook.hook(FakeMgr)
+        info = FakeMgr._create_mmap(FakeMgr(), "/tmp/x.sock", True)
+        os.close(w_fd)
+
+        # Handshake happened, but no mmap / no init_srpc, zero base.
+        assert connect_calls == ["/tmp/x.sock"]
+        assert info.base_addr == 0
+        assert info.map_size == 500 << 30
+        assert info.fd == -1
+
+
+# ============================================================
+# Test: remote data-plane stubs (payload copies only; meta probe is real)
+# ============================================================
+
+
 class TestTransferStubs:
-
-    def teardown_method(self):
-        from sglang_simulator.simulation.vllm.v6d.v6d_capacity import (
-            VirtualCapacityManager,
-        )
-        VirtualCapacityManager.reset()
-
-    def test_fabricated_metas_use_page_size(self):
-        from sglang_simulator.simulation.vllm.v6d.v6d_capacity import (
-            VirtualCapacityManager,
-            _sim_get_metas_by_names,
-        )
-        mgr = VirtualCapacityManager.get_or_create(1 << 30)
-        mgr.record_allocate([51511296])  # first store teaches the page size
-
-        metas = _sim_get_metas_by_names(["a", "b"], "10.0.0.2:9600")
-
-        assert len(metas) == 2
-        assert [m.size for m in metas] == [51511296, 51511296]
-        assert metas[0].buffer_num == 1
-        # C++ create_data behind seal() rejects metas without these fields.
-        meta_dict = metas[0].get_dict()
-        assert meta_dict["typename"] == "vineyard::Object"
-        assert meta_dict["instance_id"] == 0
-        assert meta_dict["transient"] is False
-        # buffer_0 carries a parseable placeholder object id; reconstruct_meta
-        # replaces it with the local blob before seal.
-        metas[0].buffer[0].object_id.to_string()
-
-    def test_unknown_page_size_fails_like_remote_miss(self):
-        from sglang_simulator.simulation.vllm.v6d.v6d_capacity import (
-            VirtualCapacityManager,
-            _sim_get_metas_by_names,
-        )
-        VirtualCapacityManager.get_or_create(1 << 30)  # no store yet
-
-        with pytest.raises(KeyError):
-            _sim_get_metas_by_names(["a"], "10.0.0.2:9600")
 
     def test_load_data_noop(self):
         from sglang_simulator.simulation.vllm.v6d.v6d_capacity import (
@@ -1143,6 +986,29 @@ class TestTransferStubs:
         )
         assert _sim_load_data_noop([[1]], [[2]], [[0]], [[4]], "x:1") is None
         assert _sim_async_load_data_noop([[1]], [[2]], [[0]], [[4]], "x:1") == []
+
+    def test_meta_probe_not_stubbed(self, monkeypatch):
+        """The tiered hook stubs only the payload copies; the SRPC meta probe
+        must stay real."""
+        from sglang_simulator.simulation.vllm.v6d import v6d_capacity as cap
+
+        sentinel = object()
+        fake_transfer = TestVineyardPeerArgvHook._fake_transfer_module(
+            monkeypatch,
+            get_metas_by_names=sentinel,
+            load_data=lambda *a, **k: "orig",
+            async_load_data=lambda *a, **k: "orig",
+        )
+
+        class FakeTiered:
+            async def _acquire_tiered_read(self, *args, **kwargs):
+                return None, []
+
+        cap.C_TieredVineyardPeerHook.hook(FakeTiered)
+
+        assert fake_transfer.get_metas_by_names is sentinel  # real SRPC probe
+        assert fake_transfer.load_data is cap._sim_load_data_noop
+        assert fake_transfer.async_load_data is cap._sim_async_load_data_noop
 
 
 if __name__ == "__main__":
