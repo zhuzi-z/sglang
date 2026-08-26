@@ -15,6 +15,10 @@ SRPC meta probe (``transfer.get_metas_by_names`` works because the mmap is
 (``transfer.load_data`` / ``async_load_data``, eager strategies only) are
 no-ops, and a ``[V6D HitSource]`` line per read batch is logged (port of
 the production v6d_hitsource_patch; see tmp.out/bugfix/hit_stats.sh).
+With ``V6D_KEYSOURCE_LOG=1`` (default) each read line also carries its
+object keys (`` keys=...`` suffix), and CREATE-scope acquires / eviction
+batches log ``[V6D CreateSource]`` / ``[V6D EvictSource]`` lines — the
+per-key lineage needed to trace multi-turn cache ancestry.
 Only ``--peer=tiered_vineyard`` daemon mode is supported.
 """
 
@@ -48,8 +52,20 @@ os.environ.setdefault("SRPC_STREAM_DISABLE_RDMA", "1")
 # ``_cached_objs`` never reach the daemon and are not counted — same as
 # production.  Contextvars are asyncio-task-local, so per-batch attribution
 # stays exact even when the daemon interleaves concurrent acquires.
+#
+# Key lineage (sim-only, V6D_KEYSOURCE_LOG=1 by default):
+#   * every read line gains a `` keys=k1,k2,...`` suffix (the probe keys);
+#   * CREATE-scope acquires log ``[V6D CreateSource] request_id=<rid> n=N
+#     keys=...`` — the intended writes of that request (keys the inner peer
+#     merely touches because they already exist are included: for lineage
+#     the requester is what matters);
+#   * eviction batches log ``[V6D EvictSource] n=N keys=...``.
+# Keys are daemon object keys (block-hash derived).  Joining them across
+# requests yields the multi-turn ancestry: which request wrote / probed /
+# evicted which boundary state.
 
 _ENV_HITSOURCE_LOG = "V6D_HITSOURCE_LOG"
+_ENV_KEYSOURCE_LOG = "V6D_KEYSOURCE_LOG"
 
 _HITSOURCE_COUNTERS = ("local", "p2p", "sharedfs", "tair_kvcm")
 
@@ -60,6 +76,17 @@ _hit_bag: contextvars.ContextVar = contextvars.ContextVar(
 
 def _hitsource_enabled() -> bool:
     return os.environ.get(_ENV_HITSOURCE_LOG, "1") not in ("0", "false", "False")
+
+
+def _keysource_enabled() -> bool:
+    """Key-lineage logging: keys= suffix + CreateSource/EvictSource lines."""
+    return os.environ.get(_ENV_KEYSOURCE_LOG, "1") not in ("0", "false", "False")
+
+
+def _fmt_keys(object_keys) -> str:
+    """Comma-joined, None-filtered key list (empty string when nothing)."""
+    keys = [k for k in (object_keys or ()) if k]
+    return ",".join(keys)
 
 
 # ---------------------------------------------------------------------------
@@ -189,16 +216,62 @@ class C_TieredVineyardPeerHook(BaseHook):
                 queried = len(object_keys)
                 if queried:
                     hits = sum(bag.values())
+                    keys_suffix = (" keys=" + _fmt_keys(object_keys)
+                                   if _keysource_enabled() else "")
                     logger.info(
                         "[V6D HitSource] request_id=%s queried=%d local=%d p2p=%d "
-                        "sharedfs=%d tair_kvcm=%d miss=%d%s",
+                        "sharedfs=%d tair_kvcm=%d miss=%d%s%s",
                         request_id, queried, bag["local"], bag["p2p"],
                         bag["sharedfs"], bag["tair_kvcm"],
                         max(queried - hits, 0),
                         f" error={error}" if error else "",
+                        keys_suffix,
                     )
 
         target._acquire_tiered_read = wrapped_acquire_tiered_read
+
+        # ---- key lineage: CREATE acquires + eviction batches -------------
+        # ``acquire`` is the outer entrypoint (daemon /acquire route); CREATE
+        # scope dispatches to the create path whose BATCH_CREATE keys are
+        # exactly ``object_keys``.  ``request_id`` is keyword in every caller
+        # seen, with a positional fallback for safety.
+        original_acquire = target.acquire
+
+        async def wrapped_acquire(self, object_keys, scope, *args, **kwargs):
+            if not _keysource_enabled() or "CREATE" not in str(scope):
+                return await original_acquire(self, object_keys, scope, *args, **kwargs)
+            request_id = kwargs.get("request_id")
+            if request_id is None:
+                request_id = next(
+                    (a for a in args[3:] if isinstance(a, str)), None)
+            try:
+                return await original_acquire(self, object_keys, scope, *args, **kwargs)
+            finally:
+                keys = _fmt_keys(object_keys)
+                if keys:
+                    logger.info(
+                        "[V6D CreateSource] request_id=%s n=%d keys=%s",
+                        request_id, len([k for k in (object_keys or ()) if k]), keys)
+
+        target.acquire = wrapped_acquire
+
+        # Eviction batches carry the objects being dropped — the death side
+        # of the lineage.  Batched (~15 keys/call, ~30 calls/min/pod).
+        original_evict_batch = target._evict_batch_from_vineyard
+
+        async def wrapped_evict_batch(self, object_keys):
+            if not _keysource_enabled():
+                return await original_evict_batch(self, object_keys)
+            keys = _fmt_keys(object_keys)
+            try:
+                return await original_evict_batch(self, object_keys)
+            finally:
+                if keys:
+                    logger.info(
+                        "[V6D EvictSource] n=%d keys=%s",
+                        len([k for k in (object_keys or ()) if k]), keys)
+
+        target._evict_batch_from_vineyard = wrapped_evict_batch
 
         # The tiered peer module already imports v6d.common.transfer (through
         # v6d.server.peers.vineyard.peer), so this import is a sys.modules
@@ -214,7 +287,9 @@ class C_TieredVineyardPeerHook(BaseHook):
         logger.info(
             "[v6d-sim] C_TieredVineyardPeerHook installed: real "
             "_acquire_tiered_read + [V6D HitSource] stats + real SRPC meta "
-            "probe (payload copies stubbed)"
+            "probe (payload copies stubbed); key lineage (keys= suffix + "
+            "CreateSource/EvictSource) "
+            f"{'on' if _keysource_enabled() else 'off'}"
         )
 
 
