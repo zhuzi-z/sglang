@@ -112,11 +112,9 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     layer_types = getattr(hf_config, "layer_types", None)
     num_hidden_layers = hf_config.num_hidden_layers
 
-    # Determine KV cache dtype
+    # Determine KV cache dtype ("auto" keeps the model dtype)
     cache_dtype = getattr(cache_config, "cache_dtype", "auto")
-    if cache_dtype == "auto":
-        pass  # keep model dtype
-    elif cache_dtype == "fp8":
+    if cache_dtype == "fp8":
         dtype = torch.float8_e4m3fn
 
     # Detect FullAttentionSpec supported fields (varies across vLLM versions)
@@ -486,14 +484,15 @@ class C_VLLMWorkerHook(BaseHook):
             # request has reached the end of its prompt.  Returning a token for
             # every partial chunk makes max_tokens=1 requests finish after the
             # first 8192-token chunk and silently skips the remaining prompt.
-            # The per-request decision is computed by the scheduler hook and
-            # annotated onto scheduler_output (_sim_token_emitted), riding the
-            # native scheduler -> worker dataflow.
+            # The per-request decision is computed by the executor hook
+            # (C_VLLMExecutorHook) and annotated onto scheduler_output
+            # (_sim_token_emitted), riding the native scheduler -> worker
+            # dataflow.
             token_emitted = getattr(scheduler_output, "_sim_token_emitted", None)
             if req_ids and token_emitted is None:
                 raise RuntimeError(
                     "scheduler_output lacks _sim_token_emitted annotation "
-                    "(sim scheduler hook not active?)"
+                    "(sim executor hook not active?)"
                 )
 
             sampled_token_ids = []
@@ -501,7 +500,7 @@ class C_VLLMWorkerHook(BaseHook):
                 if req_id not in token_emitted:
                     raise RuntimeError(
                         f"scheduled request {req_id!r} is missing from the "
-                        "scheduler hook's _sim_token_emitted annotation"
+                        "executor hook's _sim_token_emitted annotation"
                     )
                 sampled_token_ids.append([1] if token_emitted[req_id] else [])
 
@@ -553,9 +552,6 @@ class C_VLLMWorkerHook(BaseHook):
             self._last_model_output = output
             return output
 
-        def override_take_draft_token_ids(self):
-            return None
-
         def override_sample_tokens(self, grammar_output):
             """Return the mock output built by execute_model."""
             return self._last_model_output
@@ -582,18 +578,6 @@ class C_VLLMWorkerHook(BaseHook):
         def override_wake_up(self, tags=None):
             pass
 
-
-        target.init_device = override_init_device
-        target.load_model = override_load_model
-        target.determine_available_memory = override_determine_available_memory
-        target.get_kv_cache_spec = override_get_kv_cache_spec
-        target.get_supported_tasks = override_get_supported_tasks
-        target.initialize_from_config = override_initialize_from_config
-        target.compile_or_warm_up_model = override_compile_or_warm_up_model
-        target.execute_model = override_execute_model
-        target.take_draft_token_ids = override_take_draft_token_ids
-        target.sample_tokens = override_sample_tokens
-        target.take_draft_token_ids = override_take_draft_token_ids
         def override_reset_mm_cache(self):
             """No-op: no real model_runner to reset."""
             pass
@@ -607,6 +591,16 @@ class C_VLLMWorkerHook(BaseHook):
             """No-op in simulation."""
             pass
 
+        target.init_device = override_init_device
+        target.load_model = override_load_model
+        target.determine_available_memory = override_determine_available_memory
+        target.get_kv_cache_spec = override_get_kv_cache_spec
+        target.get_supported_tasks = override_get_supported_tasks
+        target.initialize_from_config = override_initialize_from_config
+        target.compile_or_warm_up_model = override_compile_or_warm_up_model
+        target.execute_model = override_execute_model
+        target.take_draft_token_ids = override_take_draft_token_ids
+        target.sample_tokens = override_sample_tokens
         target.sleep = override_sleep
         target.wake_up = override_wake_up
         target.get_attn_backends_type = override_get_attn_backends_type

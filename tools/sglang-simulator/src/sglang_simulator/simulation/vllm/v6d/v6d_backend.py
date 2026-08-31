@@ -12,10 +12,7 @@ No DashServing/vLLM source file is modified on disk; all changes are installed
 through class monkey-patches at interpreter startup.
 """
 
-import asyncio
-import os
 import sys
-import threading
 import time
 
 from sglang_simulator.hook import BaseHook
@@ -54,7 +51,6 @@ class C_HybridConnectorHook(BaseHook):
     @classmethod
     def hook(cls, target):
         original_bind = target.bind_connector_metadata
-        original_clear = target.clear_connector_metadata
 
         def _collect_req_ids(obj, attr_name, seen=None):
             if obj is None:
@@ -117,10 +113,14 @@ class C_HybridConnectorHook(BaseHook):
         def override_bind_connector_metadata(self, metadata):
             original_bind(self, metadata)
             reqs_to_store = _resolve_reqs_to_store(metadata)
-            # The CPU no-op "save" completes instantly.  Report completion
-            # through the REAL production channel: mark_backend_save_done()
-            # is equivalent to the worker's _SAVE_DONE_REQ RPC and drives
-            # the native chain
+            # The CPU no-op "save" completes instantly, so here we only
+            # record store-completion deadlines.  The actual
+            # mark_backend_save_done signal is sent by get_finished() at the
+            # next step boundary where now >= deadline, preserving
+            # step-aligned timing (matches production: seal only at
+            # schedule->update_connector_output).  mark_backend_save_done()
+            # is the production channel (equivalent to the worker's
+            # _SAVE_DONE_REQ RPC) and drives the native chain
             #   _do_save_done -> _saved/_try_teardown_save (block refs)
             #                 -> _cleanup -> backend.async_cleanup
             #                    (seal v6d objects + release mamba
@@ -128,12 +128,6 @@ class C_HybridConnectorHook(BaseHook):
             # v6d save_count=1: the worker signals once, on the LAST save
             # of the request (_is_last_save=True).  Empty groups_data is
             # the noop last-save marker and must signal as well.
-            # Record store-completion deadlines. The actual
-            # mark_backend_save_done signal is sent by get_finished()
-            # at the next step boundary where now >= deadline, preserving
-            # step-aligned timing (matches production: seal only at
-            # schedule→update_connector_output). Uses the production RPC
-            # channel (mark_backend_save_done) to keep mamba block release.
             _bw = BandwidthModel.get()
             _now = time.perf_counter()
             _pending = getattr(self, "_sim_pending_store", {})
@@ -155,8 +149,7 @@ class C_HybridConnectorHook(BaseHook):
                     _nblk = _sim_block_count(_groups) if _groups else 0
                     delay_s = _bw.store_completion_latency(_nblk)
                     _pending[req_id] = (
-                        max(_pending.get(req_id, (0.0,))[0] if req_id in _pending else 0.0,
-                            _now + delay_s),
+                        max(_pending.get(req_id, (0.0,))[0], _now + delay_s),
                         req,
                     )
                 logger.debug(
@@ -366,8 +359,6 @@ class C_V6dObjectBackendHook(BaseHook):
         # The original async_load_kv calls self._worker.async_start_load_kv(meta)
         # which requires real V6D data-plane operations (CUDA events, DMA, etc.).
         # We bypass that and directly yield IoRet for each reqs_to_load entry.
-        original_async_load_kv = target.async_load_kv
-
         async def override_async_load_kv(self, m):
             from vllm.v1.hybrid_connector import IoRet
             meta = m.inner

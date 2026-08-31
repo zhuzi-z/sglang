@@ -5,7 +5,6 @@ inference framework for simulation purposes.
 IMPORTANT: init_hook() must be called BEFORE any `import vllm.*` statement.
 """
 
-import json
 import logging
 import os
 
@@ -96,19 +95,22 @@ def init_hook():
     global _HOOKS_INSTALLED
     if _HOOKS_INSTALLED:
         return True
-    from sglang_simulator.simulation.vllm.v6d.ipc_hook import _install_v6d_ipc_hook
-    _install_v6d_ipc_hook()
+
+    # CPU-only v6d IPC: the SRPC engine natively supports
+    # SRPC_STREAM_DISABLE_RDMA=1 (TCP-only mode, skipping libcuda/barex/
+    # ibverbs).  setdefault so child processes (EngineCore workers,
+    # dashllm-launched v6d daemons) inherit it via the environment.
+    os.environ.setdefault("SRPC_STREAM_DISABLE_RDMA", "1")
 
     import sglang_simulator.hook as sglang_simulator_hook
     from sglang_simulator.simulation.vllm import (
         engine_args,
+        engine_core_pipeline,
         kv_offload,
         platform,
         profile_hook,
-        scheduler,
         worker,
     )
-
 
     # Ensure deterministic block hashes across nodes for cross-node cache sharing.
     # vLLM uses PYTHONHASHSEED to initialize NONE_HASH; without it, each process
@@ -129,8 +131,11 @@ def init_hook():
         engine_args.C_VLLMEngineArgsHook,
         # Worker hook (handles everything — no model_runner hooks needed)
         worker.C_VLLMWorkerHook,
-        # Scheduler hook for time prediction
-        scheduler.C_VLLMSchedulerHook,
+        # Engine-core pipeline hooks: scheduler (created_time dispatch,
+        # queue/hit stats) + executor (simulated GPU span at
+        # model_executor.execute_model, the engine's real execution seam)
+        engine_core_pipeline.C_VLLMSchedulerHook,
+        engine_core_pipeline.C_VLLMExecutorHook,
         # Profile hook — exports request / iteration stats on
         # /start_profile & /stop_profile (EngineCore.profile)
         profile_hook.C_VLLMProfileHook,

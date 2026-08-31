@@ -27,7 +27,7 @@ class C_VLLMProfileHook(BaseHook):
     @classmethod
     def hook(cls, target):
         def wrapped_profile(self, is_start: bool = True):
-            from sglang_simulator.simulation.vllm.scheduler import (
+            from sglang_simulator.simulation.vllm.engine_core_pipeline import (
                 C_VLLMSchedulerHook,
             )
 

@@ -33,7 +33,7 @@ from vllm.engine.arg_utils import EngineArgs  # noqa: E402
 # Hook modules are imported only after init_hook(): by then they are already
 # loaded by the hook installation sequence, and any future transitive
 # dependency can never precede hook installation.
-from sglang_simulator.simulation.vllm.scheduler import C_VLLMSchedulerHook  # noqa: E402
+from sglang_simulator.simulation.vllm.engine_core_pipeline import C_VLLMSchedulerHook  # noqa: E402
 
 logger = get_logger("sglang_simulator")
 

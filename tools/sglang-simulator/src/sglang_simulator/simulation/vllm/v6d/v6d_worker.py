@@ -134,8 +134,6 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
         target._start_async_v6d_init = override_start_async_v6d_init
 
         # Override register_kv_caches to allocate on CPU instead of GPU
-        original_register = target.register_kv_caches
-
         def override_register_kv_caches(self, kv_caches):
             """Register KV cache metadata without starting SRPC data channels."""
             self.kv_caches = kv_caches

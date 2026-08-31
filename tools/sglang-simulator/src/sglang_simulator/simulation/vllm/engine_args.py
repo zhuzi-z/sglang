@@ -7,8 +7,6 @@ The actual parallelism is captured in the simulator's scheduler config
 (from SGLANG_SIMULATOR_CONFIG_PATH) and used by the time predictor.
 """
 
-import torch
-
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils import get_logger
 
