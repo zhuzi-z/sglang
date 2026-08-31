@@ -22,23 +22,29 @@ def register_v6d_hooks(hooks: list) -> None:
         C_KVTPBackendHook,
     )
     from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
+        C_V6dMmapManagerHook,
         C_V6dObjectConnectorSchedulerHook,
+        C_V6dObjectFetchHelperHook,
         C_V6dObjectManagerHook,
     )
-    from sglang_simulator.simulation.vllm.v6d.v6d_swap import C_V6dSwapHandlerHook
     from sglang_simulator.simulation.vllm.v6d.v6d_worker import (
         C_V6dObjectConnectorWorkerHook,
     )
 
+    # NOTE: C_V6dSwapHandlerHook was removed with v6d_swap.py — the worker
+    # hook below replaces _start_async_v6d_init with handler=None, so
+    # V6dSwapHandler (the only caller of ops.v6d_swap_blocks) is never
+    # instantiated in hybrid mode.
     v6d_hooks = [
-        C_V6dSwapHandlerHook,
         C_HybridBackendHook,
         C_HybridConnectorHook,
         C_V6dObjectConnectorWorkerHook,
         C_V6dObjectBackendHook,
         C_KVTPBackendHook,
         C_V6dObjectConnectorSchedulerHook,
+        C_V6dObjectFetchHelperHook,
         C_V6dObjectManagerHook,
+        C_V6dMmapManagerHook,
     ]
     hooks.extend(v6d_hooks)
     logger.info("[init_hook] Registered %d V6D native control-plane hooks",

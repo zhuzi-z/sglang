@@ -5,6 +5,17 @@ The real V6dObjectConnectorWorker class is preserved so scheduler/worker
 metadata flow remains native, while CUDA/SRPC data-plane operations are
 converted to deterministic no-op completions.  This lets CPU-only dual-node
 validation exercise the real control plane without transferring full KV data.
+
+Only the live entry points are hooked.  Dead in hybrid mode (callers verified
+against vllm.v1.hybrid_connector, 2026-08):
+- sync start_load_kv/start_store_kv: HybridWorker drives loads via
+  backend.async_load_kv; nothing calls the worker sync versions.
+- async_start_load_kv: its only caller was the real
+  V6dObjectBackend.async_load_kv, which C_V6dObjectBackendHook replaces.
+- get_finished: completion is signalled via mark_backend_save_done
+  (C_HybridConnectorHook) and io_done RPC, not worker polling.
+- V6dSwapHandler (ops.v6d_swap_blocks): never instantiated because
+  _start_async_v6d_init below leaves the handlers None.
 """
 
 import asyncio
@@ -13,7 +24,6 @@ import time
 import torch
 
 from sglang_simulator.hook import BaseHook
-from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent, DummyStream
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
@@ -138,44 +148,14 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
 
         target.register_kv_caches = override_register_kv_caches
 
-        def override_start_load_kv(self, metadata):
-            self._sim_finished_load_reqs = set(metadata.reqs_to_load)
-            logger.debug(
-                "[V6D Hijack] start_load_kv: completed CPU no-op loads %s",
-                sorted(self._sim_finished_load_reqs),
-            )
-            return None
-
-        def override_start_store_kv(self, metadata):
-            self._sim_finished_store_reqs = set(metadata.reqs_to_store)
-            logger.debug(
-                "[V6D Hijack] start_store_kv: completed CPU no-op stores %s",
-                sorted(self._sim_finished_store_reqs),
-            )
-            return None
-
         async def _completed_v6d_task():
             return None
 
-        def override_async_start_load_kv(self, metadata):
-            req_ids = set(metadata.reqs_to_load)
-            self._sim_finished_load_reqs = (
-                getattr(self, "_sim_finished_load_reqs", set()) | req_ids
-            )
-            logger.debug(
-                "[V6D Hijack] async_start_load_kv: completed CPU no-op loads %s",
-                sorted(req_ids),
-            )
-            return {
-                req_id: asyncio.create_task(_completed_v6d_task())
-                for req_id in req_ids
-            }
-
         def override_async_start_store_kv(self, metadata):
+            # Store completion is signalled scheduler-side via
+            # mark_backend_save_done (C_HybridConnectorHook); here the
+            # worker's store is an instant no-op task per request.
             req_ids = set(metadata.reqs_to_store)
-            self._sim_finished_store_reqs = (
-                getattr(self, "_sim_finished_store_reqs", set()) | req_ids
-            )
             logger.debug(
                 "[V6D Hijack] async_start_store_kv: completed CPU no-op stores %s",
                 sorted(req_ids),
@@ -185,25 +165,6 @@ class C_V6dObjectConnectorWorkerHook(BaseHook):
                 for req_id in req_ids
             }
 
-        def override_get_finished(self, finished_req_ids):
-            load_reqs = set(getattr(self, "_sim_finished_load_reqs", set()))
-            store_reqs = set(getattr(self, "_sim_finished_store_reqs", set()))
-            self._sim_finished_load_reqs = set()
-            self._sim_finished_store_reqs = set()
-            if load_reqs or store_reqs:
-                logger.debug(
-                    "[V6D Hijack] get_finished: store=%s load=%s "
-                    "finished_req_ids=%s",
-                    sorted(store_reqs),
-                    sorted(load_reqs),
-                    sorted(finished_req_ids or []),
-                )
-            return store_reqs, load_reqs
-
-        target.start_load_kv = override_start_load_kv
-        target.start_store_kv = override_start_store_kv
-        target.async_start_load_kv = override_async_start_load_kv
         target.async_start_store_kv = override_async_start_store_kv
-        target.get_finished = override_get_finished
 
         logger.info("[V6D Hijack] V6dObjectConnectorWorker hook installed")

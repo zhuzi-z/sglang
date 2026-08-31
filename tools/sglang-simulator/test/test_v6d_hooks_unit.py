@@ -5,8 +5,7 @@ a V6D daemon or vLLM engine. They test:
 1. DummyStream/DummyEvent behavior
 2. head_dim=1 injection logic
 3. KV cache spec construction with real num_kv_heads
-4. ops monkey-patching (v6d_swap_blocks CPU memcpy)
-5. Hook class installation mechanics
+4. Hook class installation mechanics
 """
 
 import os
@@ -30,7 +29,7 @@ class TestDummyPrimitives:
     """Test DummyStream and DummyEvent mock CUDA primitives."""
 
     def setup_method(self):
-        from sglang_simulator.simulation.vllm.v6d.v6d_swap import (
+        from sglang_simulator.simulation.vllm.cpu_stubs import (
             DummyStream, DummyEvent,
         )
         self.DummyStream = DummyStream
@@ -221,239 +220,6 @@ class TestBuildKVCacheSpec:
 
 
 # ============================================================
-# Test 4: ops monkey-patching
-# ============================================================
-
-class TestOpsPatch:
-    """Test _patch_v6d_ops correctly replaces CUDA ops."""
-
-    def test_patch_replaces_swap_blocks(self):
-        """After patching, v6d_swap_blocks should be a Python function."""
-        from sglang_simulator.simulation.vllm.v6d import v6d_swap
-
-        # Reset patch state
-        v6d_swap._OPS_PATCHED = False
-
-        # Create a mock _custom_ops module
-        mock_ops = MagicMock()
-        with patch.dict(sys.modules, {"vllm._custom_ops": mock_ops, "vllm": MagicMock(_custom_ops=mock_ops)}):
-            v6d_swap._patch_v6d_ops()
-
-        assert v6d_swap._OPS_PATCHED is True
-        # The mock should have had its functions replaced
-        assert mock_ops.v6d_swap_blocks is not None
-        assert mock_ops.v6d_register_host_memory is not None
-        assert mock_ops.v6d_unregister_host_memory is not None
-
-
-# ============================================================
-# Test 5: CPU memcpy via mock_v6d_swap_blocks
-# ============================================================
-
-class TestMockSwapBlocks:
-    """Test the CPU memcpy implementation of v6d_swap_blocks."""
-
-    def test_swap_in_copies_data_correctly(self):
-        """Swap-in: copy from V6D mmap (src) to KV cache (dst)."""
-        num_layers = 2
-        num_blocks = 3
-        page_size = 64  # bytes per block per layer
-
-        # Allocate KV cache (destination) - zeros initially
-        kv_cache = torch.zeros(
-            num_layers * num_blocks * page_size, dtype=torch.uint8
-        )
-        # Allocate V6D mmap objects (source) - filled with data
-        v6d_objs = [
-            torch.arange(num_layers * page_size, dtype=torch.uint8) + (i + 1)
-            for i in range(num_blocks)
-        ]
-
-        # Build pointer tensors
-        layer_ptrs = torch.zeros(num_layers, dtype=torch.long)
-        for layer_idx in range(num_layers):
-            layer_ptrs[layer_idx] = (
-                kv_cache.data_ptr() + layer_idx * num_blocks * page_size
-            )
-
-        cpu_block_ptrs = torch.zeros(num_blocks, dtype=torch.long)
-        for i in range(num_blocks):
-            cpu_block_ptrs[i] = v6d_objs[i].data_ptr()
-
-        gpu_block_ids = torch.arange(num_blocks, dtype=torch.long)
-
-        # Perform swap-in
-        from sglang_simulator.simulation.vllm.v6d.v6d_swap import _patch_v6d_ops
-        # Get the mock function directly
-        import sglang_simulator.simulation.vllm.v6d.v6d_swap as swap_mod
-
-        # Call internal mock directly
-        # We need to test the actual memcpy logic
-        for i in range(num_blocks):
-            cpu_base = cpu_block_ptrs[i].item()
-            block_id = gpu_block_ids[i].item()
-            for layer_idx in range(num_layers):
-                layer_ptr = layer_ptrs[layer_idx].item()
-                kv_ptr = layer_ptr + block_id * page_size
-                obj_ptr = cpu_base + layer_idx * page_size
-                ctypes.memmove(kv_ptr, obj_ptr, page_size)
-
-        # Verify: KV cache should now contain V6D data
-        for i in range(num_blocks):
-            for layer_idx in range(num_layers):
-                offset = layer_idx * num_blocks * page_size + i * page_size
-                expected_start = layer_idx * page_size
-                expected_end = (layer_idx + 1) * page_size
-                actual = kv_cache[offset : offset + page_size]
-                expected = v6d_objs[i][expected_start:expected_end]
-                assert torch.equal(actual, expected), (
-                    f"Mismatch at block={i}, layer={layer_idx}"
-                )
-
-    def test_swap_out_copies_data_correctly(self):
-        """Swap-out: copy from KV cache (src) to V6D mmap (dst)."""
-        num_layers = 2
-        num_blocks = 2
-        page_size = 32
-
-        # KV cache with data
-        kv_cache = torch.arange(
-            num_layers * num_blocks * page_size, dtype=torch.uint8
-        )
-        # V6D objects (destination) - zeros initially
-        v6d_objs = [
-            torch.zeros(num_layers * page_size, dtype=torch.uint8)
-            for _ in range(num_blocks)
-        ]
-
-        # Build pointer tensors
-        layer_ptrs = torch.zeros(num_layers, dtype=torch.long)
-        for layer_idx in range(num_layers):
-            layer_ptrs[layer_idx] = (
-                kv_cache.data_ptr() + layer_idx * num_blocks * page_size
-            )
-
-        cpu_block_ptrs = torch.zeros(num_blocks, dtype=torch.long)
-        for i in range(num_blocks):
-            cpu_block_ptrs[i] = v6d_objs[i].data_ptr()
-
-        gpu_block_ids = torch.arange(num_blocks, dtype=torch.long)
-
-        # Perform swap-out (swap_in=False)
-        for i in range(num_blocks):
-            cpu_base = cpu_block_ptrs[i].item()
-            block_id = gpu_block_ids[i].item()
-            for layer_idx in range(num_layers):
-                layer_ptr = layer_ptrs[layer_idx].item()
-                kv_ptr = layer_ptr + block_id * page_size
-                obj_ptr = cpu_base + layer_idx * page_size
-                # swap_out: kv -> obj
-                ctypes.memmove(obj_ptr, kv_ptr, page_size)
-
-        # Verify: V6D objects should now contain KV cache data
-        for i in range(num_blocks):
-            for layer_idx in range(num_layers):
-                kv_offset = layer_idx * num_blocks * page_size + i * page_size
-                obj_offset = layer_idx * page_size
-                actual = v6d_objs[i][obj_offset : obj_offset + page_size]
-                expected = kv_cache[kv_offset : kv_offset + page_size]
-                assert torch.equal(actual, expected), (
-                    f"Mismatch at block={i}, layer={layer_idx}"
-                )
-
-
-# ============================================================
-# Test 6: V6dSwapHandler hook mechanics
-# ============================================================
-
-class TestV6dSwapHandlerHook:
-    """Test that the hook correctly installs overrides on target class."""
-
-    def test_hook_installs_init_override(self):
-        from sglang_simulator.simulation.vllm.v6d.v6d_swap import (
-            C_V6dSwapHandlerHook, DummyStream,
-        )
-
-        # Create a mock target class
-        class MockV6dSwapHandler:
-            def __init__(self):
-                pass
-
-            def _validate_swap(self, *args):
-                return True
-
-            def _process_swap_batch(self, *args):
-                return []
-
-        # Apply hook
-        C_V6dSwapHandlerHook.hook(MockV6dSwapHandler)
-
-        # Verify: __init__ was replaced
-        mock_client = MagicMock()
-        handler = MockV6dSwapHandler.__new__(MockV6dSwapHandler)
-        MockV6dSwapHandler.__init__(handler, 0, 4, mock_client, True, 0)
-
-        assert isinstance(handler._stream, DummyStream)
-        assert handler._rank_id == 0
-        assert handler._swap_in is True
-        assert handler._gpu_device == torch.device("cpu")
-
-    def test_hook_installs_swap_override(self):
-        from sglang_simulator.simulation.vllm.v6d.v6d_swap import (
-            C_V6dSwapHandlerHook,
-        )
-
-        class MockV6dSwapHandler:
-            def __init__(self):
-                pass
-
-            def _validate_swap(self, *args):
-                return True
-
-            def _process_swap_batch(self, *args, **kwargs):
-                return ["obj1"]
-
-        C_V6dSwapHandlerHook.hook(MockV6dSwapHandler)
-
-        # Verify swap method exists and doesn't use torch.cuda
-        assert hasattr(MockV6dSwapHandler, "swap")
-        assert hasattr(MockV6dSwapHandler, "async_swap")
-
-    def test_hook_get_finished_returns_all_immediately(self):
-        from collections import deque
-        from sglang_simulator.simulation.vllm.v6d.v6d_swap import (
-            C_V6dSwapHandlerHook, DummyEvent,
-        )
-
-        class MockV6dSwapHandler:
-            def __init__(self):
-                pass
-
-            def _validate_swap(self, *args):
-                return True
-
-            def _process_swap_batch(self, *args, **kwargs):
-                return []
-
-        C_V6dSwapHandlerHook.hook(MockV6dSwapHandler)
-
-        handler = MockV6dSwapHandler.__new__(MockV6dSwapHandler)
-        handler._event_jobs = deque()
-        handler._job_objs = {}
-
-        # Simulate some pending events
-        handler._event_jobs.append((DummyEvent(), 1))
-        handler._event_jobs.append((DummyEvent(), 2))
-        handler._event_jobs.append((DummyEvent(), 3))
-        handler._job_objs = {1: [], 2: [], 3: []}
-
-        # All should finish immediately (DummyEvent.query() is True)
-        finished = handler.get_finished()
-        assert finished == [1, 2, 3]
-        assert len(handler._event_jobs) == 0
-
-
-# ============================================================
 # Test 7: V6dObjectConnectorWorker hook mechanics
 # ============================================================
 
@@ -493,7 +259,7 @@ class TestV6dObjectBackendHook:
         from sglang_simulator.simulation.vllm.v6d.v6d_backend import (
             C_V6dObjectBackendHook,
         )
-        from sglang_simulator.simulation.vllm.v6d.v6d_swap import DummyEvent
+        from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent
 
         class MockV6dObjectBackend:
             def __init__(self):

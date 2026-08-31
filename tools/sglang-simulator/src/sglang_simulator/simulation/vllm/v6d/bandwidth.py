@@ -1,9 +1,9 @@
 """Transfer-latency model for the simulated v6d data plane.
 
 The simulation keeps the v6d control plane real (lookup/create/seal go to the
-daemon) but replaces ``ops.v6d_swap_blocks`` with a no-op, so the DMA between
-the v6d mmap and GPU HBM costs nothing. That single omission is what this
-module restores.
+daemon) but the DMA between the v6d mmap and GPU HBM never runs (the worker's
+swap handlers are left None), so it costs nothing. That single omission is
+what this module restores.
 
 Where the latency is applied matters, and it follows the production code:
 
@@ -93,8 +93,6 @@ class BandwidthModel:
         self.page_size_bytes = 0
         self.num_layers = 0
         self.peer_topology = None
-        self._save_floor_ms = 0.0
-        self._save_per_blk_ms = 0.0
         self._seg1_floor_ms = 0.0
         self._seg1_per_blk_ms = 0.0
         if not profile:
@@ -104,9 +102,6 @@ class BandwidthModel:
         self.num_layers = int(layout.get("num_layers", 0))
         self.peer_topology = profile.get("peer_topology")
         cp = profile.get("control_plane", {})
-        _sc = cp.get("save_completion", {})
-        self._save_floor_ms = float(_sc.get("floor_ms", 0) or 0)
-        self._save_per_blk_ms = float(_sc.get("per_block_ms", 0) or 0)
         _s1 = cp.get("seg1_cross_node", {})
         self._seg1_floor_ms = float(_s1.get("floor_ms", 0) or 0)
         self._seg1_per_blk_ms = float(_s1.get("per_block_ms", 0) or 0)
@@ -182,17 +177,6 @@ class BandwidthModel:
         if floor_ms <= 0 and per_ms <= 0:
             return 0.0
         return (floor_ms + per_ms * max(0, nblocks)) / 1000.0
-
-    def save_completion_latency(self, nblocks: int) -> float:
-        """Seal/announce control-plane completion (NOT DMA).
-
-        Delays when a store's blocks become visible cross-instance.
-        Calibrated from real-run logs (~70 ms + ~6 ms/block, r=0.27).
-        env overrides profile."""
-        return self._cp_latency(
-            nblocks, "SGLANG_SIMULATOR_SAVE_CTRL_FLOOR_MS",
-            "SGLANG_SIMULATOR_SAVE_CTRL_PER_BLK_MS",
-            self._save_floor_ms, self._save_per_blk_ms)
 
     def seg1_latency(self, nblocks: int) -> float:
         """Cross-node fetch (peer v6d -> local v6d), the seg1 transfer.

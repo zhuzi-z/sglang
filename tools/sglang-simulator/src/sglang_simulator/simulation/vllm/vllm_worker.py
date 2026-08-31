@@ -34,7 +34,6 @@ from vllm.engine.arg_utils import EngineArgs  # noqa: E402
 # loaded by the hook installation sequence, and any future transitive
 # dependency can never precede hook installation.
 from sglang_simulator.simulation.vllm.scheduler import C_VLLMSchedulerHook  # noqa: E402
-from sglang_simulator.simulation.vllm.v6d.v6d_manager import set_active_worker_id  # noqa: E402
 
 logger = get_logger("sglang_simulator")
 
@@ -80,9 +79,6 @@ class VLLMWorker(BaseWorker):
             if current == ea_default:
                 setattr(engine_args, field_name, sim_default)
 
-        # Set active worker_id for V6D RPC bypass ownership tracking
-        set_active_worker_id(name)
-
         self._llm = LLM(
             **{
                 f.name: getattr(engine_args, f.name)
@@ -90,9 +86,6 @@ class VLLMWorker(BaseWorker):
             }
         )
         logger.info("[VLLMWorker] Initialized with model=%s", engine_args.model)
-
-        # Clear active worker_id after init completes
-        set_active_worker_id(None)
 
         # Detect API availability: newer vLLM has enqueue/wait_for_completion
         self._has_enqueue_api = hasattr(self._llm, "enqueue")
