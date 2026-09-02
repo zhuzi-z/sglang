@@ -71,6 +71,12 @@ class RequestStats:
     queue_end: float = -1
     created_time: float = -1
     gen_token_latencies: list[float] = field(default_factory=list)
+    # Raw token ids, mirroring the sglang hook's raw_request.jsonl export
+    # (origin_input_ids / output_ids). Enables joining a single instance's
+    # request.jsonl back to the original trace by content in multi-instance
+    # benchmarks. Empty on the sglang backend unless recorded there too.
+    input_ids: list[int] = field(default_factory=list)
+    output_ids: list[int] = field(default_factory=list)
 
     def is_complete(self) -> bool:
         return True
