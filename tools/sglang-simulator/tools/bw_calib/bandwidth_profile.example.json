@@ -1,5 +1,6 @@
 {
   "schema": 1,
+  "_note": "Illustration only, kept from the 2026-08 RTX6000 calibration. The collector now emits schema 3 (adds collector/diagnostics/warnings, renames the per-point p10_s/p90_s to min_s/max_s); see README.md section 5 for the current field layout. The simulator itself only reads segments.*.samples[].bytes/median_s plus control_plane, so both schemas are consumable.",
   "collected_at": "2026-08-10 18:18:40",
   "host": "ds-b5d2c54c-1.ds-b5d2c54c-1-24bfe771-a-ae32",
   "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",

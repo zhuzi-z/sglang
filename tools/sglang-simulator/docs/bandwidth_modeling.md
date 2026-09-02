@@ -17,21 +17,34 @@ CPU 仿真把 v6d 的真实数据面（GPU↔host DMA、跨节点 SRPC）替换�
 - `.../simulation/vllm/v6d/bandwidth.py` — 模型（读 profile、算时延）
 - `.../simulation/vllm/v6d/v6d_backend.py` — 应用 seg2/seg2'/save_completion/seg1（deadline 机制，非阻塞）
 - `.../simulation/vllm/scheduler.py` — 应用 cold_start
-- `tools/bw_calib/collect_bandwidth.py` — DMA 段采集器
-- `tools/bw_calib/bandwidth_profile.example.json` — 示例 profile
+- `tools/bw_calib/collect_bandwidth.py` — DMA 段采集器（双后端：v6d_kernel / torch）
+- `tools/bw_calib/README.md` — 采集器详细说明（后端探测、诊断轴、profile 字段布局）
+- `tools/bw_calib/bandwidth_profile.example.json` — 示例 profile（**schema 1 旧格式，仅示意**；当前产物为 schema 3，字段以 README §5 为准）
 
 ## 采集（换环境时）
 
-在目标 GPU 节点运行：
+在目标 GPU 节点运行（完整参数见 `tools/bw_calib/README.md`）：
 ```bash
 python tools/bw_calib/collect_bandwidth.py \
     --gpu 0 --page-size 2146304 --num-layers 12 \
-    --out bandwidth_profile.json
+    --blocks 1,2,4,8,16 --out bandwidth_profile.json
 ```
-- `--page-size` / `--num-layers`：模型相关（TP 分片后的单 rank page size、层数）。Qwen3.5-122B = 2146304 / 12。
-- 采集 seg2 load/store DMA + 并发模式（dual_dir 验全双工、dual_gpu 验 TP rank 争用）。
+- **双后端**：`--backend auto`（默认）优先用生产 kernel `ops.v6d_swap_blocks`（PAI 版 vLLM）；镜像里没有定制 kernel 时自动回退纯 torch（裸 `cudaMemcpyAsync`，**只能当上界**）。每次运行都打印探测表说明选了哪个、另一个为何不可用；显式 `--backend v6d_kernel` 但不可用时直接 `exit 2`，不会深到测量里才报错。
+- `--page-size` / `--num-layers`：模型相关（TP 分片后的单 rank page size、层数）。Qwen3.5-122B = 2146304 / 12；**沿用内置默认值时会打 `[note]` 提醒**，换模型/换 TP 必须显式传。
+- 采集 seg2 load/store DMA + 并发模式（dual_dir 验全双工、dual_gpu 验 TP rank 争用；这两项需 kernel 后端，torch 后端用 `--streams N` 代替）。
 - **seg1 不在此采集**：需要两个 peer + 可用的 SRPC/RDMA 数据面（`collect_remote.py`，真实硬件）。
 - save_completion 默认（70+6/blk）来自真实运行日志分析；可用 `--save-floor-ms/--save-per-blk-ms` 覆盖。
+
+### ⚠️ 生效带宽由 samples 末两点决定，不是 summary 字段
+
+`SegmentModel.from_samples()` 把 `samples` 按 `bytes` 排序后**用最大的两个点重算边际带宽**；`bandwidth_gib_per_s` / `fixed_overhead_s` 只是采集器的记录字段，**运行时不参与计算**（本环境 profile 记 60.88 GiB/s，实际生效 48.73）。因此：
+
+- 想改变生效带宽必须改 `samples` 数组，手改 summary 字段无效；
+- 曲线若「先升后降」（GB300 实测 32/64 block 降速区：末两点算出 111 GiB/s，平坦区实为 197，低估 43%），采集器会**告警并默认只把单调前缀写入 `segments.*.samples`**（`--no-trim` 可关闭），全量 sweep 始终保留在 `diagnostics.*`；
+- 每次运行都会打印真正生效的模型，直接看这行确认：
+  ```text
+  EFFECTIVE AT RUNTIME (from_samples(last two samples)): BW=48.73 GiB/s, floor=2.205 ms, t0=12.4 us
+  ```
 
 ## 配置（跑仿真时）
 
