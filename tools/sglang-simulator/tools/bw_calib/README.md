@@ -108,6 +108,10 @@ Key options:
   really full duplex; `dual_gpu` (two GPUs, same direction) answers whether TP
   ranks slow each other down. Both need the `v6d_kernel` backend; on `torch`
   use `--streams` instead.
+- With `--mode both` the collector ends with a verdict line per direction,
+  comparing the peak-to-tail drop of `loop` against `contig`: a drop that only
+  shows up in `loop` is a per-layer-loop artifact, a drop in both is more likely
+  a real link characteristic.
 
 ## 4. The tail of the sweep decides the runtime bandwidth
 
@@ -136,6 +140,11 @@ The collector therefore:
 
 - Editing `bandwidth_gib_per_s` by hand has no effect at simulation time; change
   the `samples` array instead.
+- Samples are sorted by size before trimming, mirroring the consumer, so
+  `--reverse` sweeps are handled correctly.
+- Each `diagnostics.<mode>_<direction>` entry also carries a `summary` with
+  peak / tail bandwidth and the drop in percent, so the curve shape stays
+  machine-readable.
 - If a curve peaks early and then drops, first check whether it is an artifact:
   run `--mode contig` and `--streams 4`. If `contig` does not drop but `loop`
   does, the drop comes from the per-layer loop, not from the link.

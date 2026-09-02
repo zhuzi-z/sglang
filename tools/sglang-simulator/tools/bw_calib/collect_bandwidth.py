@@ -393,7 +393,7 @@ def effective_runtime_model(rows, fallback_bw):
 
 
 def sweep(backend, args, direction, mode, streams, blocks, warnings):
-    """One (direction x mode) sweep. Returns (rows, t0, bw)."""
+    """One (direction x mode) sweep. Returns (rows, t0, bw, summary)."""
     swap_in = direction == "load"
     label = f"{mode}_{direction}" if mode else direction
     rows, pts = [], []
@@ -433,20 +433,24 @@ def sweep(backend, args, direction, mode, streams, blocks, warnings):
               f"{gib(nbytes) / med:>8.2f} {100.0 * (hi - lo) / med:>8.1f}")
     t0, bw = fit_affine(pts)
     peak = max(rows, key=lambda r: r["gib_per_s"])
-    drop = 100.0 * (1 - rows[-1]["gib_per_s"] / peak["gib_per_s"])
+    tail = max(rows, key=lambda r: r["bytes"])
+    drop = 100.0 * (1 - tail["gib_per_s"] / peak["gib_per_s"])
+    summary = {"peak_gib_per_s": peak["gib_per_s"], "peak_blocks": peak["blocks"],
+               "tail_gib_per_s": tail["gib_per_s"], "tail_blocks": tail["blocks"],
+               "drop_pct_peak_to_tail": drop}
     print(f"  affine fit: t0={t0 * 1e6:.1f} us, BW={gib(bw):.2f} GiB/s")
     print(f"  peak {peak['gib_per_s']:.2f} GiB/s @ {peak['blocks']} blk -> "
-          f"tail {rows[-1]['gib_per_s']:.2f} GiB/s @ {rows[-1]['blocks']} blk "
+          f"tail {tail['gib_per_s']:.2f} GiB/s @ {tail['blocks']} blk "
           f"(drop {drop:.1f}%)")
     if drop > TAIL_DROP_WARN_PCT:
         msg = (f"{label}: sweep tail is {drop:.1f}% below peak "
-               f"({rows[-1]['gib_per_s']:.1f} vs {peak['gib_per_s']:.1f} GiB/s). "
+               f"({tail['gib_per_s']:.1f} vs {peak['gib_per_s']:.1f} GiB/s). "
                f"The consumer fits the LAST TWO samples, so an untrimmed "
                f"profile under-reports bandwidth here.")
         print(f"  !! {msg}")
         warnings.append(msg)
     print()
-    return rows, t0, bw
+    return rows, t0, bw, summary
 
 
 # ---------------------------------------------------------------------------
@@ -573,22 +577,32 @@ def run(args):
     print(f"layout: {args.num_layers} layers x {args.page_size} B = {seg2} B/block "
           f"({gib(seg2) * 1024:.2f} MiB)")
     print(f"blocks: {blocks}  iters={args.iters} warmup={args.warmup}\n")
+    if args.page_size == DEF_PAGE_SIZE and args.num_layers == DEF_NUM_LAYERS:
+        print("  [note] using the built-in Qwen3.5-122B-A10B-FP8 @ tp=2 layout. "
+              "Pass --page-size/--num-layers\n         for any other model or TP "
+              "degree, otherwise the profile describes the wrong transfer "
+              "size.\n")
 
     # ---- the sweeps ----
     primary_mode = None if backend == "v6d_kernel" else (
         "loop" if "loop" in modes else modes[0])
     for mode in modes:
         for direction in ("load", "store"):
-            rows, t0, bw = sweep(backend, args, direction, mode, streams,
-                                 blocks, warnings)
+            rows, t0, bw, summary = sweep(backend, args, direction, mode,
+                                          streams, blocks, warnings)
             key = f"{mode}_{direction}" if mode else direction
             out["diagnostics"][key] = {"samples": rows,
                                        "affine_fixed_overhead_s": t0,
-                                       "affine_bandwidth_gib_per_s": gib(bw)}
+                                       "affine_bandwidth_gib_per_s": gib(bw),
+                                       "summary": summary}
             if mode == primary_mode:
-                kept = rows if args.no_trim else monotonic_prefix(rows)
-                if len(kept) < len(rows):
-                    dropped = [r["blocks"] for r in rows[len(kept):]]
+                # Mirror the consumer, which sorts samples by bytes before
+                # fitting -- otherwise a --reverse sweep would be trimmed to a
+                # single point and silently fall back to the summary fit.
+                ordered = sorted(rows, key=lambda r: r["bytes"])
+                kept = ordered if args.no_trim else monotonic_prefix(ordered)
+                if len(kept) < len(ordered):
+                    dropped = [r["blocks"] for r in ordered[len(kept):]]
                     msg = (f"local_{direction}: trimmed non-monotonic tail "
                            f"blocks={dropped} out of segments.samples "
                            f"(full sweep kept under diagnostics.{key})")
@@ -606,6 +620,25 @@ def run(args):
                       f"BW={eff['bandwidth_gib_per_s']:.2f} GiB/s, "
                       f"floor={eff['floor_s'] * 1e3:.3f} ms, "
                       f"t0={eff['fixed_overhead_s'] * 1e6:.1f} us\n")
+
+    # ---- loop vs contig verdict: is an early peak a real link limit? ----
+    if backend == "torch" and args.mode == "both":
+        for direction in ("load", "store"):
+            lp = out["diagnostics"].get(f"loop_{direction}", {}).get("summary")
+            cg = out["diagnostics"].get(f"contig_{direction}", {}).get("summary")
+            if not (lp and cg):
+                continue
+            ld, cd = lp["drop_pct_peak_to_tail"], cg["drop_pct_peak_to_tail"]
+            if max(ld, cd) <= TAIL_DROP_WARN_PCT:
+                verdict = "no significant drop in either pattern"
+            elif ld - cd > TAIL_DROP_WARN_PCT:
+                verdict = ("per-layer-loop artifact (contig stays flat) -- retry "
+                           "with --streams N")
+            else:
+                verdict = "both patterns drop -- likely a real link characteristic"
+            print(f"  [{direction}] loop drop={ld:.1f}%  contig drop={cd:.1f}%  "
+                  f"-> {verdict}")
+        print()
 
     # ---- concurrency (v6d_kernel only; torch uses --streams) ----
     if args.concurrency and backend == "v6d_kernel":
