@@ -1,0 +1,5 @@
+# sglang_simulator auto-start: executed by the site module at every Python
+# interpreter startup (lines beginning with "import" in a .pth file are
+# exec'd).  The bootstrap installs simulation hooks only when the
+# SGLANG_SIMULATOR_COLLECTOR_ENABLE environment variable is set to a truthy value.
+import sglang_simulator._pth_bootstrap

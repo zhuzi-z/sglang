@@ -34,6 +34,25 @@ SAMPLE_TOKENS_LATENCIES: list[float] = []
 
 
 
+class C_VLLMEngineArgsHook(BaseHook):
+    """Hook EngineArgs to default the profiler to nsys (cudaProfilerApi)."""
+
+    HOOK_CLASS_NAME = "EngineArgs"
+    HOOK_MODULE_NAME = "vllm.engine.arg_utils"
+
+    @classmethod
+    def hook(cls, target):
+        original_post_init = target.__post_init__
+
+        def wrapped_post_init(self):
+            original_post_init(self)
+            if self.profiler_config.profiler is None:
+                self.profiler_config.profiler = "cuda"
+
+        target.__post_init__ = wrapped_post_init
+
+
+
 class C_WorkerWrapperBaseHook(BaseHook):
 
     HOOK_CLASS_NAME = "WorkerWrapperBase"    
@@ -138,14 +157,31 @@ class C_WorkerHook(BaseHook):
 
             target.sample_tokens = wrapped_sample_tokens
 
+        original_profile = getattr(target, "profile", None)
+
         def override_profile(self, *args, **kwrags):
-            SGL_HOOK_REQ_INFO_DIR = os.getenv("SGL_HOOK_REQ_INFO_DIR", os.getcwd())
+            # Drive the real profiler first (cudaProfilerStart/Stop when
+            # profiler_config.profiler == "cuda") so `nsys profile
+            # -c cudaProfilerApi` captures the collection window, then
+            # export the collected data.
+            if original_profile is not None:
+                is_start = args[0] if args else kwrags.get("is_start", True)
+                try:
+                    original_profile(self, is_start)
+                except RuntimeError:
+                    # Profiling is not enabled: fall back to data export only.
+                    pass
+
+            SIM_COLLECT_INFO_DIR = os.path.join(
+                os.getenv("SIM_COLLECT_INFO_DIR", os.getcwd()),
+                str(os.getpid()),
+            )
 
             rank_suffix = f"rank{self.rank}"
 
             n_st = len(SAMPLE_TOKENS_LATENCIES)
             with open(
-                f"{SGL_HOOK_REQ_INFO_DIR}/{rank_suffix}.schedule_batch.jsonl",
+                f"{SIM_COLLECT_INFO_DIR}/{rank_suffix}.schedule_batch.jsonl",
                 "w",
             ) as f:
                 for i, batch_infos in enumerate(SCHEDULE_INFOS):
@@ -160,7 +196,7 @@ class C_WorkerHook(BaseHook):
                             batch_infos["full_step_latency"] = il + st_lat
                     f.write(json.dumps(batch_infos) + "\n")
 
-            print(f"Schedule batch data has been saved to {SGL_HOOK_REQ_INFO_DIR}/{rank_suffix}.schedule_batch.jsonl")
+            print(f"Schedule batch data has been saved to {SIM_COLLECT_INFO_DIR}/{rank_suffix}.schedule_batch.jsonl")
             SCHEDULE_INFOS.clear()
             SAMPLE_TOKENS_LATENCIES.clear()
 
@@ -179,24 +215,22 @@ class C_EngineCoreHook(BaseHook):
         original_profile = target.profile
 
         def wrapped_profile(self, is_start: bool = True):
-            if not is_start:
-                # stop_profile: export REQUEST_INFOS before delegating to
-                # the executor (which forwards profile to workers).
-                SGL_HOOK_REQ_INFO_DIR = os.getenv(
-                    "SGL_HOOK_REQ_INFO_DIR", os.getcwd()
-                )
 
-                with open(
-                    f"{SGL_HOOK_REQ_INFO_DIR}/rank0.requests.jsonl", "w"
-                ) as f:
-                    for req_infos in REQUEST_INFOS.values():
-                        f.write(json.dumps(asdict(req_infos)) + "\n")
+            SIM_COLLECT_INFO_DIR = os.getenv(
+                "SIM_COLLECT_INFO_DIR", os.getcwd()
+            )
 
-                print(
-                    f"Request data has been saved to "
-                    f"{SGL_HOOK_REQ_INFO_DIR}/rank0.requests.jsonl"
-                )
-                REQUEST_INFOS.clear()
+            with open(
+                f"{SIM_COLLECT_INFO_DIR}/rank0.requests.jsonl", "w"
+            ) as f:
+                for req_infos in REQUEST_INFOS.values():
+                    f.write(json.dumps(asdict(req_infos)) + "\n")
+
+            print(
+                f"Request data has been saved to "
+                f"{SIM_COLLECT_INFO_DIR}/rank0.requests.jsonl"
+            )
+            REQUEST_INFOS.clear()
 
             return original_profile(self, is_start)
 
