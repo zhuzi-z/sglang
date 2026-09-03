@@ -1,5 +1,6 @@
 from sglang_simulator.hook import install_class_hooks
 from worker_hook import (
+    C_VLLMEngineArgsHook,
     C_WorkerWrapperBaseHook,
     C_WorkerHook,
     C_SchedulerHook,
@@ -7,7 +8,13 @@ from worker_hook import (
 )
 
 install_class_hooks(
-    [C_WorkerWrapperBaseHook, C_WorkerHook, C_SchedulerHook, C_EngineCoreHook]
+    [
+        C_VLLMEngineArgsHook,
+        C_WorkerWrapperBaseHook,
+        C_WorkerHook,
+        C_SchedulerHook,
+        C_EngineCoreHook,
+    ]
 )
 
 # -*- coding: utf-8 -*-
