@@ -89,6 +89,12 @@ class C_VLLMSchedulerHook(BaseHook):
             st.last_event_time = last_event_time
             st.input_length = input_length
             st.output_length = 0
+            # Raw prompt token ids (mirrors sglang hook's raw_request export),
+            # enabling trace-level join back to the original dataset.
+            prompt_token_ids = getattr(request, "prompt_token_ids", None)
+            st.input_ids = (
+                list(prompt_token_ids) if prompt_token_ids is not None else []
+            )
             return st
 
         def wrapped_init(self, vllm_config, *args, **kwargs):
@@ -211,6 +217,21 @@ class C_VLLMSchedulerHook(BaseHook):
                     StateManager.set_global_clock(next_time + 1e-6)
                     _dispatch_eligible(self)
 
+            # --- Capture output_ids BEFORE original_schedule() ---
+            # schedule() removes finished requests from self.requests, so a
+            # post-schedule lookup returns None. output_token_ids at this
+            # point reflects all tokens generated up to the previous step
+            # (update_from_output runs between consecutive schedule() calls),
+            # which is the complete output for requests finishing this step.
+            for req_id, request in self.requests.items():
+                st = request_stats_manager.stats.get(req_id)
+                if st is None:
+                    continue
+                output_token_ids = getattr(request, "output_token_ids", None)
+                if output_token_ids:
+                    st.output_ids = list(output_token_ids)
+
+            # --- Call original schedule ---
             scheduler_output = original_schedule(self)
 
             # Real-time per-request hit-rate log at inference end: vLLM reports
@@ -401,15 +422,17 @@ class C_VLLMExecutorHook(BaseHook):
             # Deliberately not folded into predicted_latency so that the
             # iter_latency semantics of the trained label stay intact and
             # both components remain separately auditable in
-            # iteration.jsonl. Driven by this step's scheduled token count,
-            # mirroring the GPU-side ``total_tokens`` field.
+            # iteration.jsonl. Driven by the same ScheduleBatch the iter
+            # predictor sees: the mechanistic model consumes sum_extend
+            # and sum(ext_i * past_i) from the per-request aggregation,
+            # matching the GPU-side calibration features exactly.
             total_tokens = sum(num_scheduled_tokens.values())
             sample_tokens_latency = 0.0
             if predictor is not None and hasattr(
                 predictor, "predict_sample_tokens_time"
             ):
                 sample_tokens_latency = float(
-                    predictor.predict_sample_tokens_time(total_tokens)
+                    predictor.predict_sample_tokens_time(simulation_batch)
                 )
 
             # Full GPU span actually occupied by this step, matching the
