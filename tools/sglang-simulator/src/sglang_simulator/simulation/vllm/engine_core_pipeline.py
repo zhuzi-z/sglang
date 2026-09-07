@@ -40,6 +40,11 @@ logger = get_logger()
 # None means no override (use original sampling_params.max_tokens)
 _MAX_DECODE_STEPS = int(v) if (v := os.environ.get("SGLANG_SIMULATOR_MAX_DECODE_STEPS")) is not None else None
 
+# Record raw input_ids/output_ids on RequestStats
+# (VLLM_SIMULATOR_RECORD_RAW_REQUEST, off by default). Read once here so
+# the schedule hot path pays no env lookup.
+_RECORD_RAW_REQUEST = Envs.record_raw_request()
+
 
 class C_VLLMSchedulerHook(BaseHook):
     """Hook the vLLM Scheduler for created_time-based request dispatch
@@ -91,10 +96,11 @@ class C_VLLMSchedulerHook(BaseHook):
             st.output_length = 0
             # Raw prompt token ids (mirrors sglang hook's raw_request export),
             # enabling trace-level join back to the original dataset.
-            prompt_token_ids = getattr(request, "prompt_token_ids", None)
-            st.input_ids = (
-                list(prompt_token_ids) if prompt_token_ids is not None else []
-            )
+            if _RECORD_RAW_REQUEST:
+                prompt_token_ids = getattr(request, "prompt_token_ids", None)
+                st.input_ids = (
+                    list(prompt_token_ids) if prompt_token_ids is not None else []
+                )
             return st
 
         def wrapped_init(self, vllm_config, *args, **kwargs):
@@ -223,13 +229,14 @@ class C_VLLMSchedulerHook(BaseHook):
             # point reflects all tokens generated up to the previous step
             # (update_from_output runs between consecutive schedule() calls),
             # which is the complete output for requests finishing this step.
-            for req_id, request in self.requests.items():
-                st = request_stats_manager.stats.get(req_id)
-                if st is None:
-                    continue
-                output_token_ids = getattr(request, "output_token_ids", None)
-                if output_token_ids:
-                    st.output_ids = list(output_token_ids)
+            if _RECORD_RAW_REQUEST:
+                for req_id, request in self.requests.items():
+                    st = request_stats_manager.stats.get(req_id)
+                    if st is None:
+                        continue
+                    output_token_ids = getattr(request, "output_token_ids", None)
+                    if output_token_ids:
+                        st.output_ids = list(output_token_ids)
 
             # --- Call original schedule ---
             scheduler_output = original_schedule(self)

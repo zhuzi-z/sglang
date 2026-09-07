@@ -33,9 +33,17 @@ class C_VLLMProfileHook(BaseHook):
 
             req_stats = request_stats_manager.get_all_req_stats()
             output_dir = Envs.output_dir()
+            record_raw_request = Envs.record_raw_request()
             with open(os.path.join(output_dir, "request.jsonl"), "w") as f:
                 for item in req_stats:
-                    f.write(json.dumps(asdict(item), default=str) + "\n")
+                    data = asdict(item)
+                    # Raw token ids are only part of the schema when the
+                    # recording switch is on; otherwise strip the keys so
+                    # the line schema matches the pre-feature request.jsonl.
+                    if not record_raw_request:
+                        data.pop("input_ids", None)
+                        data.pop("output_ids", None)
+                    f.write(json.dumps(data, default=str) + "\n")
             with open(os.path.join(output_dir, "iteration.jsonl"), "w") as f:
                 for item in C_VLLMSchedulerHook.ITERATION_STATS:
                     f.write(json.dumps(item, default=str) + "\n")
