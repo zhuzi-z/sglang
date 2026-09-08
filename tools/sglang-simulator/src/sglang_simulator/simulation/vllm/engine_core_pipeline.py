@@ -120,16 +120,25 @@ class C_VLLMSchedulerHook(BaseHook):
             # Per-instance tracking to avoid cross-worker contamination
             self._sim_req_created_time = {}
 
-            # Native HybridConnector's HybridScheduler asserts a live
-            # engine_proxy._g_sched_loop at construction time.  The async
-            # engine entrypoints (AsyncLLM / api_server) install that loop
-            # during startup, but the OFFLINE runner drives a synchronous
-            # LLM() engine where nothing ever registers it, so a
-            # HybridConnector deployment crashes in Scheduler.__init__
-            # (get_hybrid_sched_loop assertion).  Install a CPU fallback
-            # loop mirroring the worker-side _ensure_cpu_worker_loop in
-            # worker.py; the None-guard keeps it a no-op on paths where the
-            # async engine already set the loop.
+            # Native HybridConnector's HybridScheduler asserts BOTH a live
+            # engine_proxy._g_sched_loop (get_hybrid_sched_loop) and a live
+            # _g_sched_rpc_serv (sched_rpc_server, created by _start_rpc_server
+            # -> RpcServer(port, "schedrpcserver").start(loop)) at
+            # construction time.  The async engine entrypoints (AsyncLLM /
+            # api_server) install both via engine_proxy.core_init during
+            # startup, but the OFFLINE runner drives a synchronous LLM()
+            # engine where core_init is never called (it needs an
+            # EngineCoreProc handle we do not have), so a HybridConnector
+            # deployment crashes in Scheduler.__init__.  Bootstrap the same
+            # two globals here, mirroring core_init's construction sequence
+            # (start_asyncio_thread("hybridsched") + RpcServer(port,
+            # "schedrpcserver").start(loop), port from sched_rpc_server_port)
+            # and the worker-side _ensure_cpu_worker_loop pattern in
+            # worker.py; the None-guards keep it a no-op on paths where the
+            # async engine already installed them.  _g_core is deliberately
+            # left None: wakeup_core() is only reachable from worker-side
+            # RPC traffic, which the CPU hijacks replace with in-process
+            # direct calls (mark_backend_save_done et al).
             try:
                 import vllm.v1.hybrid_connector.engine_proxy as _engine_proxy
                 if getattr(_engine_proxy, "_g_sched_loop", None) is None:
@@ -147,6 +156,18 @@ class C_VLLMSchedulerHook(BaseHook):
                     _engine_proxy._g_sched_loop = _sched_loop
                     logger.info(
                         "[vLLM Hijack] installed CPU hybrid sched loop"
+                    )
+                if getattr(_engine_proxy, "_g_sched_rpc_serv", None) is None:
+                    _port = _engine_proxy.sched_rpc_server_port(vllm_config)
+                    _engine_proxy._g_sched_rpc_serv = _engine_proxy.RpcServer(
+                        _port, "schedrpcserver"
+                    )
+                    _engine_proxy._g_sched_rpc_serv.start(
+                        _engine_proxy._g_sched_loop
+                    )
+                    logger.info(
+                        "[vLLM Hijack] started CPU hybrid sched rpc server "
+                        "on port %s", _port
                     )
             except (ImportError, AttributeError):
                 # No hybrid_connector module in this vLLM build: nothing to
