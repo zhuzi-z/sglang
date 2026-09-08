@@ -19,7 +19,7 @@ class RequestInfos:
     queue_end: float = 0.0
     output_length: int = 0
     input_length: int = 0
-    final_device_hit_len: int = 0
+    total_kv_hit_len: int = 0
     local_kv_hit_len: int = 0
     ext_kv_hit_len: int = 0
     input_ids: list[int] = field(default_factory=list)
@@ -204,10 +204,6 @@ class C_WorkerHook(BaseHook):
                     if i < n_st:
                         st_lat = SAMPLE_TOKENS_LATENCIES[i]
                         batch_infos["sample_tokens_latency"] = st_lat
-                        il = batch_infos.get("iter_latency")
-                        if il is not None:
-                            # X1 label: full GPU span = RPC-1 + RPC-2
-                            batch_infos["full_step_latency"] = il + st_lat
                     f.write(json.dumps(batch_infos) + "\n")
 
             print(f"Schedule batch data has been saved to {output_dir}/{rank_suffix}.schedule_batch.jsonl")
@@ -286,7 +282,7 @@ class C_SchedulerHook(BaseHook):
                         req_info.input_length = request.num_prompt_tokens
                         req_info.output_length = request.max_tokens
 
-                        req_info.final_device_hit_len = (
+                        req_info.total_kv_hit_len = (
                             request.num_cached_tokens
                         )
                         req_info.ext_kv_hit_len = (

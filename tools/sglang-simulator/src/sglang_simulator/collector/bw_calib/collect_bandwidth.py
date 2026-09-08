@@ -744,7 +744,10 @@ def run(args):
     return out
 
 
-def main():
+def main(argv=None):
+    # argv is injectable so in-process callers (e.g. the dashserving
+    # entrypoint hook) never inherit the host process's sys.argv; None keeps
+    # the standalone CLI behavior of parsing sys.argv[1:].
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--backend", choices=["auto", "v6d_kernel", "torch"],
@@ -796,7 +799,7 @@ def main():
                         "and records it as save_completion_measured for gap "
                         "analysis (does NOT overwrite the log-derived value)")
     p.add_argument("--out", default="bandwidth_profile.json")
-    run(p.parse_args())
+    run(p.parse_args(argv))
 
 
 if __name__ == "__main__":
