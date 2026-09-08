@@ -14,8 +14,10 @@ Both hooks share the predictor / iteration-stats / sim-mode state carried
 on C_VLLMSchedulerHook, which is why they live in one module.
 """
 
+import asyncio
 import heapq
 import os
+import threading
 import time
 from collections import deque
 
@@ -117,6 +119,39 @@ class C_VLLMSchedulerHook(BaseHook):
             req_created_time.clear()
             # Per-instance tracking to avoid cross-worker contamination
             self._sim_req_created_time = {}
+
+            # Native HybridConnector's HybridScheduler asserts a live
+            # engine_proxy._g_sched_loop at construction time.  The async
+            # engine entrypoints (AsyncLLM / api_server) install that loop
+            # during startup, but the OFFLINE runner drives a synchronous
+            # LLM() engine where nothing ever registers it, so a
+            # HybridConnector deployment crashes in Scheduler.__init__
+            # (get_hybrid_sched_loop assertion).  Install a CPU fallback
+            # loop mirroring the worker-side _ensure_cpu_worker_loop in
+            # worker.py; the None-guard keeps it a no-op on paths where the
+            # async engine already set the loop.
+            try:
+                import vllm.v1.hybrid_connector.engine_proxy as _engine_proxy
+                if getattr(_engine_proxy, "_g_sched_loop", None) is None:
+                    _sched_loop = asyncio.new_event_loop()
+
+                    def _run_sched_loop():
+                        asyncio.set_event_loop(_sched_loop)
+                        _sched_loop.run_forever()
+
+                    threading.Thread(
+                        target=_run_sched_loop,
+                        name="hybridsched-cpu-loop",
+                        daemon=True,
+                    ).start()
+                    _engine_proxy._g_sched_loop = _sched_loop
+                    logger.info(
+                        "[vLLM Hijack] installed CPU hybrid sched loop"
+                    )
+            except (ImportError, AttributeError):
+                # No hybrid_connector module in this vLLM build: nothing to
+                # bootstrap, keep behaviour unchanged.
+                pass
 
             original_init(self, vllm_config, *args, **kwargs)
 
