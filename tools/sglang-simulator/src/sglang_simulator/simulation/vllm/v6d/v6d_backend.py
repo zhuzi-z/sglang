@@ -312,6 +312,15 @@ class C_V6dObjectBackendHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
+        # CPU sim has no real swap DMA to protect, and no store step ever
+        # fires, so the 30s abort fallback is the only drain for aborted
+        # saves (e.g. preempted huge prompts) — every abort would otherwise
+        # park the replay for 30s.  Drain promptly instead.
+        module = sys.modules.get(target.__module__)
+        if module is not None and hasattr(module, "_BYPASS_ABORT_FALLBACK_DELAY_S"):
+            module._BYPASS_ABORT_FALLBACK_DELAY_S = 1.0
+            logger.info("[V6D Hijack] bypass abort fallback delay set to 1.0s")
+
         original_init = target.__init__
 
         def override_init(self, *args, **kwargs):
