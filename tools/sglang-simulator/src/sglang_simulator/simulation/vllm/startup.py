@@ -108,7 +108,6 @@ def init_hook():
         engine_core_pipeline,
         kv_offload,
         platform,
-        profile_hook,
         worker,
     )
 
@@ -131,14 +130,15 @@ def init_hook():
         engine_args.C_VLLMEngineArgsHook,
         # Worker hook (handles everything — no model_runner hooks needed)
         worker.C_VLLMWorkerHook,
-        # Engine-core pipeline hooks: scheduler (created_time dispatch,
-        # queue/hit stats) + executor (simulated GPU span at
-        # model_executor.execute_model, the engine's real execution seam)
+        # Engine-core pipeline hooks: EngineCore (created_time dispatch +
+        # profile stats export), scheduler (queue/hit stats) + executor
+        # (simulated GPU span at model_executor.execute_model, the engine's
+        # real execution seam)
+        engine_core_pipeline.C_VLLMEngineCoreHook,
+        # Scheduler hook: unfinished-count accessors only (no EngineCore-
+        # level seam exists for the busy loop's has_unfinished check)
         engine_core_pipeline.C_VLLMSchedulerHook,
         engine_core_pipeline.C_VLLMExecutorHook,
-        # Profile hook — exports request / iteration stats on
-        # /start_profile & /stop_profile (EngineCore.profile)
-        profile_hook.C_VLLMProfileHook,
         # Native SimpleCPUOffloadWorker hook (bypasses CUDA for native offload)
         kv_offload.C_VLLMSimpleCPUOffloadWorkerHook,
         # Native OffloadingConnectorWorker hook (default native path)
