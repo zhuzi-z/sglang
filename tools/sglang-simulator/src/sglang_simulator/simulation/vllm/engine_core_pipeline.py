@@ -17,6 +17,7 @@ on C_VLLMSchedulerHook, which is why they live in one module.
 import asyncio
 import heapq
 import os
+import queue
 import threading
 import time
 from collections import deque
@@ -135,10 +136,12 @@ class C_VLLMSchedulerHook(BaseHook):
             # "schedrpcserver").start(loop), port from sched_rpc_server_port)
             # and the worker-side _ensure_cpu_worker_loop pattern in
             # worker.py; the None-guards keep it a no-op on paths where the
-            # async engine already installed them.  _g_core is deliberately
-            # left None: wakeup_core() is only reachable from worker-side
-            # RPC traffic, which the CPU hijacks replace with in-process
-            # direct calls (mark_backend_save_done et al).
+            # async engine already installed them.  _g_core is NOT handled
+            # here: it is bootstrapped by C_VLLMEngineCoreHook through the
+            # real engine_proxy.core_init (which needs the EngineCore
+            # instance, not the Scheduler) — _sched() dereferences
+            # _g_core.scheduler at every kvconn.step(), so leaving it None
+            # crashes at runtime (assert _g_core is not None).
             try:
                 import vllm.v1.hybrid_connector.engine_proxy as _engine_proxy
                 if getattr(_engine_proxy, "_g_sched_loop", None) is None:
@@ -358,6 +361,66 @@ class C_VLLMSchedulerHook(BaseHook):
         target.add_request = wrapped_add_request
         target.schedule = wrapped_schedule
         target.get_num_unfinished_requests = wrapped_get_num_unfinished
+
+
+class C_VLLMEngineCoreHook(BaseHook):
+    """Hook the vLLM EngineCore __init__ to bootstrap the hybrid
+    engine-proxy globals for the in-process engine path (OFFLINE).
+
+    Production installs engine_proxy._g_core / _g_sched_loop /
+    _g_sched_rpc_serv in EngineCoreProc.__init__ (vllm core.py's
+    ``_core_init(self, vllm_config)`` runs before ``super().__init__`` so
+    the globals exist before HybridScheduler is constructed).  The
+    synchronous OFFLINE runner (simulate.py -> VLLMWorker -> LLM()) builds
+    the plain in-process EngineCore via InprocClient instead, so
+    ``_core_init`` never runs and HybridConnector crashes — first at
+    HybridScheduler construction (get_hybrid_sched_loop), and once the
+    loop/serv are bootstrapped, at the first ``kvconn.step()``
+    (``sched_allocate_slots`` -> ``_sched()``'s
+    ``assert _g_core is not None``).
+
+    Mirror EngineCoreProc's sequence here: create ``input_queue`` if the
+    instance does not have one yet (consumed by wakeup_core's fake-abort
+    nudge; the sync OFFLINE loop drives steps from the same thread, so a
+    plain undrained Queue is sufficient), then call the REAL
+    ``engine_proxy.core_init(self, vllm_config)``.  The ``_g_core is None``
+    guard keeps the EngineCoreProc path (async engine / BLOCKING), which
+    already ran ``_core_init``, untouched.
+    """
+
+    HOOK_CLASS_NAME = "EngineCore"
+    HOOK_MODULE_NAME = "vllm.v1.engine.core"
+
+    @classmethod
+    def hook(cls, target):
+        original_init = target.__init__
+
+        def wrapped_init(self, *args, **kwargs):
+            vllm_config = args[0] if args else kwargs.get("vllm_config")
+            if vllm_config is not None and getattr(
+                vllm_config, "kv_transfer_config", None
+            ) is not None:
+                try:
+                    import vllm.v1.hybrid_connector.engine_proxy as _engine_proxy
+                    if getattr(_engine_proxy, "_g_core", None) is None:
+                        # EngineCoreProc creates input_queue before
+                        # super().__init__ (core.py: queue.Queue at the top
+                        # of EngineCoreProc.__init__).
+                        if not hasattr(self, "input_queue"):
+                            self.input_queue = queue.Queue()
+                        # Mirror core.py _core_init(self, vllm_config).
+                        _engine_proxy.core_init(self, vllm_config)
+                        logger.info(
+                            "[vLLM Hijack] engine_proxy.core_init done for "
+                            "in-process EngineCore (OFFLINE path)"
+                        )
+                except (ImportError, AttributeError):
+                    # No hybrid_connector module in this vLLM build: nothing
+                    # to bootstrap, keep behaviour unchanged.
+                    pass
+            original_init(self, *args, **kwargs)
+
+        target.__init__ = wrapped_init
 
 
 class C_VLLMExecutorHook(BaseHook):
