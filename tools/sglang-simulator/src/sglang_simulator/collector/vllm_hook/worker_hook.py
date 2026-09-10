@@ -1,15 +1,29 @@
+import gzip
+import json
 import os
+import threading
 import time
 import torch
-import json
 from typing import Optional
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
+from array import array
 
 from sglang_simulator.hook import BaseHook
+from sglang_simulator.utils.json import CustomJsonEncoder
+
+# Single knob for export shaping, comma-separated flags
+# (SIM_COLLECTOR_EXPORT):
+#   content: "ids" (default) keeps input_ids/output_ids, "no_ids" drops them
+#   format:  "gzip" (default) writes .jsonl.gz, "plain" writes plain .jsonl
+_EXPORT_FLAGS = frozenset(
+    os.getenv("SIM_COLLECTOR_EXPORT", "ids,gzip").lower().split(",")
+)
+EXPORT_TOKEN_IDS = "no_ids" not in _EXPORT_FLAGS
+EXPORT_GZIP = "plain" not in _EXPORT_FLAGS
 
 
-@dataclass
+@dataclass(slots=True)
 class RequestInfos:
     rid: str = ""
     created_time: Optional[float] = None
@@ -22,15 +36,58 @@ class RequestInfos:
     total_kv_hit_len: int = 0
     local_kv_hit_len: int = 0
     ext_kv_hit_len: int = 0
-    input_ids: list[int] = field(default_factory=list)
-    output_ids: list[int] = field(default_factory=list)
+    input_ids: array = field(default_factory=lambda: array("i"))
+    output_ids: array = field(default_factory=lambda: array("i"))
 
 
-SCHEDULE_INFOS: list[dict] = []
+@dataclass(slots=True)
+class BatchInfos:
+    start_timestamp: float = 0.0
+    end_timestamp: float = 0.0
+    forward_mode: int = 0
+    # List of tuples (req_id, extend_input_len, past_kv_len, output_len)
+    requests: list[tuple[str, int, int, int]] = field(default_factory=list)
+    iter_latency: float = 0.0
+    sample_tokens_latency: float = 0.0
+    logprobs_req_count: int = 0
+    logprobs_tokens: int = 0
+    logprobs_n: int = 0
+
+
+BATCH_INFOS: list[BatchInfos] = []
+BATCH_SAMPLE_TOKENS_LATENCIES: list[float] = []
+
 REQUEST_INFOS: dict[str, RequestInfos] = defaultdict(RequestInfos)
-# RPC-2 (sample_tokens) window timings; aligns 1:1 with SCHEDULE_INFOS
-# strictly by call order.
-SAMPLE_TOKENS_LATENCIES: list[float] = []
+
+
+def _round6(value: Optional[float]) -> Optional[float]:
+    """Round to 6 decimals to shrink the exported payload (None-safe)."""
+    return round(value, 6) if value is not None else None
+
+
+def _open_export(path: str):
+    """Open a JSONL export file; gzip-compressed (level 1) when EXPORT_GZIP."""
+    if EXPORT_GZIP:
+        return gzip.open(path, "wt", compresslevel=1)
+    return open(path, "w")
+
+
+_LAST_EXPORT_THREAD: Optional[threading.Thread] = None
+
+
+def _run_export(export_fn, is_start: bool) -> None:
+    """Export on a side thread for start_profile (the engine keeps
+    serving), blocking for stop_profile (data flushed before moving on)."""
+    global _LAST_EXPORT_THREAD
+    # Exports of one process write the same file: wait out the previous one.
+    if _LAST_EXPORT_THREAD is not None:
+        _LAST_EXPORT_THREAD.join()
+        _LAST_EXPORT_THREAD = None
+    if is_start:
+        _LAST_EXPORT_THREAD = threading.Thread(target=export_fn, daemon=True)
+        _LAST_EXPORT_THREAD.start()
+    else:
+        export_fn()
 
 
 def get_output_dir() -> str:
@@ -43,7 +100,6 @@ def get_output_dir() -> str:
     output_dir = os.path.join(base, sub_dir)
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
-
 
 
 class C_VLLMEngineArgsHook(BaseHook):
@@ -69,7 +125,6 @@ class C_VLLMEngineArgsHook(BaseHook):
         target.__post_init__ = wrapped_post_init
 
 
-
 class C_WorkerWrapperBaseHook(BaseHook):
 
     HOOK_CLASS_NAME = "WorkerWrapperBase"    
@@ -82,21 +137,21 @@ class C_WorkerWrapperBaseHook(BaseHook):
 
         def wrapped_execute_model(self, scheduler_output: "SchedulerOutput"):
 
-            request_infos = {}
+            batch_req_infos = {}
             for req_id, sched_token in scheduler_output.num_scheduled_tokens.items():
-                request_infos[req_id] = {"extend_input_len": sched_token}
+                batch_req_infos[req_id] = {"extend_input_len": sched_token}
             
             for req_id, completed_token, output_token in zip(
                 scheduler_output.scheduled_cached_reqs.req_ids, 
                 scheduler_output.scheduled_cached_reqs.num_computed_tokens,
                 scheduler_output.scheduled_cached_reqs.num_output_tokens
             ):
-                request_infos[req_id]["prefix_indices_len"] = completed_token - output_token
-                request_infos[req_id]["output_ids_len"] = output_token
+                batch_req_infos[req_id]["past_kv_len"] = completed_token
+                batch_req_infos[req_id]["output_len"] = output_token
             
             for req in scheduler_output.scheduled_new_reqs:
-                request_infos[req.req_id]["prefix_indices_len"] = req.num_computed_tokens
-                request_infos[req.req_id]["output_ids_len"] = 0
+                batch_req_infos[req.req_id]["past_kv_len"] = req.num_computed_tokens
+                batch_req_infos[req.req_id]["output_len"] = 0
 
             forward_mode = 2 if all([num_token == 1 for num_token in scheduler_output.num_scheduled_tokens.values()]) else 1
 
@@ -123,22 +178,27 @@ class C_WorkerWrapperBaseHook(BaseHook):
             torch.cuda.synchronize()
             end = time.time()
 
-            if len(request_infos):
-                for rid, req_info in request_infos.items():
-                    req_info["rid"] = rid
-
-                SCHEDULE_INFOS.append(
-                    {
-                        "start_timestamp": start,
-                        "end_timestamp": end,
-                        "forward_mode": forward_mode,
-                        "request_infos": list(request_infos.values()),
-                        "iter_latency": end - start,
-                        "total_tokens": scheduler_output.total_num_scheduled_tokens,
-                        "logprobs_req_count": logprobs_req_count,
-                        "logprobs_tokens": logprobs_tokens,
-                        "logprobs_n": logprobs_n,
-                    }
+            if len(batch_req_infos):
+                BATCH_INFOS.append(
+                    BatchInfos(
+                        start_timestamp=_round6(start),
+                        end_timestamp=_round6(end),
+                        forward_mode=forward_mode,
+                        # Keep only the last 12 chars of rid.
+                        requests=[
+                            (
+                                rid[-12:],
+                                req_info["extend_input_len"],
+                                req_info["past_kv_len"],
+                                req_info["output_len"],
+                            )
+                            for rid, req_info in batch_req_infos.items()
+                        ],
+                        iter_latency=_round6(end - start),
+                        logprobs_req_count=logprobs_req_count,
+                        logprobs_tokens=logprobs_tokens,
+                        logprobs_n=logprobs_n,
+                    )
                 )
 
             return ret
@@ -169,46 +229,44 @@ class C_WorkerHook(BaseHook):
                 start = time.time()
                 ret = original_sample_tokens(self, *args, **kwargs)
                 torch.cuda.synchronize()
-                SAMPLE_TOKENS_LATENCIES.append(time.time() - start)
+                BATCH_SAMPLE_TOKENS_LATENCIES.append(_round6(time.time() - start))
                 return ret
 
             target.sample_tokens = wrapped_sample_tokens
 
         original_profile = getattr(target, "profile", None)
 
-        def override_profile(self, *args, **kwrags):
-            # Drive the real profiler first (cudaProfilerStart/Stop when
-            # profiler_config.profiler == "cuda") so `nsys profile
-            # -c cudaProfilerApi` captures the collection window, then
-            # export the collected data.
-            if original_profile is not None:
-                is_start = args[0] if args else kwrags.get("is_start", True)
-                try:
-                    original_profile(self, is_start)
-                except RuntimeError:
-                    # Profiling is not enabled: fall back to data export only.
-                    pass
+        def override_profile(self, is_start: bool = True):
+            global BATCH_INFOS
 
             output_dir = get_output_dir()
-
             rank_suffix = f"rank{self.rank}"
 
-            n_st = len(SAMPLE_TOKENS_LATENCIES)
-            with open(
-                f"{output_dir}/{rank_suffix}.schedule_batch.jsonl",
-                "w",
-            ) as f:
-                for i, batch_infos in enumerate(SCHEDULE_INFOS):
-                    # New fields, backward compatible: under the old hook /
-                    # old vllm, i >= n_st and no extra field is written.
-                    if i < n_st:
-                        st_lat = SAMPLE_TOKENS_LATENCIES[i]
-                        batch_infos["sample_tokens_latency"] = st_lat
-                    f.write(json.dumps(batch_infos) + "\n")
+            n_st = len(BATCH_SAMPLE_TOKENS_LATENCIES)
+            for i, batch_info in enumerate(BATCH_INFOS):
+                # Backward compatible: under the old hook / old vllm,
+                # i >= n_st and sample_tokens_latency stays 0.0.
+                if i < n_st:
+                    batch_info.sample_tokens_latency = (
+                        BATCH_SAMPLE_TOKENS_LATENCIES[i]
+                    )
 
-            print(f"Schedule batch data has been saved to {output_dir}/{rank_suffix}.schedule_batch.jsonl")
-            SCHEDULE_INFOS.clear()
-            SAMPLE_TOKENS_LATENCIES.clear()
+            batch_infos = BATCH_INFOS
+            BATCH_INFOS = []
+            BATCH_SAMPLE_TOKENS_LATENCIES.clear()
+
+            def _export():
+                path = f"{output_dir}/{rank_suffix}.schedule_batch.jsonl"
+                if EXPORT_GZIP:
+                    path += ".gz"
+                with _open_export(path) as f:
+                    for batch_info in batch_infos:
+                        f.write(
+                            json.dumps(batch_info, cls=CustomJsonEncoder) + "\n"
+                        )
+                print(f"Schedule batch data has been saved to {path}")
+
+            _run_export(_export, is_start)
 
         target.profile = override_profile
 
@@ -225,21 +283,30 @@ class C_EngineCoreHook(BaseHook):
         original_profile = target.profile
 
         def wrapped_profile(self, is_start: bool = True):
+            global REQUEST_INFOS
 
             output_dir = get_output_dir()
 
-            with open(
-                f"{output_dir}/rank0.requests.jsonl", "w"
-            ) as f:
-                for req_infos in REQUEST_INFOS.values():
-                    f.write(json.dumps(asdict(req_infos)) + "\n")
+            request_infos = REQUEST_INFOS
+            REQUEST_INFOS = defaultdict(RequestInfos)
 
-            print(
-                f"Request data has been saved to "
-                f"{output_dir}/rank0.requests.jsonl"
-            )
-            REQUEST_INFOS.clear()
+            def _export():
+                path = f"{output_dir}/rank0.requests.jsonl"
+                if EXPORT_GZIP:
+                    path += ".gz"
+                with _open_export(path) as f:
+                    for req_infos in request_infos.values():
+                        row = asdict(req_infos)
+                        if not EXPORT_TOKEN_IDS:
+                            # Token ids dominate the payload; drop on request.
+                            del row["input_ids"]
+                            del row["output_ids"]
+                        f.write(json.dumps(row, cls=CustomJsonEncoder) + "\n")
+                print(f"Request data has been saved to {path}")
 
+            _run_export(_export, is_start)
+            
+            # Call the original profile method to trigger the lower-level worker
             return original_profile(self, is_start)
 
         target.profile = wrapped_profile
@@ -261,9 +328,9 @@ class C_SchedulerHook(BaseHook):
             recv_time = time.time()
             req_info = REQUEST_INFOS[request.request_id]
             req_info.rid = request.request_id
-            req_info.queue_start = recv_time
-            req_info.server_created_time = request.arrival_time
-            req_info.created_time = request.arrival_time
+            req_info.queue_start = _round6(recv_time)
+            req_info.server_created_time = _round6(request.arrival_time)
+            req_info.created_time = _round6(request.arrival_time)
             return original_add_request(self, request)
 
         def wrapped_schedule(self):
@@ -278,7 +345,7 @@ class C_SchedulerHook(BaseHook):
                         continue
                     req_info = REQUEST_INFOS[req_id]
                     if req_info.queue_end == 0:
-                        req_info.queue_end = prefill_timestamp
+                        req_info.queue_end = _round6(prefill_timestamp)
                         req_info.input_length = request.num_prompt_tokens
                         req_info.output_length = request.max_tokens
 
@@ -296,14 +363,16 @@ class C_SchedulerHook(BaseHook):
             return scheduler_output
 
         def wrapped_free_request(self, request):
-            if request.is_finished():
+            # Token ids dominate REQUEST_INFOS memory; skip collecting them
+            # entirely when they are not exported.
+            if EXPORT_TOKEN_IDS and request.is_finished():
                 req_info = REQUEST_INFOS[request.request_id]
                 req_info.input_ids = (
-                    list(request.prompt_token_ids)
+                    array("i", request.prompt_token_ids)
                     if request.prompt_token_ids is not None
-                    else []
+                    else array("i")
                 )
-                req_info.output_ids = list(request.output_token_ids)
+                req_info.output_ids = array("i", request.output_token_ids)
             return original_free_request(self, request)
 
         target.add_request = wrapped_add_request
