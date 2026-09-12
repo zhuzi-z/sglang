@@ -300,27 +300,26 @@ class C_VLLMEngineCoreHook(BaseHook):
 
         def wrapped_step(self, *args, **kwargs):
             """Dispatch due future-queue requests before each engine step."""
-            if cls_sim_mode() == SimulationMode.OFFLINE and dispatcher.all_received:
+            offline = cls_sim_mode() == SimulationMode.OFFLINE
+            if offline and dispatcher.all_received:
                 dispatcher.dispatch(self)
 
-                # Idle state: nothing runnable but future requests pending —
-                # jump the virtual clock to the next created_time.  Do NOT
-                # jump while the connector still holds dispatched-but-
-                # unadmitted requests (_waiting/_loading): admission runs on
-                # wall time, and free-running the clock here drifts
-                # queue_end/TTFT far past reality.
-                if (
-                    not self.scheduler.waiting
-                    and not self.scheduler.running
-                    and dispatcher.has_next()
-                    and not _connector_has_pending(self.scheduler)
-                ):
-                    StateManager.set_global_clock(
-                        dispatcher.next_req_created_time() + 1e-6
-                    )
-                    dispatcher.dispatch(self)
-
-            return original_step(self, *args, **kwargs)
+            result = original_step(self, *args, **kwargs)
+            if offline and not result[1]:
+                # The count hook includes parked arrivals; they are not active work.
+                is_req_pending = (
+                    self.scheduler.get_num_unfinished_requests() > len(dispatcher)
+                    or _connector_has_pending(self.scheduler)
+                )
+                if is_req_pending:
+                    # Match SGLang's idle tick. The connector observes the clock
+                    # on its next native step and owns all transfer readiness.
+                    StateManager.step_global_clock(0.005)
+                    StateManager.set_current_inference_dur(0.005)
+                elif dispatcher.all_received and dispatcher.has_next():
+                    StateManager.set_global_clock(max(
+                        StateManager.get_global_clock(), dispatcher.next_req_created_time()))
+            return result
 
         target.__init__ = wrapped_init
         target.add_request = wrapped_add_request
@@ -365,11 +364,12 @@ def cls_sim_mode() -> SimulationMode:
 
 
 def _connector_has_pending(scheduler) -> bool:
-    """True if the KV connector holds dispatched requests not yet visible
-    to the scheduler (HybridConnector _waiting / _loading)."""
+    """Check native work interfaces, including loads and trailing stores."""
     get_conn = getattr(scheduler, "get_kv_connector", None)
     connector = get_conn() if get_conn is not None else None
-    return bool(getattr(connector, "pending_requests", None))
+    if connector is None:
+        return False
+    return bool(connector.has_requests() or getattr(connector, "pending_requests", None))
 
 
 class C_VLLMExecutorHook(BaseHook):

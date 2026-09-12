@@ -18,6 +18,7 @@ def register_v6d_hooks(hooks: list) -> None:
     from sglang_simulator.simulation.vllm.v6d.v6d_backend import (
         C_HybridBackendHook,
         C_HybridConnectorHook,
+        C_HybridControlPlaneHook,
         C_V6dObjectBackendHook,
         C_KVTPBackendHook,
     )
@@ -38,6 +39,7 @@ def register_v6d_hooks(hooks: list) -> None:
     v6d_hooks = [
         C_HybridBackendHook,
         C_HybridConnectorHook,
+        C_HybridControlPlaneHook,
         C_V6dObjectConnectorWorkerHook,
         C_V6dObjectBackendHook,
         C_KVTPBackendHook,
