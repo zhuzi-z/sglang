@@ -8,13 +8,19 @@ arena + 2000 objects x 132MB declared -> 130MB RSS, 0.0s boot).  Capacity
 and eviction accounting are therefore the daemon's own — no virtual layer.
 
 The read path is the REAL ``TieredVineyardPeer._acquire_tiered_read``
-(reached via ``client.get`` from the connector), including the REAL remote
-SRPC meta probe (``transfer.get_metas_by_names`` works because the mmap is
-2M-aligned, so the SRPC server registers the bulkstore fine under
-``SRPC_STREAM_DISABLE_RDMA=1`` TCP mode).  Only the payload copies
-(``transfer.load_data`` / ``async_load_data``, eager strategies only) are
-no-ops, and a ``[V6D HitSource]`` line per read batch is logged (port of
-the production v6d_hitsource_patch; see tmp.out/bugfix/hit_stats.sh).
+(reached via ``client.get`` from the connector).  By default the remote
+SRPC meta probe (``transfer.get_metas_by_names``) is stubbed (fabricated
+locally from the daemon's own uniform page size), fully severing the P2P
+SRPC network path for environments where no remote peer is reachable — at
+the cost of trusting the tracker fully (a stale remote announcement is no
+longer rejected by the probe).  Set ``V6D_SIM_STUB_META_PROBE=0`` to restore
+the real probe (the mmap is 2M-aligned, so the SRPC server registers the
+bulkstore fine under ``SRPC_STREAM_DISABLE_RDMA=1`` TCP mode), so stale
+tracker entries are re-confirmed by the remote exactly as in production.
+The payload copies (``transfer.load_data`` / ``async_load_data``, eager
+strategies only) are always no-ops, and a ``[V6D HitSource]`` line per read
+batch is logged (port of the production v6d_hitsource_patch; see
+tmp.out/bugfix/hit_stats.sh).
 With ``V6D_KEYSOURCE_LOG=1`` (default) each read line also carries its
 object keys (`` keys=...`` suffix), and CREATE-scope acquires / eviction
 batches log ``[V6D CreateSource]`` / ``[V6D EvictSource]`` lines — the
@@ -66,6 +72,7 @@ os.environ.setdefault("SRPC_STREAM_DISABLE_RDMA", "1")
 
 _ENV_HITSOURCE_LOG = "V6D_HITSOURCE_LOG"
 _ENV_KEYSOURCE_LOG = "V6D_KEYSOURCE_LOG"
+_ENV_STUB_META_PROBE = "V6D_SIM_STUB_META_PROBE"
 
 _HITSOURCE_COUNTERS = ("local", "p2p", "sharedfs", "tair_kvcm")
 
@@ -83,6 +90,16 @@ def _keysource_enabled() -> bool:
     return os.environ.get(_ENV_KEYSOURCE_LOG, "1") not in ("0", "false", "False")
 
 
+def _stub_meta_probe_enabled() -> bool:
+    """Stub the remote SRPC meta probe (get_metas_by_names).
+
+    Default ON: the P2P SRPC network path is fully cut (metas are fabricated
+    locally from the learned uniform page size).  Set to 0/false to restore
+    the real probe so stale tracker entries get re-confirmed by the remote.
+    """
+    return os.environ.get(_ENV_STUB_META_PROBE, "1") not in ("0", "false", "False")
+
+
 def _fmt_keys(object_keys) -> str:
     """Comma-joined, None-filtered key list (empty string when nothing)."""
     keys = [k for k in (object_keys or ()) if k]
@@ -96,14 +113,21 @@ def _fmt_keys(object_keys) -> str:
 # A P2P read in the real daemon resolves to two SRPC calls into the remote
 # peer: ``transfer.get_metas_by_names`` (metadata probe, also used by
 # ``VineyardPeer.get_remote_object_sizes`` for the eviction check) and
-# ``transfer.load_data`` (the actual blob copy).  The meta probe runs for
-# real (SRPC is alive under the 2M-aligned sparse mmap), so stale tracker
-# entries are re-confirmed by the remote exactly as in production; only the
-# payload copies are stubbed:
+# ``transfer.load_data`` (the actual blob copy).
 #
-#   * ``load_data``/``async_load_data`` are no-ops.  They are only reached by
-#     eager fetch strategies; the default lazy strategy never calls them
-#     (data load is client-side, and the sim connector never loads).
+#   * ``load_data``/``async_load_data`` are ALWAYS no-ops.  They are only
+#     reached by eager fetch strategies; the default lazy strategy never
+#     calls them (data load is client-side, and the sim connector never
+#     loads).
+#   * ``get_metas_by_names`` is stubbed by default: ``_sim_get_metas_by_names``
+#     fabricates the meta locally — the declared size is the cluster-wide
+#     uniform page size learned from the daemon's own ``_object_info`` (any
+#     locally-tracked vineyard object's size), which keeps ``_check_and_evict``
+#     and the follow-up local ``create_blobs`` exactly as in production.  This
+#     runs P2P reads with zero remote SRPC traffic.  Set
+#     ``V6D_SIM_STUB_META_PROBE=0`` to restore the real probe (SRPC is alive
+#     under the 2M-aligned sparse mmap), so stale tracker entries are
+#     re-confirmed by the remote exactly as in production.
 
 
 def _sim_load_data_noop(*args, **kwargs):
@@ -114,6 +138,75 @@ def _sim_load_data_noop(*args, **kwargs):
 
 def _sim_async_load_data_noop(*args, **kwargs):
     return []
+
+
+# 0 -> page size not learned yet.  Set from the daemon's own object ledger
+# (``TieredVineyardPeer._object_info``); KV blocks share one cluster-wide
+# page size, so any vineyard-tier object's size is a faithful probe.
+_learned_page_size = 0
+
+
+def _learn_page_size_from_peer(peer) -> None:
+    """Cache a uniform page size from the daemon's local object tracker.
+
+    Called at the head of each read batch (which always precedes any remote
+    meta probe).  Cheap: returns immediately once learned, and otherwise
+    stops at the first vineyard-tier object with a positive size.
+    """
+    global _learned_page_size
+    if _learned_page_size > 0:
+        return
+    info = getattr(peer, "_object_info", None)
+    if not info:
+        return
+    for oi in info.values():
+        if getattr(oi, "tier", None) == "vineyard":
+            size = getattr(oi, "size", 0) or 0
+            if size > 0:
+                _learned_page_size = size
+                return
+
+
+def _sim_get_metas_by_names(names, endpoint, trace_id=""):
+    """Fabricate remote object metas in place of the real SRPC meta probe.
+
+    Severs the P2P SRPC network call entirely.  Before any local object
+    exists the uniform page size is unknown, so we fail like a real remote
+    miss (the tracker entry stays unconfirmed).  Unlike the real probe this
+    trusts the tracker fully: a stale remote announcement is not rejected.
+    """
+    size = _learned_page_size
+    if size <= 0:
+        # No local store yet: the uniform page size is unknown, so no
+        # faithful meta can be fabricated.  Fail like a real remote miss.
+        raise KeyError(
+            f"[v6d-sim] remote meta probe {endpoint}: page size unknown "
+            f"(no local store yet), {len(names)} keys treated as unfetchable"
+        )
+    from v6d.lite.common.type import ObjectID, ObjectMeta
+    blob_meta = {
+        "id": ObjectID.invalid_object_id().to_string(),
+        "length": size,
+        "nbytes": size,
+        "transient": False,
+        "instance_id": 0,
+        "typename": "vineyard::Blob",
+    }
+    return [
+        ObjectMeta.from_dict({
+            "size": size,
+            # Mirror the field defaults _check_meta_data() applies to local
+            # stores — the C++ create_data behind seal() rejects metas that
+            # lack them ("Metatree invalid: No 'typename' field").
+            "typename": "vineyard::Object",
+            "instance_id": 0,
+            "transient": False,
+            "user_name": "",
+            "buffer_num": 1,
+            "buffer_0": dict(blob_meta),
+        })
+        for _ in names
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +279,11 @@ class C_TieredVineyardPeerHook(BaseHook):
     2. Data-plane stubs: no-op the two payload-copy entry points in
        ``v6d.common.transfer`` (eager strategies only — never called by the
        default lazy strategy).  The remote SRPC meta probe
-       (``get_metas_by_names``) runs for real.  Everything else on the read
-       path (LRU touch, lease pin, tracker probe, eviction check, local
-       admit + re-ANNOUNCE, ``record_*_hit``) runs unmodified.
+       (``get_metas_by_names``) is stubbed with locally-fabricated metas by
+       default (cutting all remote SRPC traffic), or runs for real when
+       ``V6D_SIM_STUB_META_PROBE=0``.  Everything else on the read path (LRU
+       touch, lease pin, tracker probe, eviction check, local admit +
+       re-ANNOUNCE, ``record_*_hit``) runs unmodified.
     """
 
     HOOK_CLASS_NAME = "TieredVineyardPeer"
@@ -199,6 +294,10 @@ class C_TieredVineyardPeerHook(BaseHook):
         original_acquire_tiered_read = target._acquire_tiered_read
 
         async def wrapped_acquire_tiered_read(self, *args, **kwargs):
+            if _stub_meta_probe_enabled():
+                # Learn the uniform page size before any remote meta probe
+                # this batch may trigger (get_metas_by_names has no self).
+                _learn_page_size_from_peer(self)
             if not _hitsource_enabled():
                 return await original_acquire_tiered_read(self, *args, **kwargs)
             object_keys = args[0] if args else kwargs.get("object_keys") or ()
@@ -277,19 +376,25 @@ class C_TieredVineyardPeerHook(BaseHook):
         # v6d.server.peers.vineyard.peer), so this import is a sys.modules
         # lookup; the stubs apply process-wide, which is fine: the client
         # side never transfers data either (fetch is stubbed there).
-        # get_metas_by_names stays REAL — the SRPC meta probe is what makes
-        # remote hits production-faithful (stale tracker entries get
-        # re-confirmed by the remote).
+        # get_metas_by_names is stubbed by default, cutting the last remote
+        # SRPC call on the read path.  Set V6D_SIM_STUB_META_PROBE=0 to keep
+        # it REAL — the SRPC meta probe is what makes remote hits
+        # production-faithful (stale tracker entries get re-confirmed by the
+        # remote).
         import v6d.common.transfer as transfer
         transfer.load_data = _sim_load_data_noop
         transfer.async_load_data = _sim_async_load_data_noop
+        _stub_meta = _stub_meta_probe_enabled()
+        if _stub_meta:
+            transfer.get_metas_by_names = _sim_get_metas_by_names
 
         logger.info(
             "[v6d-sim] C_TieredVineyardPeerHook installed: real "
-            "_acquire_tiered_read + [V6D HitSource] stats + real SRPC meta "
+            "_acquire_tiered_read + [V6D HitSource] stats + %s SRPC meta "
             "probe (payload copies stubbed); key lineage (keys= suffix + "
-            "CreateSource/EvictSource) "
-            f"{'on' if _keysource_enabled() else 'off'}"
+            "CreateSource/EvictSource) %s",
+            "stubbed" if _stub_meta else "real",
+            "on" if _keysource_enabled() else "off",
         )
 
 
