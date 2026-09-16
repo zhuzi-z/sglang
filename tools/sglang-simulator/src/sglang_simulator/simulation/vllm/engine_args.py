@@ -49,6 +49,15 @@ class C_VLLMEngineArgsHook(BaseHook):
                 self.distributed_executor_backend = "uni"
 
             original_post_init(self)
+
+            profiler_config = getattr(self, "profiler_config", None)
+            if isinstance(profiler_config, dict):
+                if profiler_config.get("profiler") is None:
+                    profiler_config["profiler"] = "cuda"
+            elif profiler_config is not None:
+                if profiler_config.profiler is None:
+                    profiler_config.profiler = "cuda"
+
             logger.info(
                 "[vLLM Hijack] EngineArgs: forced parallelism to 1 "
                 "(tp=%d, pp=%d)",
