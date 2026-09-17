@@ -20,6 +20,7 @@ import time
 from collections import deque
 
 from sglang_simulator.hook import BaseHook
+from sglang_simulator.simulation import probe_log
 from sglang_simulator.simulation.manager import ConfigManager
 from sglang_simulator.simulation.manager import StateManager
 from sglang_simulator.simulation.manager.env import Envs
@@ -486,9 +487,52 @@ class C_VLLMExecutorHook(BaseHook):
                         event_time - st.last_event_time
                     )
                     st.last_event_time = event_time
+                    if len(st.gen_token_latencies) == 1:
+                        cls._emit_ttft_probe(st, len(num_scheduled_tokens))
 
             return result
 
         target.execute_model = wrapped_execute_model
         logger.info("[vLLM Hijack] UniProcExecutor hook installed "
                     "(simulated GPU span at execute_model)")
+
+    @staticmethod
+    def _emit_ttft_probe(st, batch_size: int) -> None:
+        """Log one line at first-token time, for cross-layer TTFT attribution.
+
+        ``request.jsonl`` only lands when ``profile()`` is called and the stats
+        are reset right after, so it cannot serve a long sampling window or an
+        online join with the dashllm-side probe. This streaming line can.
+
+        BLOCKING only: ``queue_start`` is a virtual-clock value in OFFLINE mode,
+        so ``t_add_ms`` would not be a wall-clock anchor there and could not be
+        aligned with the upstream logs.
+        """
+        if not probe_log.enabled():
+            return
+        if C_VLLMSchedulerHook.SIM_MODE != SimulationMode.BLOCKING:
+            return
+        try:
+            ttft_ms = st.gen_token_latencies[0] * 1000.0
+            timed = st.queue_start > 0 and st.queue_end > 0
+            queue_ms = (st.queue_end - st.queue_start) * 1000.0 if timed else probe_log.MISSING
+            # First-schedule -> first token: v6d/L2 KV load plus prefill
+            # compute. The two are not separable here because the vLLM path
+            # reports l2_load_latency as a hardcoded 0.0 (only the sglang path
+            # measures it), so group by `ext` to infer the v6d share.
+            sched_to_tok_ms = ttft_ms - queue_ms if timed else probe_log.MISSING
+            probe_log.emit(
+                f"{probe_log.PREFIX} stage=engine"
+                f" rid={st.rid}"
+                f" t_add_ms={st.queue_start * 1000.0:.1f}"
+                f" d_queue_ms={queue_ms:.3f}"
+                f" d_sched_to_tok_ms={sched_to_tok_ms:.3f}"
+                f" d_ttft_ms={ttft_ms:.3f}"
+                f" in_len={st.input_length}"
+                f" cached={st.final_device_hit_len}"
+                f" ext={st.ext_kv_hit_len}"
+                f" bs={batch_size}"
+            )
+        except Exception as e:
+            # Never let instrumentation break the engine step.
+            logger.warning("[lat-probe] engine emit failed: %s", e)

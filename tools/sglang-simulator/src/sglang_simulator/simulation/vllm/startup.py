@@ -155,5 +155,13 @@ def init_hook():
 
     from sglang_simulator.simulation.vllm.dashllm.kv_transfer_hook import _install_dashllm_kv_transfer_hook
     _install_dashllm_kv_transfer_hook()
+
+    # Latency probe — logs the dashllm-side segments that sit outside
+    # EngineCore (dashservingd dispatch, _process_input/admission, the hop
+    # into the EngineCore process). On by default like the other hooks;
+    # SGLANG_SIMULATOR_LATENCY_PROBE=0 silences it.
+    from sglang_simulator.simulation.vllm.dashllm.latency_probe import install_dashllm_latency_probe
+    install_dashllm_latency_probe()
+
     _HOOKS_INSTALLED = True
     return True
