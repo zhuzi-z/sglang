@@ -66,6 +66,7 @@ cross-process hop, which is the quantity this probe exists to expose.
 Enabled by default; see ``probe_log.enabled()`` for the kill switch.
 """
 
+import threading
 import time
 
 from sglang_simulator.simulation import probe_log
@@ -213,9 +214,105 @@ def install_dashllm_latency_probe() -> None:
     try:
         ok_process = _install_process_probe()
         ok_generate = _install_generate_probe()
+        ok_engine = _install_engine_internals_probe()
     except Exception as e:
         logger.warning("[lat-probe] install failed, probe disabled: %s", e)
         return
     logger.info(
-        "[lat-probe] installed (process=%s, generate=%s)", ok_process, ok_generate
+        "[lat-probe] installed (process=%s, generate=%s, engine_internals=%s)",
+        ok_process,
+        ok_generate,
+        ok_engine,
     )
+
+
+def _mark(name: str, rid, **extra) -> None:
+    """Emit one timestamped marker; the offline join does the subtraction.
+
+    Markers carry absolute wall-clock ms instead of pre-computed deltas because
+    the stages they cover are split across two threads (request thread vs
+    engine-loop thread), so no single call site can see both ends.
+    """
+    tail = "".join(f" {k}={v}" for k, v in extra.items())
+    probe_log.emit(
+        f"{probe_log.PREFIX} stage=mark name={name} uuid={rid or ''}"
+        f" t_ms={_now_ms():.1f} tid={threading.get_native_id()}{tail}"
+    )
+
+
+def _install_engine_internals_probe() -> bool:
+    """Split the A and C segments inside dashllm's vLLM adapter.
+
+    A (start_generate -> process_request) and C (add_request -> EngineCore) are
+    each ~150ms while the CPU sits idle (loadavg ~1 on 4 cores), and neither is
+    explained by the code on those paths -- they are dict building and a queue
+    handoff. What they do straddle is a thread boundary: `_process_request` and
+    `_enqueue_input_queue` run on the request thread, while `_add_request` runs
+    on `_run_sync_loop`'s engine-loop thread after `_drain_input_queue`. So this
+    records the thread id at every point and the `_input_queue` depth at
+    enqueue, which is what distinguishes GIL/scheduling starvation from an
+    actual queue backlog.
+
+    Also fills a real gap: dashllm's own `dashllm_vllm_time_to_add_request_start`
+    is unreachable in this configuration -- `_enable_multi_thread_process_request`
+    makes `_generate` set `process_request_finished` up front, so the branch that
+    records it never runs.
+    """
+    try:
+        import dashllm.core.backend.engine._vllm_v1 as vllm_v1
+    except Exception:
+        return False
+
+    cls = getattr(vllm_v1, "vLLMEngine", None)
+    if cls is None or getattr(cls, "_sglang_simulator_latency_probe", False):
+        return False
+
+    # generate() is a generator, so entry is timed when the caller pulls the
+    # first item -- which is exactly when the request thread starts working.
+    orig_generate = cls.generate
+
+    def _probed_generate(self, *, request_context=None, **kw):
+        rid = (getattr(request_context, "request_uuid", "")
+               or getattr(request_context, "request_id", ""))
+        _mark("vllm_generate", rid)
+        yield from orig_generate(self, request_context=request_context, **kw)
+
+    cls.generate = _probed_generate
+
+    orig_procreq = cls._process_request
+
+    def _probed_procreq(self, *, request_id=None, **kw):
+        _mark("procreq_in", request_id)
+        try:
+            return orig_procreq(self, request_id=request_id, **kw)
+        finally:
+            _mark("procreq_out", request_id)
+
+    cls._process_request = _probed_procreq
+
+    orig_enqueue = cls._enqueue_input_queue
+
+    def _probed_enqueue(self, command, infer_id, pending_request=None):
+        try:
+            qsize = self._input_queue.qsize()
+        except Exception:
+            qsize = -1
+        _mark("enqueue", infer_id, qsize=qsize,
+              cmd=getattr(command, "name", command))
+        return orig_enqueue(self, command, infer_id, pending_request)
+
+    cls._enqueue_input_queue = _probed_enqueue
+
+    orig_add = cls._add_request
+
+    def _probed_add(self, infer_id, pending_request):
+        _mark("addreq_in", infer_id)
+        try:
+            return orig_add(self, infer_id, pending_request)
+        finally:
+            _mark("addreq_out", infer_id)
+
+    cls._add_request = _probed_add
+
+    cls._sglang_simulator_latency_probe = True
+    return True
