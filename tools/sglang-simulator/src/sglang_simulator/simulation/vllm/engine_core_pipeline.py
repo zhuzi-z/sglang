@@ -618,23 +618,30 @@ class C_VLLMExecutorHook(BaseHook):
                 if _core is None:
                     time.sleep(abs(full_step_latency))
                 else:
-                    while (_remain := _deadline - time.monotonic()) > 0:
-                        _sched = getattr(_core, "scheduler", None)
-                        if _sched is not None and _sched.has_requests():
-                            # Busy: boundary-locked admission (GPU-faithful).
-                            time.sleep(_remain)
-                            break
-                        try:
-                            _item = _core.input_queue.get(
-                                timeout=min(_remain, 0.005))
-                            _core._handle_client_request(*_item)
-                        except queue.Empty:
-                            pass
-                    # Non-blocking tail drain: consume anything that
-                    # arrived during the wait, but never block on get().
-                    while not _core.input_queue.empty():
-                        _core._handle_client_request(
-                            *_core.input_queue.get_nowait())
+                    # Multiplex input consumption into the wait, mirroring
+                    # EngineCoreProc._wait_model_output_future's bypass
+                    # loop (core.py): block on input_queue.get(timeout),
+                    # consume ADD/ABORT immediately, defer everything else
+                    # and requeue it (appendleft, original order) after the
+                    # wait so the next boundary _process_input_queue handles
+                    # it unchanged.  get(timeout) is the sleep itself: no
+                    # busy-polling, exact deadline accounting.
+                    _deferred = []
+                    try:
+                        while (_remain := _deadline - time.monotonic()) > 0:
+                            try:
+                                _item = _core.input_queue.get(
+                                    timeout=min(_remain, 0.005))
+                            except queue.Empty:
+                                continue
+                            _tname = getattr(_item[0], "name", str(_item[0]))
+                            if _tname in ("ADD", "ABORT"):
+                                _core._handle_client_request(*_item)
+                            else:
+                                _deferred.append(_item)
+                    finally:
+                        for _item in reversed(_deferred):
+                            _core.input_queue.queue.appendleft(_item)
                 event_time = time.time()
             else:
                 # OFFLINE: the virtual clock accumulates the full GPU span.
