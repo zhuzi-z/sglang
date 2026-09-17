@@ -591,7 +591,50 @@ class C_VLLMExecutorHook(BaseHook):
                 # overhead (schedule/update/dispatch/post_step) is
                 # naturally consumed by the real engine loop, so only the
                 # GPU span (RPC-1 + RPC-2 + logprobs term) is slept for.
-                time.sleep(abs(full_step_latency))
+                # [wake-on-input wait, 2026-09-17] The previous monolithic
+                # time.sleep(full_step_latency) froze the EngineCore loop
+                # for the whole simulated GPU span, starving the zmq input
+                # pump: on CPU-sim, add_request -> engine入队 measured p50
+                # ~349ms (vs ~4ms on GPU), which dominated the sim-vs-real
+                # TTFT gap.  Replaced by a deadline loop that mirrors the
+                # real run_busy_loop's load-shaped admission: when the
+                # engine is idle (scheduler.has_requests() is False), block
+                # on input_queue.get(timeout=5ms) so arrivals are consumed
+                # within ~5ms (matching GPU's idle wait); when busy, sleep
+                # through to the deadline (boundary-locked admission,
+                # matching GPU under load).  Wall-clock accounting is
+                # unchanged: the loop always exits at the deadline, so the
+                # simulated GPU span is preserved exactly.  The tail drain
+                # deliberately does NOT call _process_input_queue(), whose
+                # idle branch blocks on input_queue.get() and would hang
+                # the loop when no work remains.
+                _core = None
+                try:
+                    import vllm.v1.hybrid_connector.engine_proxy as _ep
+                    _core = getattr(_ep, "_g_core", None)
+                except (ImportError, AttributeError):
+                    _core = None
+                _deadline = time.monotonic() + abs(full_step_latency)
+                if _core is None:
+                    time.sleep(abs(full_step_latency))
+                else:
+                    while (_remain := _deadline - time.monotonic()) > 0:
+                        _sched = getattr(_core, "scheduler", None)
+                        if _sched is not None and _sched.has_requests():
+                            # Busy: boundary-locked admission (GPU-faithful).
+                            time.sleep(_remain)
+                            break
+                        try:
+                            _item = _core.input_queue.get(
+                                timeout=min(_remain, 0.005))
+                            _core._handle_client_request(*_item)
+                        except queue.Empty:
+                            pass
+                    # Non-blocking tail drain: consume anything that
+                    # arrived during the wait, but never block on get().
+                    while not _core.input_queue.empty():
+                        _core._handle_client_request(
+                            *_core.input_queue.get_nowait())
                 event_time = time.time()
             else:
                 # OFFLINE: the virtual clock accumulates the full GPU span.
