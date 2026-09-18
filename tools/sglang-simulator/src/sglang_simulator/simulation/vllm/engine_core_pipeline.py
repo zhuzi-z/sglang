@@ -435,17 +435,6 @@ class C_VLLMEngineCoreHook(BaseHook):
 
         target.__init__ = wrapped_init
 
-        # Chain C_VLLMProfileHook unconditionally: class_hook_entry applies
-        # only the FIRST matching hook per class, and this hook is registered
-        # ahead of C_VLLMProfileHook (same target EngineCore /
-        # vllm.v1.engine.core), which would otherwise never run (start_profile
-        # RPCs failing with "Profiling is not enabled").  The two hooks patch
-        # different methods (__init__ vs profile), so they compose safely.
-        from sglang_simulator.simulation.vllm.profile_hook import (
-            C_VLLMProfileHook,
-        )
-        C_VLLMProfileHook.hook(target)
-
 
 class C_VLLMExecutorHook(BaseHook):
     """Hook UniProcExecutor.execute_model to consume the simulated GPU span.
