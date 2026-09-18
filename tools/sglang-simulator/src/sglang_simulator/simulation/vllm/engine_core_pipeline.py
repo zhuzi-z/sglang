@@ -221,6 +221,19 @@ class C_VLLMSchedulerHook(BaseHook):
             if cls.SIM_MODE == SimulationMode.BLOCKING:
                 # BLOCKING mode: process immediately, record stats with real time
                 now = time.time()
+                # [sim-prof] admission-tail profiling (2026-09-18): marks the
+                # moment the ENGINE starts processing this request
+                # (scheduler.add_request entered).  Together with the
+                # wrapper-side "vllm_v1 add_request start" log, the
+                # connector "Found N matching blocks" log and the engine
+                # "Request added" log, this splits the admission leg into
+                # pump/zmq wait (wrapper start -> this mark) vs
+                # lookup+scheduler work (this mark -> Request added).
+                logger.info(
+                    "[sim-prof] add_request enter reqid=%s ts=%.6f",
+                    getattr(request, "request_id", "?"),
+                    now,
+                )
                 _new_request_stats(
                     request,
                     created_time=created_time if created_time is not None else now,
@@ -421,6 +434,17 @@ class C_VLLMEngineCoreHook(BaseHook):
             original_init(self, *args, **kwargs)
 
         target.__init__ = wrapped_init
+
+        # Chain C_VLLMProfileHook unconditionally: class_hook_entry applies
+        # only the FIRST matching hook per class, and this hook is registered
+        # ahead of C_VLLMProfileHook (same target EngineCore /
+        # vllm.v1.engine.core), which would otherwise never run (start_profile
+        # RPCs failing with "Profiling is not enabled").  The two hooks patch
+        # different methods (__init__ vs profile), so they compose safely.
+        from sglang_simulator.simulation.vllm.profile_hook import (
+            C_VLLMProfileHook,
+        )
+        C_VLLMProfileHook.hook(target)
 
 
 class C_VLLMExecutorHook(BaseHook):
