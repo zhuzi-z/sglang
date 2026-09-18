@@ -14,8 +14,11 @@ Both hooks share the predictor / iteration-stats / sim-mode state carried
 on C_VLLMSchedulerHook, which is why they live in one module.
 """
 
+import asyncio
 import heapq
 import os
+import queue
+import threading
 import time
 from collections import deque
 
@@ -39,6 +42,11 @@ logger = get_logger()
 # Max decode steps (output length) from environment variable
 # None means no override (use original sampling_params.max_tokens)
 _MAX_DECODE_STEPS = int(v) if (v := os.environ.get("SGLANG_SIMULATOR_MAX_DECODE_STEPS")) is not None else None
+
+# Record raw input_ids/output_ids on RequestStats
+# (VLLM_SIMULATOR_RECORD_RAW_REQUEST, off by default). Read once here so
+# the schedule hot path pays no env lookup.
+_RECORD_RAW_REQUEST = Envs.record_raw_request()
 
 
 class C_VLLMSchedulerHook(BaseHook):
@@ -89,6 +97,13 @@ class C_VLLMSchedulerHook(BaseHook):
             st.last_event_time = last_event_time
             st.input_length = input_length
             st.output_length = 0
+            # Raw prompt token ids (mirrors sglang hook's raw_request export),
+            # enabling trace-level join back to the original dataset.
+            if _RECORD_RAW_REQUEST:
+                prompt_token_ids = getattr(request, "prompt_token_ids", None)
+                st.input_ids = (
+                    list(prompt_token_ids) if prompt_token_ids is not None else []
+                )
             return st
 
         def wrapped_init(self, vllm_config, *args, **kwargs):
@@ -105,6 +120,62 @@ class C_VLLMSchedulerHook(BaseHook):
             req_created_time.clear()
             # Per-instance tracking to avoid cross-worker contamination
             self._sim_req_created_time = {}
+
+            # Native HybridConnector's HybridScheduler asserts BOTH a live
+            # engine_proxy._g_sched_loop (get_hybrid_sched_loop) and a live
+            # _g_sched_rpc_serv (sched_rpc_server, created by _start_rpc_server
+            # -> RpcServer(port, "schedrpcserver").start(loop)) at
+            # construction time.  The async engine entrypoints (AsyncLLM /
+            # api_server) install both via engine_proxy.core_init during
+            # startup, but the OFFLINE runner drives a synchronous LLM()
+            # engine where core_init is never called (it needs an
+            # EngineCoreProc handle we do not have), so a HybridConnector
+            # deployment crashes in Scheduler.__init__.  Bootstrap the same
+            # two globals here, mirroring core_init's construction sequence
+            # (start_asyncio_thread("hybridsched") + RpcServer(port,
+            # "schedrpcserver").start(loop), port from sched_rpc_server_port)
+            # and the worker-side _ensure_cpu_worker_loop pattern in
+            # worker.py; the None-guards keep it a no-op on paths where the
+            # async engine already installed them.  _g_core is NOT handled
+            # here: it is bootstrapped by C_VLLMEngineCoreHook through the
+            # real engine_proxy.core_init (which needs the EngineCore
+            # instance, not the Scheduler) — _sched() dereferences
+            # _g_core.scheduler at every kvconn.step(), so leaving it None
+            # crashes at runtime (assert _g_core is not None).
+            try:
+                import vllm.v1.hybrid_connector.engine_proxy as _engine_proxy
+                if getattr(_engine_proxy, "_g_sched_loop", None) is None:
+                    _sched_loop = asyncio.new_event_loop()
+
+                    def _run_sched_loop():
+                        asyncio.set_event_loop(_sched_loop)
+                        _sched_loop.run_forever()
+
+                    threading.Thread(
+                        target=_run_sched_loop,
+                        name="hybridsched-cpu-loop",
+                        daemon=True,
+                    ).start()
+                    _engine_proxy._g_sched_loop = _sched_loop
+                    logger.info(
+                        "[vLLM Hijack] installed CPU hybrid sched loop"
+                    )
+                if getattr(_engine_proxy, "_g_sched_rpc_serv", None) is None:
+                    _port = _engine_proxy.sched_rpc_server_port(vllm_config)
+                    _engine_proxy._g_sched_rpc_serv = _engine_proxy.RpcServer(
+                        _port, "schedrpcserver"
+                    )
+                    _engine_proxy._g_sched_rpc_serv.start(
+                        _engine_proxy._g_sched_loop
+                    )
+                    logger.info(
+                        "[vLLM Hijack] started CPU hybrid sched rpc server "
+                        "on port %s", _port
+                    )
+            except (ImportError, AttributeError):
+                # No hybrid_connector module in this vLLM build: nothing to
+                # bootstrap, keep behaviour unchanged.
+                pass
 
             original_init(self, vllm_config, *args, **kwargs)
 
@@ -150,6 +221,19 @@ class C_VLLMSchedulerHook(BaseHook):
             if cls.SIM_MODE == SimulationMode.BLOCKING:
                 # BLOCKING mode: process immediately, record stats with real time
                 now = time.time()
+                # [sim-prof] admission-tail profiling (2026-09-18): marks the
+                # moment the ENGINE starts processing this request
+                # (scheduler.add_request entered).  Together with the
+                # wrapper-side "vllm_v1 add_request start" log, the
+                # connector "Found N matching blocks" log and the engine
+                # "Request added" log, this splits the admission leg into
+                # pump/zmq wait (wrapper start -> this mark) vs
+                # lookup+scheduler work (this mark -> Request added).
+                logger.info(
+                    "[sim-prof] add_request enter reqid=%s ts=%.6f",
+                    getattr(request, "request_id", "?"),
+                    now,
+                )
                 _new_request_stats(
                     request,
                     created_time=created_time if created_time is not None else now,
@@ -211,6 +295,22 @@ class C_VLLMSchedulerHook(BaseHook):
                     StateManager.set_global_clock(next_time + 1e-6)
                     _dispatch_eligible(self)
 
+            # --- Capture output_ids BEFORE original_schedule() ---
+            # schedule() removes finished requests from self.requests, so a
+            # post-schedule lookup returns None. output_token_ids at this
+            # point reflects all tokens generated up to the previous step
+            # (update_from_output runs between consecutive schedule() calls),
+            # which is the complete output for requests finishing this step.
+            if _RECORD_RAW_REQUEST:
+                for req_id, request in self.requests.items():
+                    st = request_stats_manager.stats.get(req_id)
+                    if st is None:
+                        continue
+                    output_token_ids = getattr(request, "output_token_ids", None)
+                    if output_token_ids:
+                        st.output_ids = list(output_token_ids)
+
+            # --- Call original schedule ---
             scheduler_output = original_schedule(self)
 
             # Real-time per-request hit-rate log at inference end: vLLM reports
@@ -274,6 +374,66 @@ class C_VLLMSchedulerHook(BaseHook):
         target.add_request = wrapped_add_request
         target.schedule = wrapped_schedule
         target.get_num_unfinished_requests = wrapped_get_num_unfinished
+
+
+class C_VLLMEngineCoreHook(BaseHook):
+    """Hook the vLLM EngineCore __init__ to bootstrap the hybrid
+    engine-proxy globals for the in-process engine path (OFFLINE).
+
+    Production installs engine_proxy._g_core / _g_sched_loop /
+    _g_sched_rpc_serv in EngineCoreProc.__init__ (vllm core.py's
+    ``_core_init(self, vllm_config)`` runs before ``super().__init__`` so
+    the globals exist before HybridScheduler is constructed).  The
+    synchronous OFFLINE runner (simulate.py -> VLLMWorker -> LLM()) builds
+    the plain in-process EngineCore via InprocClient instead, so
+    ``_core_init`` never runs and HybridConnector crashes — first at
+    HybridScheduler construction (get_hybrid_sched_loop), and once the
+    loop/serv are bootstrapped, at the first ``kvconn.step()``
+    (``sched_allocate_slots`` -> ``_sched()``'s
+    ``assert _g_core is not None``).
+
+    Mirror EngineCoreProc's sequence here: create ``input_queue`` if the
+    instance does not have one yet (consumed by wakeup_core's fake-abort
+    nudge; the sync OFFLINE loop drives steps from the same thread, so a
+    plain undrained Queue is sufficient), then call the REAL
+    ``engine_proxy.core_init(self, vllm_config)``.  The ``_g_core is None``
+    guard keeps the EngineCoreProc path (async engine / BLOCKING), which
+    already ran ``_core_init``, untouched.
+    """
+
+    HOOK_CLASS_NAME = "EngineCore"
+    HOOK_MODULE_NAME = "vllm.v1.engine.core"
+
+    @classmethod
+    def hook(cls, target):
+        original_init = target.__init__
+
+        def wrapped_init(self, *args, **kwargs):
+            vllm_config = args[0] if args else kwargs.get("vllm_config")
+            if vllm_config is not None and getattr(
+                vllm_config, "kv_transfer_config", None
+            ) is not None:
+                try:
+                    import vllm.v1.hybrid_connector.engine_proxy as _engine_proxy
+                    if getattr(_engine_proxy, "_g_core", None) is None:
+                        # EngineCoreProc creates input_queue before
+                        # super().__init__ (core.py: queue.Queue at the top
+                        # of EngineCoreProc.__init__).
+                        if not hasattr(self, "input_queue"):
+                            self.input_queue = queue.Queue()
+                        # Mirror core.py _core_init(self, vllm_config).
+                        _engine_proxy.core_init(self, vllm_config)
+                        logger.info(
+                            "[vLLM Hijack] engine_proxy.core_init done for "
+                            "in-process EngineCore (OFFLINE path)"
+                        )
+                except (ImportError, AttributeError):
+                    # No hybrid_connector module in this vLLM build: nothing
+                    # to bootstrap, keep behaviour unchanged.
+                    pass
+            original_init(self, *args, **kwargs)
+
+        target.__init__ = wrapped_init
 
 
 class C_VLLMExecutorHook(BaseHook):
@@ -401,15 +561,17 @@ class C_VLLMExecutorHook(BaseHook):
             # Deliberately not folded into predicted_latency so that the
             # iter_latency semantics of the trained label stay intact and
             # both components remain separately auditable in
-            # iteration.jsonl. Driven by this step's scheduled token count,
-            # mirroring the GPU-side ``total_tokens`` field.
+            # iteration.jsonl. Driven by the same ScheduleBatch the iter
+            # predictor sees: the mechanistic model consumes sum_extend
+            # and sum(ext_i * past_i) from the per-request aggregation,
+            # matching the GPU-side calibration features exactly.
             total_tokens = sum(num_scheduled_tokens.values())
             sample_tokens_latency = 0.0
             if predictor is not None and hasattr(
                 predictor, "predict_sample_tokens_time"
             ):
                 sample_tokens_latency = float(
-                    predictor.predict_sample_tokens_time(total_tokens)
+                    predictor.predict_sample_tokens_time(simulation_batch)
                 )
 
             # Full GPU span actually occupied by this step, matching the
@@ -442,7 +604,57 @@ class C_VLLMExecutorHook(BaseHook):
                 # overhead (schedule/update/dispatch/post_step) is
                 # naturally consumed by the real engine loop, so only the
                 # GPU span (RPC-1 + RPC-2 + logprobs term) is slept for.
-                time.sleep(abs(full_step_latency))
+                # [wake-on-input wait, 2026-09-17] The previous monolithic
+                # time.sleep(full_step_latency) froze the EngineCore loop
+                # for the whole simulated GPU span, starving the zmq input
+                # pump: on CPU-sim, add_request -> engine入队 measured p50
+                # ~349ms (vs ~4ms on GPU), which dominated the sim-vs-real
+                # TTFT gap.  Replaced by a deadline loop that mirrors the
+                # real run_busy_loop's load-shaped admission: when the
+                # engine is idle (scheduler.has_requests() is False), block
+                # on input_queue.get(timeout=5ms) so arrivals are consumed
+                # within ~5ms (matching GPU's idle wait); when busy, sleep
+                # through to the deadline (boundary-locked admission,
+                # matching GPU under load).  Wall-clock accounting is
+                # unchanged: the loop always exits at the deadline, so the
+                # simulated GPU span is preserved exactly.  The tail drain
+                # deliberately does NOT call _process_input_queue(), whose
+                # idle branch blocks on input_queue.get() and would hang
+                # the loop when no work remains.
+                _core = None
+                try:
+                    import vllm.v1.hybrid_connector.engine_proxy as _ep
+                    _core = getattr(_ep, "_g_core", None)
+                except (ImportError, AttributeError):
+                    _core = None
+                _deadline = time.monotonic() + abs(full_step_latency)
+                if _core is None:
+                    time.sleep(abs(full_step_latency))
+                else:
+                    # Multiplex input consumption into the wait, mirroring
+                    # EngineCoreProc._wait_model_output_future's bypass
+                    # loop (core.py): block on input_queue.get(timeout),
+                    # consume ADD/ABORT immediately, defer everything else
+                    # and requeue it (appendleft, original order) after the
+                    # wait so the next boundary _process_input_queue handles
+                    # it unchanged.  get(timeout) is the sleep itself: no
+                    # busy-polling, exact deadline accounting.
+                    _deferred = []
+                    try:
+                        while (_remain := _deadline - time.monotonic()) > 0:
+                            try:
+                                _item = _core.input_queue.get(
+                                    timeout=min(_remain, 0.005))
+                            except queue.Empty:
+                                continue
+                            _tname = getattr(_item[0], "name", str(_item[0]))
+                            if _tname in ("ADD", "ABORT"):
+                                _core._handle_client_request(*_item)
+                            else:
+                                _deferred.append(_item)
+                    finally:
+                        for _item in reversed(_deferred):
+                            _core.input_queue.queue.appendleft(_item)
                 event_time = time.time()
             else:
                 # OFFLINE: the virtual clock accumulates the full GPU span.
