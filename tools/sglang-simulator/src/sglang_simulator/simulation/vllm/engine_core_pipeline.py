@@ -694,6 +694,32 @@ class C_VLLMExecutorHook(BaseHook):
                     continue
                 st = request_stats_manager.stats.get(req_id)
                 if st is not None:
+                    # [SimTTFT] additive only: on the FIRST token emission of a
+                    # request (its first latency record), log the engine-side
+                    # TTFT breakdown so sim-vs-real can be decomposed into
+                    # engine queue wait vs billed prefill span.  No behaviour
+                    # change: bookkeeping reads fields already maintained by
+                    # the scheduler/executor hooks and never raises.
+                    try:
+                        if (not st.gen_token_latencies
+                                and C_VLLMSchedulerHook.SIM_MODE
+                                == SimulationMode.BLOCKING
+                                and getattr(st, "queue_start", None)
+                                and st.queue_end != -1):
+                            logger.info(
+                                "[SimTTFT] rid=%s input_len=%d local_hit=%d "
+                                "ext_hit=%d queue_wait_ms=%.1f "
+                                "prefill_span_ms=%.1f engine_ttft_ms=%.1f",
+                                st.rid,
+                                st.input_length,
+                                st.local_kv_hit_len,
+                                st.ext_kv_hit_len,
+                                (st.queue_end - st.queue_start) * 1000,
+                                (event_time - st.queue_end) * 1000,
+                                (event_time - st.queue_start) * 1000,
+                            )
+                    except Exception:
+                        pass
                     st.gen_token_latencies.append(
                         event_time - st.last_event_time
                     )
