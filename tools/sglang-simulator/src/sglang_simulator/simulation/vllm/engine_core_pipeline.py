@@ -622,11 +622,15 @@ class C_VLLMExecutorHook(BaseHook):
                 # idle branch blocks on input_queue.get() and would hang
                 # the loop when no work remains.
                 _core = None
+                _kvconn = None
                 try:
                     import vllm.v1.hybrid_connector.engine_proxy as _ep
                     _core = getattr(_ep, "_g_core", None)
+                    if _core is not None:
+                        _kvconn = _core.scheduler.get_kv_connector()
                 except (ImportError, AttributeError):
                     _core = None
+                    _kvconn = None
                 _deadline = time.monotonic() + abs(full_step_latency)
                 if _core is None:
                     time.sleep(abs(full_step_latency))
@@ -640,8 +644,34 @@ class C_VLLMExecutorHook(BaseHook):
                     # it unchanged.  get(timeout) is the sleep itself: no
                     # busy-polling, exact deadline accounting.
                     _deferred = []
+                    _kvconn_err_logged = False
                     try:
                         while (_remain := _deadline - time.monotonic()) > 0:
+                            # [kvconn drive, 2026-09-20] GPU bypass parity:
+                            # the real bypass loop also calls kvconn.step()
+                            # every iteration during the forward wait,
+                            # driving _step_waiting (load dispatch) and
+                            # _step_loaded (post-load injection) mid-step —
+                            # that is why mark_loaded -> Request added is
+                            # ~0ms on GPU.  The sim mock wait never drove
+                            # it, so both stages froze until the next real
+                            # step boundary (+183ms inject delay, forming
+                            # the +120ms admission tail).  Drive it here
+                            # whenever the connector has pending work.
+                            if _kvconn is not None and _kvconn.has_requests():
+                                try:
+                                    _outs = _kvconn.step()
+                                    if _outs:
+                                        for _ci, _o in _outs.items():
+                                            if _o:
+                                                _core.output_queue.put_nowait(
+                                                    (_ci, _o))
+                                except Exception:
+                                    if not _kvconn_err_logged:
+                                        _kvconn_err_logged = True
+                                        logger.exception(
+                                            "[sim] kvconn.step() failed "
+                                            "in BLOCKING wait")
                             try:
                                 _item = _core.input_queue.get(
                                     timeout=min(_remain, 0.005))
