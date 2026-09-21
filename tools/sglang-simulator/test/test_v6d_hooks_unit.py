@@ -946,12 +946,14 @@ class TestEngineClockBoundary:
         from sglang_simulator.simulation.types import SimulationMode
 
         calls = []
-        future = Future()
-        future.result = MagicMock(side_effect=AssertionError("extra Future wait"))
+        worker_future = Future()
+        worker_future.set_result("model-output")
         class Executor:
+            # Fake executor with no scheduler_config -> async_scheduling reads
+            # False, exercising the P-side (non-async) deferred-future path.
             def execute_model(self, output):
                 calls.append("execute")
-                return future
+                return worker_future
         def predict(batch):
             calls.append("predict")
             return 0.5
@@ -966,25 +968,33 @@ class TestEngineClockBoundary:
             scheduled_new_reqs=[SimpleNamespace(req_id="r", prompt_token_ids=[1] * tokens,
                                                num_computed_tokens=0, sampling_params=None)])
         with patch.object(pipeline.time, "sleep") as sleep:
-            assert Executor().execute_model(output) is future
-            sleep.assert_not_called()
-        assert calls == (["predict", "execute"] if tokens else ["execute"])
-        if mode == "BLOCKING" and tokens:
-            assert output._sim_full_step_latency == pytest.approx(0.5)
-            # Completion accounting happens only after EngineCore has waited
-            # for the deferred model-output future.
-            assert pipeline.C_VLLMEngineCoreHook.ITERATION_STATS == []
-            completed = Future()
-            completed.set_result("model-output")
-            with patch.object(pipeline.time, "time", return_value=123.0):
-                assert self.engine._wait_model_output_future(
-                    completed, output
-                ) == ("model-output", {})
-            assert len(pipeline.C_VLLMEngineCoreHook.ITERATION_STATS) == 1
-        else:
+            returned = Executor().execute_model(output)
+            if not tokens:
+                # Empty sim batch: native passthrough, no accounting/deferral.
+                assert returned is worker_future
+                assert calls == ["execute"]
+                sleep.assert_not_called()
+                assert StateManager.get_global_clock() == 1.0
+                return
+            # Prediction runs before the original call in both modes.
+            assert calls == ["predict", "execute"]
+            # Non-async path never annotates the worker-side latency carrier.
             assert not hasattr(output, "_sim_full_step_latency")
-        future.result.assert_not_called()
-        assert StateManager.get_global_clock() == (1.5 if tokens and mode == "OFFLINE" else 1.0)
+            if mode == "OFFLINE":
+                # Synchronous virtual-clock path returns the worker future as-is.
+                assert returned is worker_future
+                sleep.assert_not_called()
+                assert StateManager.get_global_clock() == 1.5
+                assert len(pipeline.C_VLLMEngineCoreHook.ITERATION_STATS) == 1
+                return
+            # BLOCKING (async off): a NEW deferred future is returned; the span
+            # is slept on the sim GPU pool and stats publish only after it.
+            assert returned is not worker_future
+            assert isinstance(returned, Future)
+            assert returned.result(timeout=5) == "model-output"
+            sleep.assert_called_once_with(pytest.approx(0.5))
+            assert len(pipeline.C_VLLMEngineCoreHook.ITERATION_STATS) == 1
+            assert StateManager.get_global_clock() == 1.0
 
     @pytest.mark.parametrize("async_scheduling", [False, True])
     @pytest.mark.parametrize("mode", ["OFFLINE", "BLOCKING"])
@@ -1025,6 +1035,9 @@ class TestEngineClockBoundary:
             scheduler_config=SimpleNamespace(async_scheduling=async_scheduling)
         )
         class Executor:
+            # Real UniProcExecutor exposes scheduler_config; mirror it so the
+            # executor-side async_scheduling read matches the worker-side.
+            scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
             def execute_model(self, output):
                 result = worker.execute_model(output)
                 actual = getattr(result, "_output", result)
@@ -1047,7 +1060,9 @@ class TestEngineClockBoundary:
                 if async_scheduling:
                     result = worker.sample_tokens(None).get_output()
                 else:
-                    result = result.get_output()
+                    # Non-async path returns a deferred future; the span sleep
+                    # runs on the sim GPU pool. Block on it to synchronize.
+                    result = result.result(timeout=5)
             end = 1.5 if tokens else 1.0
             assert controller.now() == end
             assert controller._stores == []

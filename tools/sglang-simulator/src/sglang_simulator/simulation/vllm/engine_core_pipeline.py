@@ -28,6 +28,7 @@ import heapq
 import json
 import os
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 
 from sglang_simulator.hook import BaseHook
@@ -433,6 +434,17 @@ class C_VLLMExecutorHook(BaseHook):
     REGEX = True
 
     _COLD_START_DONE = False
+    # Sim-owned single-worker pool that consumes the modelled GPU span off the
+    # EngineCore thread, so execute_model can return a still-pending future.
+    # max_workers=1 serialises steps, matching a single GPU stream.
+    _GPU_SPAN_EXECUTOR = None
+
+    @classmethod
+    def _gpu_span_pool(cls):
+        if cls._GPU_SPAN_EXECUTOR is None:
+            cls._GPU_SPAN_EXECUTOR = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="sim-gpu-span")
+        return cls._GPU_SPAN_EXECUTOR
 
     @classmethod
     def hook(cls, target):
@@ -600,35 +612,10 @@ class C_VLLMExecutorHook(BaseHook):
                 C_VLLMEngineCoreHook.SIM_MODE == SimulationMode.BLOCKING
             )
             simulated_gpu_span = abs(full_step_latency)
-            if is_blocking:
-                # One-time engine cold start is part of the first deferred GPU
-                # span so it does not block the EngineCore loop either.
-                if not cls._COLD_START_DONE:
-                    cls._COLD_START_DONE = True
-                    cold_start = float(os.environ.get(
-                        "SGLANG_SIMULATOR_COLD_START_S", "0") or 0)
-                    if cold_start > 0:
-                        logger.info(
-                            "[sim-coldstart] one-time cold-start "
-                            "overhead %.3f s on first non-empty iter",
-                            cold_start)
-                        simulated_gpu_span += cold_start
 
-                # SchedulerOutput is the native executor -> worker carrier.
-                # The worker consumes this in sample_tokens() and returns an
-                # AsyncModelRunnerOutput whose get_output() sleeps on vLLM's
-                # WorkerAsyncOutput thread.  Set it before the original call:
-                # that call already hands scheduler_output to the worker.
-                setattr(
-                    scheduler_output,
-                    "_sim_full_step_latency",
-                    simulated_gpu_span,
-                )
-
-            # Keep completion accounting attached to the same native object.
-            # BLOCKING publishes it from EngineCore._wait_model_output_future,
-            # after the actual async result returns; OFFLINE publishes below
-            # after advancing the virtual clock.
+            # Completion accounting travels on the native SchedulerOutput and is
+            # published once the modelled span actually elapses (BLOCKING) or the
+            # virtual clock advances (OFFLINE).
             scheduler_output._sim_iteration_stat = {
                 "requests": simulation_batch.request_info(),
                 # RPC-1 only, matching the predictor's training label.
@@ -641,9 +628,6 @@ class C_VLLMExecutorHook(BaseHook):
                 "l2_backup_latency": 0.0,
             }
 
-            result = original_execute_model(
-                self, scheduler_output, *args, **kwargs)
-
             if not is_blocking:
                 # OFFLINE: the virtual clock accumulates the full GPU span.
                 # Known diff vs real, deliberately NOT compensated: the
@@ -654,13 +638,69 @@ class C_VLLMExecutorHook(BaseHook):
                 # calibration. OFFLINE duration is expected to run
                 # ~2.5ms/step shorter than real; treat it as a known diff
                 # item when interpreting results, not a bug.
+                result = original_execute_model(
+                    self, scheduler_output, *args, **kwargs)
                 StateManager.set_current_inference_dur(full_step_latency)
                 StateManager.step_global_clock(full_step_latency)
                 _finalize_step_stats(
-                    scheduler_output, StateManager.get_global_clock()
-                )
+                    scheduler_output, StateManager.get_global_clock())
+                return result
 
-            return result
+            # One-time engine cold start folded into the first modelled span.
+            if not cls._COLD_START_DONE:
+                cls._COLD_START_DONE = True
+                cold_start = float(os.environ.get(
+                    "SGLANG_SIMULATOR_COLD_START_S", "0") or 0)
+                if cold_start > 0:
+                    logger.info(
+                        "[sim-coldstart] one-time cold-start "
+                        "overhead %.3f s on first non-empty iter",
+                        cold_start)
+                    simulated_gpu_span += cold_start
+
+            async_scheduling = bool(getattr(
+                getattr(self, "scheduler_config", None),
+                "async_scheduling", False))
+
+            if async_scheduling:
+                # Batch-queue path: EngineCore waits on the sample_tokens
+                # future, so defer the span there via the worker's
+                # AsyncModelRunnerOutput on vLLM's WorkerAsyncOutput thread.
+                scheduler_output._sim_full_step_latency = simulated_gpu_span
+                return original_execute_model(
+                    self, scheduler_output, *args, **kwargs)
+
+            # Non-async path (e.g. P/D-disagg P side, where vLLM forces async
+            # scheduling off): step() waits on execute_model's own future.
+            # Build the mock output synchronously (worker does NOT sleep since
+            # _sim_full_step_latency is unset), then return a still-pending
+            # future whose result is filled after the span elapses on a
+            # background thread.  With _enable_bypass on, vLLM's native
+            # _wait_model_output_future bypass loop then pumps ADD/ABORT input
+            # and drives kvconn.step() during the wait -- reproducing the
+            # real-GPU load/admission overlap with no hand-rolled time slicing.
+            result = original_execute_model(
+                self, scheduler_output, *args, **kwargs)
+            model_output = result.result() if isinstance(result, Future) else result
+
+            deferred: Future = Future()
+            _span = simulated_gpu_span
+            _sout = scheduler_output
+
+            def _consume_gpu_span():
+                try:
+                    time.sleep(_span)
+                    # Real completion timestamp; GPU steps serialise on this
+                    # single-worker pool so stat writes never race the engine
+                    # thread (which only reaches the next step after this
+                    # future resolves).
+                    _finalize_step_stats(_sout, time.time())
+                    deferred.set_result(model_output)
+                except BaseException as exc:  # pragma: no cover
+                    deferred.set_exception(exc)
+
+            cls._gpu_span_pool().submit(_consume_gpu_span)
+            return deferred
 
         target.execute_model = wrapped_execute_model
         logger.info("[vLLM Hijack] UniProcExecutor hook installed "
