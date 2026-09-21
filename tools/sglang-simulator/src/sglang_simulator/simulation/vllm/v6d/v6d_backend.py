@@ -129,9 +129,21 @@ class SimulatedKVController:
         return tracked()
 
     def settle_preparations(self):
+        """Wait for control-plane RPCs (OFFLINE deterministic barrier)."""
         preparing, self._preparing = self._preparing, []
         for future in preparing:
             future.result(timeout=30.0)
+
+    def reap_preparations(self):
+        """Publish completed RPCs without blocking the EngineCore thread."""
+        pending = []
+        for future in self._preparing:
+            if future.done():
+                # Surface connector-loop failures on the engine thread.
+                future.result()
+            else:
+                pending.append(future)
+        self._preparing = pending
 
     def queue_load(self, request, num_tokens, groups):
         nblocks = sum(len(keys) for keys, _ids in groups.values())
@@ -285,13 +297,24 @@ class C_HybridControlPlaneHook(BaseHook):
 
         def step_waiting(self):
             result = original_waiting(self)
-            if self._sim_controller is not None:
-                self._sim_controller.settle_preparations()
-                self._sim_controller.progress()
+            controller = self._sim_controller
+            if controller is not None:
+                if Envs.simulation_mode() == "OFFLINE":
+                    # Virtual time cannot advance while a real control-plane
+                    # coroutine is unresolved, so OFFLINE retains the explicit
+                    # synchronization barrier.
+                    controller.settle_preparations()
+                else:
+                    # BLOCKING mirrors production: lookup/allocation RPCs stay
+                    # on the connector asyncio loop while EngineCore continues
+                    # polling and overlapping them with the simulated GPU span.
+                    controller.reap_preparations()
+                controller.progress()
             return result
 
         def step(self):
             if self._sim_controller is not None:
+                self._sim_controller.reap_preparations()
                 self._sim_controller.progress()
             return original_step(self)
 

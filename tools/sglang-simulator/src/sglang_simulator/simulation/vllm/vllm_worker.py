@@ -23,8 +23,8 @@ import uuid
 
 from sglang_simulator.dataset import GenericRequest
 from sglang_simulator.simulation.benchmark import BaseWorker
-from sglang_simulator.utils import get_logger
 from sglang_simulator.simulation.vllm.startup import init_hook
+from sglang_simulator.utils import get_logger
 
 # Environment must be set before vllm import
 os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
@@ -43,11 +43,11 @@ EngineArgs = AsyncEngineArgs
 logger = get_logger("sglang_simulator")
 
 
-# Simulation-fixed defaults applied to EngineArgs
+# Simulation-fixed defaults applied to EngineArgs. async_scheduling remains
+# user-controlled; BLOCKING supports both synchronous and asynchronous modes.
 _SIMULATION_DEFAULTS = {
     "enforce_eager": True,
     "load_format": "dummy",
-    "async_scheduling": False,
 }
 
 
@@ -66,8 +66,8 @@ class VLLMWorker(BaseWorker):
     """High-level vLLM worker for simulation benchmarks.
 
     Accepts a vLLM EngineArgs directly. Simulation-fixed defaults are applied
-    automatically (enforce_eager, load_format, async_scheduling) but can
-    be overridden in the EngineArgs if needed.
+    automatically (enforce_eager, load_format) but can be overridden in
+    the EngineArgs if needed.
     """
 
     def __init__(

@@ -14,6 +14,7 @@ V6D-aware simulation strategy (merged from feat/vllm-pai + V6D additions):
 import asyncio
 import dataclasses
 import threading
+import time
 
 import torch
 
@@ -228,7 +229,21 @@ class C_VLLMWorkerHook(BaseHook):
     @classmethod
     def hook(cls, target):
         # Cache imports at hook-install time
-        from vllm.v1.outputs import ModelRunnerOutput as _ModelRunnerOutput
+        from vllm.v1.outputs import (
+            AsyncModelRunnerOutput as _AsyncModelRunnerOutput,
+            ModelRunnerOutput as _ModelRunnerOutput,
+        )
+
+        class _SimAsyncOutput(_AsyncModelRunnerOutput):
+            """Defer a simulated GPU span to vLLM's async-output thread."""
+
+            def __init__(self, output, latency: float):
+                self._output = output
+                self._latency = latency
+
+            def get_output(self):
+                time.sleep(self._latency)
+                return self._output
 
         # Field set varies across vLLM versions; probe once at install time.
         _mro_fields = {f.name for f in dataclasses.fields(_ModelRunnerOutput)}
@@ -550,11 +565,31 @@ class C_VLLMWorkerHook(BaseHook):
                     )
 
             self._last_model_output = output
+            latency = getattr(scheduler_output, "_sim_full_step_latency", None)
+            scheduler_config = getattr(
+                getattr(self, "vllm_config", None), "scheduler_config", None
+            )
+            async_scheduling = bool(
+                getattr(scheduler_config, "async_scheduling", False)
+            )
+            self._last_sim_full_step_latency = (
+                latency if async_scheduling else None
+            )
+            if latency is not None and not async_scheduling:
+                # With no batch queue, UniProcExecutor resolves this async
+                # output synchronously. BLOCKING therefore retains its original
+                # serial behavior while still using the same worker-owned wait.
+                return _SimAsyncOutput(output, latency)
             return output
 
         def override_sample_tokens(self, grammar_output):
-            """Return the mock output built by execute_model."""
-            return self._last_model_output
+            """Defer BLOCKING GPU time when async scheduling is enabled."""
+            output = self._last_model_output
+            latency = getattr(self, "_last_sim_full_step_latency", None)
+            self._last_sim_full_step_latency = None
+            if latency is not None:
+                return _SimAsyncOutput(output, latency)
+            return output
 
         def override_take_draft_token_ids(self):
             """No draft tokens in simulation.

@@ -193,6 +193,26 @@ def _ext_computed_tokens(req_id) -> int:
         return 0
 
 
+def _finalize_step_stats(scheduler_output, event_time: float) -> None:
+    """Publish one step's stats when its model-output future is complete."""
+    if getattr(scheduler_output, "_sim_stats_finalized", False):
+        return
+    iteration_stat = getattr(scheduler_output, "_sim_iteration_stat", None)
+    if iteration_stat is None:
+        return
+    scheduler_output._sim_stats_finalized = True
+    C_VLLMEngineCoreHook.ITERATION_STATS.append(iteration_stat)
+
+    token_emitted = getattr(scheduler_output, "_sim_token_emitted", {})
+    for req_id in (getattr(scheduler_output, "num_scheduled_tokens", None) or {}):
+        if not token_emitted.get(req_id, True):
+            continue
+        st = request_stats_manager.stats.get(req_id)
+        if st is not None:
+            st.gen_token_latencies.append(event_time - st.last_event_time)
+            st.last_event_time = event_time
+
+
 class C_VLLMEngineCoreHook(BaseHook):
     """Hook EngineCore for created_time-based request dispatch.
 
@@ -219,9 +239,9 @@ class C_VLLMEngineCoreHook(BaseHook):
 
     # Per-request stats live in the shared request_stats_manager
     # (simulation/req_stats_manager.py), same as the SGLang backend.
-    # Appended by C_VLLMExecutorHook, one record per forward step.  Keep the
-    # schema aligned with the SGLang hook so step-level predictor validation
-    # can consume either backend.
+    # C_VLLMExecutorHook attaches one record per forward step; OFFLINE publishes
+    # it immediately, while BLOCKING publishes after the model-output future
+    # completes. Keep the schema aligned with the SGLang hook.
     ITERATION_STATS: list[dict] = []
 
     @classmethod
@@ -229,6 +249,9 @@ class C_VLLMEngineCoreHook(BaseHook):
         original_init = target.__init__
         original_add_request = target.add_request
         original_step = target.step
+        original_wait_model_output = getattr(
+            target, "_wait_model_output_future", None
+        )
         dispatcher = ReqDispatcher()
         dispatcher.original_core_add_request = original_add_request
 
@@ -321,14 +344,29 @@ class C_VLLMEngineCoreHook(BaseHook):
                         StateManager.get_global_clock(), dispatcher.next_req_created_time()))
             return result
 
+        def wrapped_wait_model_output(
+            self, model_output_future, step_sout, *args, **kwargs
+        ):
+            result = original_wait_model_output(
+                self, model_output_future, step_sout, *args, **kwargs
+            )
+            if cls.SIM_MODE == SimulationMode.BLOCKING:
+                # The future returned only after _SimAsyncOutput.get_output()
+                # has consumed the simulated GPU span. Use that real completion
+                # time instead of maintaining a projected GPU clock.
+                _finalize_step_stats(step_sout, time.time())
+            return result
+
         target.__init__ = wrapped_init
         target.add_request = wrapped_add_request
         target.step = wrapped_step
+        if original_wait_model_output is not None:
+            target._wait_model_output_future = wrapped_wait_model_output
 
         # EngineCore.profile doubles as the benchmark round separator: dump
         # request / iteration stats to SGLANG_SIMULATOR_OUTPUT_DIR and reset
-        # them, and (on round start) reset the local prefix cache so each
-        # round starts cold.  The hook framework applies only the first hook
+        # simulator-local accounting. Cache reset remains user-controlled via
+        # the native API. The hook framework applies only the first hook
         # matching a class, so the profile patch is merged here instead of
         # living in its own hook class on EngineCore.
         def wrapped_profile(self, is_start: bool = True):
@@ -377,10 +415,10 @@ class C_VLLMExecutorHook(BaseHook):
 
     EngineCore.step() runs the model at
     ``self.model_executor.execute_model(scheduler_output, non_block=True)``.
-    UniProcExecutor.collective_rpc executes the worker's method synchronously
-    and wraps the result in a resolved Future, so accounting the predicted
-    span here keeps the engine loop's timing identical to accounting inside
-    schedule() while placing it where real hardware would be busy.
+    The prediction remains at this executor seam. In BLOCKING mode its span is
+    attached to SchedulerOutput and consumed by the worker's asynchronous
+    sample output, keeping the EngineCore loop free to drive the connector. In
+    OFFLINE mode the same prediction advances the virtual clock directly.
 
     ExecutorWithExternalLauncher does not override execute_model, so it
     inherits the hooked method.  The module regex also covers forks that
@@ -506,13 +544,15 @@ class C_VLLMExecutorHook(BaseHook):
                 )
             scheduler_output._sim_token_emitted = token_emitted
 
-            result = original_execute_model(
-                self, scheduler_output, *args, **kwargs)
-
             if simulation_batch.is_empty():
-                return result
+                return original_execute_model(
+                    self, scheduler_output, *args, **kwargs)
 
             # --- Predict and account this step's GPU span ---
+            # Prediction deliberately happens before original_execute_model so
+            # BLOCKING can annotate scheduler_output before it reaches the
+            # worker.  The prediction depends only on scheduler output state,
+            # never on the model result, so this preserves the old semantics.
             StateManager.inc_iteration()
             predictor = C_VLLMEngineCoreHook.INFERENCE_PREDICTOR
             if predictor is not None:
@@ -556,16 +596,13 @@ class C_VLLMExecutorHook(BaseHook):
                 predicted_latency + sample_tokens_latency + logprobs_latency
             )
 
-            if C_VLLMEngineCoreHook.SIM_MODE == SimulationMode.BLOCKING:
-                # One-time engine cold start (CUDA graph capture / kernel
-                # JIT / first allocation). Measured on RTX PRO 6000: the
-                # first non-empty iter of each fresh server process runs
-                # ~1.4-1.5 s regardless of token count (6288 tok -> +1.48 s,
-                # 256 tok -> +1.38 s), while the predictor only models the
-                # per-token forward. Production pays this once per process
-                # and it delays the earliest requests' queueing; the sim
-                # never paid it, so its queue never built up. Env-gated:
-                # unset -> 0 -> behaviour unchanged.
+            is_blocking = (
+                C_VLLMEngineCoreHook.SIM_MODE == SimulationMode.BLOCKING
+            )
+            simulated_gpu_span = abs(full_step_latency)
+            if is_blocking:
+                # One-time engine cold start is part of the first deferred GPU
+                # span so it does not block the EngineCore loop either.
                 if not cls._COLD_START_DONE:
                     cls._COLD_START_DONE = True
                     cold_start = float(os.environ.get(
@@ -575,14 +612,39 @@ class C_VLLMExecutorHook(BaseHook):
                             "[sim-coldstart] one-time cold-start "
                             "overhead %.3f s on first non-empty iter",
                             cold_start)
-                        time.sleep(cold_start)
-                # BLOCKING: real wall clock. Engine-side per-step CPU
-                # overhead (schedule/update/dispatch/post_step) is
-                # naturally consumed by the real engine loop, so only the
-                # GPU span (RPC-1 + RPC-2 + logprobs term) is slept for.
-                time.sleep(abs(full_step_latency))
-                event_time = time.time()
-            else:
+                        simulated_gpu_span += cold_start
+
+                # SchedulerOutput is the native executor -> worker carrier.
+                # The worker consumes this in sample_tokens() and returns an
+                # AsyncModelRunnerOutput whose get_output() sleeps on vLLM's
+                # WorkerAsyncOutput thread.  Set it before the original call:
+                # that call already hands scheduler_output to the worker.
+                setattr(
+                    scheduler_output,
+                    "_sim_full_step_latency",
+                    simulated_gpu_span,
+                )
+
+            # Keep completion accounting attached to the same native object.
+            # BLOCKING publishes it from EngineCore._wait_model_output_future,
+            # after the actual async result returns; OFFLINE publishes below
+            # after advancing the virtual clock.
+            scheduler_output._sim_iteration_stat = {
+                "requests": simulation_batch.request_info(),
+                # RPC-1 only, matching the predictor's training label.
+                "forward_latency": predicted_latency,
+                "sample_tokens_latency": sample_tokens_latency,
+                "logprobs_latency": logprobs_latency,
+                "full_step_latency": full_step_latency,
+                "total_tokens": total_tokens,
+                "l2_load_latency": 0.0,
+                "l2_backup_latency": 0.0,
+            }
+
+            result = original_execute_model(
+                self, scheduler_output, *args, **kwargs)
+
+            if not is_blocking:
                 # OFFLINE: the virtual clock accumulates the full GPU span.
                 # Known diff vs real, deliberately NOT compensated: the
                 # engine residual (~2.5ms/step = RPC transfers +
@@ -594,39 +656,12 @@ class C_VLLMExecutorHook(BaseHook):
                 # item when interpreting results, not a bug.
                 StateManager.set_current_inference_dur(full_step_latency)
                 StateManager.step_global_clock(full_step_latency)
-                event_time = StateManager.get_global_clock()
-
-            C_VLLMEngineCoreHook.ITERATION_STATS.append(
-                {
-                    "requests": simulation_batch.request_info(),
-                    # RPC-1 only, matching the predictor's training label.
-                    "forward_latency": predicted_latency,
-                    "sample_tokens_latency": sample_tokens_latency,
-                    "logprobs_latency": logprobs_latency,
-                    "full_step_latency": full_step_latency,
-                    "total_tokens": total_tokens,
-                    "l2_load_latency": 0.0,
-                    "l2_backup_latency": 0.0,
-                }
-            )
-
-            # Record per-token latency for all scheduled requests
-            for req_id in num_scheduled_tokens:
-                # Intermediate chunked-prefill forwards do not emit a
-                # token.  Keep last_event_time unchanged so the first
-                # recorded latency is the complete TTFT across all
-                # prompt chunks, matching the SGLang hook semantics.
-                if not token_emitted.get(req_id, True):
-                    continue
-                st = request_stats_manager.stats.get(req_id)
-                if st is not None:
-                    st.gen_token_latencies.append(
-                        event_time - st.last_event_time
-                    )
-                    st.last_event_time = event_time
+                _finalize_step_stats(
+                    scheduler_output, StateManager.get_global_clock()
+                )
 
             return result
 
         target.execute_model = wrapped_execute_model
         logger.info("[vLLM Hijack] UniProcExecutor hook installed "
-                    "(simulated GPU span at execute_model)")
+                    "(GPU prediction at execute_model; BLOCKING span deferred)")

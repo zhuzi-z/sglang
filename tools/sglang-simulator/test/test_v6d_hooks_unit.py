@@ -666,6 +666,47 @@ class TestConnectorAdapters:
         assert Connector.bind_connector_metadata is original_bind
         assert Connector.request_finished_all_groups is original_finish
 
+    @pytest.mark.parametrize(
+        "mode,settle_calls,reap_calls", [
+            ("OFFLINE", 1, 1),
+            ("BLOCKING", 0, 2),
+        ]
+    )
+    def test_control_plane_barrier_is_offline_only(
+            self, controller, monkeypatch, mode, settle_calls, reap_calls):
+        from sglang_simulator.simulation.vllm.v6d.v6d_backend import (
+            C_HybridControlPlaneHook,
+        )
+
+        monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", mode)
+
+        class Hybrid:
+            def __init__(self):
+                self._backend = controller.backend
+                self._backend._sim_sync_prepare = True
+                self.loop = None
+
+            async def _on_add_req(self, req, blocks):
+                return None
+
+            def _step_waiting(self):
+                return "waiting"
+
+            def step(self):
+                return self._step_waiting()
+
+        C_HybridControlPlaneHook.hook(Hybrid)
+        hybrid = Hybrid()
+        control = hybrid._sim_controller
+        control.settle_preparations = MagicMock()
+        control.reap_preparations = MagicMock()
+        control.progress = MagicMock()
+
+        assert hybrid.step() == "waiting"
+        assert control.settle_preparations.call_count == settle_calls
+        assert control.reap_preparations.call_count == reap_calls
+        assert control.progress.call_count == 2
+
     def test_control_wait_rejects_its_own_loop(self, controller):
         import asyncio
         async def complete():
@@ -691,6 +732,8 @@ class TestEngineClockBoundary:
                 self.admitted.append((request.request_id, StateManager.get_global_clock()))
             def step(self):
                 return self.native_step()
+            def _wait_model_output_future(self, future, step_sout):
+                return future.result(), {}
 
         monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE")
         monkeypatch.setattr(StateManager, "_global_clock", 1.0)
@@ -805,16 +848,13 @@ class TestEngineClockBoundary:
         if transfer == "store":
             assert block.ref_cnt == 0
 
-    def test_round_end_resets_connector_before_clock_reset(self, monkeypatch, tmp_path):
-        seen = []
-        def reset_connector_cache():
-            seen.append(StateManager.get_global_clock())
-            return True
+    def test_profile_does_not_implicitly_reset_connector(self, monkeypatch, tmp_path):
+        reset_connector_cache = MagicMock()
         self.engine.scheduler.get_kv_connector = lambda: SimpleNamespace()
         self.engine.scheduler.reset_connector_cache = reset_connector_cache
         monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_DIR", str(tmp_path))
         self.engine.profile(False)
-        assert seen == [1.0]
+        reset_connector_cache.assert_not_called()
         assert StateManager.get_global_clock() == 0.0
 
     def test_blocking_step_never_polls_idle_work_or_advances_virtual_time(self, monkeypatch):
@@ -927,18 +967,30 @@ class TestEngineClockBoundary:
                                                num_computed_tokens=0, sampling_params=None)])
         with patch.object(pipeline.time, "sleep") as sleep:
             assert Executor().execute_model(output) is future
-            if mode == "BLOCKING" and tokens:
-                sleep.assert_called_once_with(0.5)
-            else:
-                sleep.assert_not_called()
-        assert calls == (["execute", "predict"] if tokens else ["execute"])
+            sleep.assert_not_called()
+        assert calls == (["predict", "execute"] if tokens else ["execute"])
+        if mode == "BLOCKING" and tokens:
+            assert output._sim_full_step_latency == pytest.approx(0.5)
+            # Completion accounting happens only after EngineCore has waited
+            # for the deferred model-output future.
+            assert pipeline.C_VLLMEngineCoreHook.ITERATION_STATS == []
+            completed = Future()
+            completed.set_result("model-output")
+            with patch.object(pipeline.time, "time", return_value=123.0):
+                assert self.engine._wait_model_output_future(
+                    completed, output
+                ) == ("model-output", {})
+            assert len(pipeline.C_VLLMEngineCoreHook.ITERATION_STATS) == 1
+        else:
+            assert not hasattr(output, "_sim_full_step_latency")
         future.result.assert_not_called()
         assert StateManager.get_global_clock() == (1.5 if tokens and mode == "OFFLINE" else 1.0)
 
+    @pytest.mark.parametrize("async_scheduling", [False, True])
     @pytest.mark.parametrize("mode", ["OFFLINE", "BLOCKING"])
     @pytest.mark.parametrize("tokens", [0, 4])
     def test_worker_lifecycle_leaves_transfer_progress_to_connector(
-            self, controller, monkeypatch, mode, tokens):
+            self, controller, monkeypatch, mode, tokens, async_scheduling):
         from sglang_simulator.simulation.vllm import engine_core_pipeline as pipeline
         from sglang_simulator.simulation.vllm.worker import C_VLLMWorkerHook
         from sglang_simulator.simulation.types import SimulationMode
@@ -969,12 +1021,16 @@ class TestEngineClockBoundary:
             pass
         C_VLLMWorkerHook.hook(Worker)
         worker = Worker()
+        worker.vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(async_scheduling=async_scheduling)
+        )
         class Executor:
             def execute_model(self, output):
                 result = worker.execute_model(output)
+                actual = getattr(result, "_output", result)
                 assert calls == [("bind", 1.0), ("load", 1.0),
                                  ("save", 1.0), ("clear", 1.0)]
-                assert result.kv_connector_output is not None
+                assert actual.kv_connector_output is not None
                 assert controller._stores == []
                 return result
         pipeline.C_VLLMExecutorHook.hook(Executor)
@@ -987,6 +1043,11 @@ class TestEngineClockBoundary:
                 patch.object(pipeline.time, "sleep") as sleep:
             sleep.side_effect = lambda duration: setattr(wall, "return_value", wall.return_value + duration)
             result = Executor().execute_model(output)
+            if mode == "BLOCKING" and tokens:
+                if async_scheduling:
+                    result = worker.sample_tokens(None).get_output()
+                else:
+                    result = result.get_output()
             end = 1.5 if tokens else 1.0
             assert controller.now() == end
             assert controller._stores == []
