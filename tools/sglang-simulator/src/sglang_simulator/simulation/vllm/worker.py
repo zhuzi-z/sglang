@@ -105,6 +105,29 @@ def _build_kv_cache_spec(vllm_config) -> dict:
         )
 
     block_size = cache_config.block_size
+    # Prefer the production physical block size injected via the hisim
+    # scheduler config ("physical_block_size"): the container-side alignment
+    # (kernel_block_alignment_size=64 without a CUTLASS_MLA backend) derives
+    # 1088 while production (128) derives 1152.  set_scheduler_config() only
+    # runs later in determine_available_memory, so read the raw config here.
+    # cache_config is updated in-place so downstream consumers (scheduler
+    # block-aligned split, mamba_block_size) stay consistent with the spec.
+    try:
+        _injected_block_size = (
+            ConfigManager._get_raw_config()
+            .get("scheduler", {})
+            .get("physical_block_size")
+        )
+    except Exception:
+        _injected_block_size = None
+    if _injected_block_size:
+        block_size = int(_injected_block_size)
+        cache_config.block_size = block_size
+        if getattr(cache_config, "mamba_block_size", None) is not None:
+            cache_config.mamba_block_size = block_size
+    # Pre-account the x(attn_pack_size) page growth applied by the fork's
+    # merge_attn_layers_into_pack (merged pack page = real_page * pack).
+    attn_pack_size = getattr(cache_config, "attn_pack_size", 1) or 1
     dtype = model_config.dtype
     if isinstance(dtype, str):
         dtype = getattr(torch, dtype)
@@ -138,15 +161,43 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     else:
         # Hybrid model: build per-layer specs with uniform page size.
         mamba_block_size = getattr(cache_config, "mamba_block_size", None)
-        if mamba_block_size is None:
+        if mamba_block_size is None or _injected_block_size:
             mamba_block_size = block_size
 
-        # Build MambaSpec
+        # Use the model's real mamba state shapes/dtypes (same call path the
+        # fork's MambaModelConfig uses) so v6d region accounting and the
+        # page_size_padded >= raw assertion track production; fall back to
+        # placeholders when the model class cannot be resolved here.
+        mamba_shapes = ((1, 1), (1, 1, 1))
+        mamba_dtypes = (dtype, dtype)
+        try:
+            try:
+                from vllm.model_executor.models import ModelRegistry
+            except ImportError:
+                from vllm.model_executor.models.registry import ModelRegistry
+            model_cls, _ = ModelRegistry.resolve_model_cls(
+                model_config.architecture, model_config=model_config
+            )
+            mamba_shapes = model_cls.get_mamba_state_shape_from_config(
+                vllm_config
+            )
+            mamba_dtypes = model_cls.get_mamba_state_dtype_from_config(
+                vllm_config
+            )
+        except Exception:
+            logger.warning(
+                "[V6D Hijack] failed to resolve real mamba state spec, "
+                "falling back to placeholder shapes/dtypes",
+                exc_info=True,
+            )
+
+        # Build MambaSpec.  page_size_padded pre-accounts the x(attn_pack_size)
+        # growth of the merged attention pack page so unify finds equal pages.
         mamba_kwargs = dict(
             block_size=mamba_block_size,
-            shapes=((1, 1), (1, 1, 1)),
-            dtypes=(dtype, dtype),
-            page_size_padded=attn_page_size,
+            shapes=mamba_shapes,
+            dtypes=mamba_dtypes,
+            page_size_padded=attn_page_size * attn_pack_size,
             mamba_cache_mode=getattr(cache_config, "mamba_cache_mode", "none"),
         )
         # Forward num_speculative_blocks (MTP/EAGLE) so light-mode runtime
@@ -208,9 +259,10 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     logger.info(
         "[V6D Hijack] Built KV cache spec: %d layers (incl. %d MTP draft), "
         "num_kv_heads=%d (total=%d, tp=%d), head_size=%d, block_size=%d, "
-        "page_size=%d bytes",
+        "page_size=%d bytes, mamba_page_padded=%d bytes, attn_pack_size=%d",
         len(kv_cache_spec), num_mtp_layers, num_kv_heads, total_num_kv_heads,
         tp_size, head_size, block_size, attn_page_size,
+        attn_page_size * attn_pack_size, attn_pack_size,
     )
     return kv_cache_spec
 
