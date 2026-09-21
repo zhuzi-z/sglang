@@ -1,0 +1,17 @@
+# 回归对账模板 B：L20B L1 0-32k bench5 五集（历史线 l1_new，2026-08-28 定稿）
+# MTP 基线：在用 hinge base=14.690 lo=0.0775us/tok hi=1.0093us/tok bp=9728
+#           （bench5 全量标定，MAPE 6.64%）；机理式 7.96% 不优 → auto 应裁决回退 hinge
+# 说明：node3_39af 是历史指定测试集，本管线统一 LODO，作为第 5 集参与训练与轮换留出
+task: l20b_l1_0-32k_bench5
+description: L20B L1 0-32k bench5 五集训练 + hinge 标定（回归模板）
+datasets:
+  - path: /workspace/l20b/l1_new/bench/trainset/node1_11b3/rank0.schedule_batch.jsonl
+    slowdown_factor: null   # 历史范围 sf1.0~2.0，逐集值未记录
+  - path: /workspace/l20b/l1_new/bench/trainset/node1_d0b0/rank0.schedule_batch.jsonl
+    slowdown_factor: null
+  - path: /workspace/l20b/l1_new/bench/trainset/node2_7f41_0a20/rank0.schedule_batch.jsonl
+    slowdown_factor: null
+  - path: /workspace/l20b/l1_new/bench/trainset/node2_e52f_0662/rank0.schedule_batch.jsonl
+    slowdown_factor: null
+  - path: /workspace/l20b/l1_new/bench/train_v3/testset/node3_39af_3cd8_1567/rank0.schedule_batch.jsonl
+    slowdown_factor: null

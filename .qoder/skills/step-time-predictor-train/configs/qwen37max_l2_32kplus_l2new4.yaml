@@ -1,0 +1,22 @@
+# qwen3.7-max L2 32k++ 分桶 新一轮压测（l2_new4，2026-09-20 采集，2026-09-21 训练）
+# 四实例同负载副本（同一 32k+ 合成数据集并行打流，1 个负载分布 × 4 pods）：
+#   LODO 4 折验证 pod 泛化；最终 held-out 需补第二负载形态（J4 警告）
+# bucket=[32768,1048576] 请求级过滤（32k++ 闭区间；~99.5% 请求在域内）
+# 数据性质：命中富集（L1 ~67% / L2 ~11% tok 命中率）、全程饱和、prefill-only
+# sf：用户指定填 null（服务端推断 sf≈2 未获 bench 端确认，仅作背景元数据不入配置）
+task: qwen37max-l2-32kplus-l2new4-20260921
+description: qwen3.7-max L2 32k++分桶 新一轮压测（l2_new4 四实例 命中富集）训练 + MTP 标定
+bucket: [32768, 1048576]
+datasets:
+  - path: /workspace/l20b/l2_new4/inst1/engine0/rank0.schedule_batch.jsonl
+    tag: inst1   # 显式 tag：父目录均为 engine0，缺省会撞名导致 LODO 折互相覆盖
+    slowdown_factor: null
+  - path: /workspace/l20b/l2_new4/inst2/engine0/rank0.schedule_batch.jsonl
+    tag: inst2
+    slowdown_factor: null
+  - path: /workspace/l20b/l2_new4/inst3/engine0/rank0.schedule_batch.jsonl
+    tag: inst3
+    slowdown_factor: null
+  - path: /workspace/l20b/l2_new4/inst4/engine0/rank0.schedule_batch.jsonl
+    tag: inst4
+    slowdown_factor: null

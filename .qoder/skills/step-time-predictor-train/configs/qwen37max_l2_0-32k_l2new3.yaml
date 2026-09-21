@@ -1,0 +1,19 @@
+# qwen3.7-max L2 0-32k 分桶 新一轮压测（l2_new3，2026-09-18 采集，2026-09-21 训练）
+# 三实例同负载副本（同一合成数据集并行打流，1 个负载分布 × 3 pods）：
+#   LODO 3 折验证 pod 泛化；最终 held-out 需补第二负载形态（J4 警告）
+# bucket=[0,32768] 请求级过滤（配套 rank0.requests.jsonl 齐备）
+# 数据性质：nocache 工况（L1/L2 token 命中率 ≈0）；prefill-only（output=1）
+# sf：用户指定填 null（服务端推断 sf≈8 未获 bench 端确认，仅作背景元数据不入配置）
+task: qwen37max-l2-0-32k-l2new3-20260920
+description: qwen3.7-max L2 0-32k分桶 新一轮压测（l2_new3 三实例 nocache）训练 + MTP 标定
+bucket: [0, 32768]
+datasets:
+  - path: /workspace/l20b/l2_new3/instance-2nd/engine0/rank0.schedule_batch.jsonl
+    tag: instance-2nd   # 显式 tag：父目录均为 engine0，缺省会撞名导致 LODO 折互相覆盖
+    slowdown_factor: null
+  - path: /workspace/l20b/l2_new3/instance-3rd/engine0/rank0.schedule_batch.jsonl
+    tag: instance-3rd
+    slowdown_factor: null
+  - path: /workspace/l20b/l2_new3/instance-4th/engine0/rank0.schedule_batch.jsonl
+    tag: instance-4th
+    slowdown_factor: null

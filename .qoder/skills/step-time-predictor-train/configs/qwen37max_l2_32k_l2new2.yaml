@@ -1,0 +1,18 @@
+# 回归对账模板 A：qwen3.7-max L2 32k 负载阶梯（历史线 l2_new2，2026-09-01 定稿）
+# 历史基线：全量 R²=0.9970 MAPE=1.63%；LODO held-out MAPE 1.81~2.12%
+# MTP 基线：机理式 nnls 五集统一 base=5.043 a=0.9813 b=6.6792（n=49258，R²=0.9091，MAPE 5.61%）
+task: qwen37max_l2_32k_l2new2
+description: qwen3.7-max L2 32k 负载阶梯四集训练 + 五集 MTP 机理式标定（回归模板）
+datasets:
+  - path: /workspace/l20b/l2_new2/trainset/node1_c3e2/rank0.schedule_batch.jsonl
+    slowdown_factor: 5.0
+  - path: /workspace/l20b/l2_new2/trainset/node1_07bc/rank0.schedule_batch.jsonl
+    slowdown_factor: 4.0
+  - path: /workspace/l20b/l2_new2/trainset/node1_4890/rank0.schedule_batch.jsonl
+    slowdown_factor: 3.0
+  - path: /workspace/l20b/l2_new2/trainset/node1_9931/rank0.schedule_batch.jsonl
+    slowdown_factor: 2.0
+  # 历史线中该集仅参与 MTP 标定（stages: [mtp]），不进训练
+  - path: /workspace/l20b/l2_new2/trainset/node2_9b42_8f6a/rank0.schedule_batch.jsonl
+    slowdown_factor: null   # 慢放集，具体 sf 未记录
+    stages: [mtp]
