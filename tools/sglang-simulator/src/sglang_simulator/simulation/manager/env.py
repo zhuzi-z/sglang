@@ -55,3 +55,17 @@ class Envs:
     def num_warmup(cls) -> int:
         # The number of warmup requests.
         return int(os.getenv("SGLANG_SIMULATOR_NUM_WARMUP", "0"))
+
+    @classmethod
+    def record_raw_request(cls) -> bool:
+        # Record raw input_ids/output_ids on RequestStats (vllm scheduler
+        # hook) so the dumped request.jsonl can be joined back to the
+        # original trace by content. Off by default: the per-step output
+        # copy in the schedule hot path is quadratic in output length.
+        # When off, both keys are stripped from request.jsonl entirely.
+        return os.environ.get("VLLM_SIMULATOR_RECORD_RAW_REQUEST", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )

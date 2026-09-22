@@ -136,6 +136,12 @@ def init_hook():
         # model_executor.execute_model, the engine's real execution seam)
         engine_core_pipeline.C_VLLMSchedulerHook,
         engine_core_pipeline.C_VLLMExecutorHook,
+        # EngineCore init hook: bootstraps the hybrid engine_proxy globals
+        # (_g_core/_g_sched_loop/_g_sched_rpc_serv) for the in-process
+        # engine path (OFFLINE sync LLM) via the real engine_proxy.core_init;
+        # no-op when EngineCoreProc's own _core_init already ran (async
+        # engine / BLOCKING).
+        engine_core_pipeline.C_VLLMEngineCoreHook,
         # Profile hook — exports request / iteration stats on
         # /start_profile & /stop_profile (EngineCore.profile)
         profile_hook.C_VLLMProfileHook,
