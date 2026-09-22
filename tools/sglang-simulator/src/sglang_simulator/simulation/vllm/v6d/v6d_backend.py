@@ -131,10 +131,46 @@ class C_HybridConnectorHook(BaseHook):
             _bw = BandwidthModel.get()
             _now = time.perf_counter()
             _pending = getattr(self, "_sim_pending_store", {})
+            # reqs_to_store value arity depends on the engine baseline:
+            #   nightly_20260724_1ab8ff0e: (groups_data, is_last_save)
+            #   release_20260827_c9032a29: (groups_data, is_last_save,
+            #                               create_batch_id)
+            # create_batch_id only names the pre-submitted async CREATE batch
+            # for the real data plane (async_swap(create_batch_id=...)), which
+            # the sim replaces with a CPU no-op, so it carries no meaning here
+            # -- the engine's own sync start_store_kv discards it as well.
+            # Index positionally rather than unpacking a fixed arity: a future
+            # trailing field must not disable store/save-done modelling again
+            # (that silently stalls the engine -- no save-done means v6d
+            # objects are never sealed and protected blocks never released).
+            _store_entries = tuple(reqs_to_store.items())
+            if _store_entries and not getattr(
+                    self, "_sim_store_arity_logged", False):
+                _entry0 = _store_entries[0][1]
+                if not isinstance(_entry0, (tuple, list)):
+                    raise TypeError(
+                        "[V6D Hijack] reqs_to_store entry is "
+                        f"{type(_entry0).__name__}, expected a sequence "
+                        "(groups_data, is_last_save[, create_batch_id])"
+                    )
+                _arity = len(_entry0)
+                if _arity < 2:
+                    raise ValueError(
+                        "[V6D Hijack] reqs_to_store entry arity "
+                        f"{_arity} < 2: engine metadata contract changed, "
+                        "cannot model store completion / save-done"
+                    )
+                logger.info(
+                    "[V6D Hijack] reqs_to_store entry arity=%d "
+                    "(groups_data, is_last_save%s), indexing positionally",
+                    _arity,
+                    ", create_batch_id" if _arity == 3 else (
+                        f", +{_arity - 2} trailing fields" if _arity > 3
+                        else ""),
+                )
+                self._sim_store_arity_logged = True
             save_done_reqs = {
-                req_id
-                for req_id, (_groups_data, is_last_save) in reqs_to_store.items()
-                if is_last_save
+                req_id for req_id, _entry in _store_entries if _entry[1]
             }
             if save_done_reqs:
                 from vllm.v1.hybrid_connector import sched_get_req
