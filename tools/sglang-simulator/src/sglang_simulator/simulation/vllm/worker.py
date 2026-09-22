@@ -209,6 +209,15 @@ def _build_kv_cache_spec(vllm_config) -> dict:
         # (task29: prefix-cache hit ratio overestimated by up to +10.3pp on
         # node1_0047).
         _mamba_fields = {f.name for f in dataclasses.fields(MambaSpec)}
+        if "state_align_size" in _mamba_fields:
+            # light_flex: GDN layers export recurrent state only at FLA chunk
+            # boundaries (64); other modes leave it at the spec default and
+            # MambaSpec only validates the value under light_flex.
+            mamba_kwargs["state_align_size"] = (
+                64
+                if mamba_kwargs["mamba_cache_mode"] == "light_flex"
+                else 1
+            )
         if "num_speculative_blocks" in _mamba_fields:
             spec_cfg = getattr(vllm_config, "speculative_config", None)
             num_spec_tokens = (
