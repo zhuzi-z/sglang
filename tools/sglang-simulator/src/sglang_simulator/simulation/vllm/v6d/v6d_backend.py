@@ -92,7 +92,46 @@ class SimulatedKVController:
                 state = self.hybrid._saving.get(rid)
                 if state is not None:
                     self._aborted_stores[rid] = state._req
-        for rid, (groups, last) in stores.items():
+        # reqs_to_store value arity depends on the engine baseline:
+        #   nightly_20260724_1ab8ff0e: (groups_data, is_last_save)
+        #   release_20260827_c9032a29: (groups_data, is_last_save,
+        #                               create_batch_id)
+        # create_batch_id only names the pre-submitted async CREATE batch
+        # for the real data plane (async_swap(create_batch_id=...)), which
+        # the sim replaces with a CPU no-op, so it carries no meaning here
+        # -- the engine's own sync start_store_kv discards it as well.
+        # Index positionally rather than unpacking a fixed arity: a future
+        # trailing field must not disable store/save-done modelling again
+        # (that silently stalls the engine -- no save-done means v6d
+        # objects are never sealed and protected blocks never released).
+        _store_entries = tuple(stores.items())
+        if _store_entries and not getattr(
+                self, "_sim_store_arity_logged", False):
+            _entry0 = _store_entries[0][1]
+            if not isinstance(_entry0, (tuple, list)):
+                raise TypeError(
+                    "[V6D Hijack] reqs_to_store entry is "
+                    f"{type(_entry0).__name__}, expected a sequence "
+                    "(groups_data, is_last_save[, create_batch_id])"
+                )
+            _arity = len(_entry0)
+            if _arity < 2:
+                raise ValueError(
+                    "[V6D Hijack] reqs_to_store entry arity "
+                    f"{_arity} < 2: engine metadata contract changed, "
+                    "cannot model store completion / save-done"
+                )
+            logger.info(
+                "[V6D Hijack] reqs_to_store entry arity=%d "
+                "(groups_data, is_last_save%s), indexing positionally",
+                _arity,
+                ", create_batch_id" if _arity == 3 else (
+                    f", +{_arity - 2} trailing fields" if _arity > 3
+                    else ""),
+            )
+            self._sim_store_arity_logged = True
+        for rid, _entry in _store_entries:
+            groups, last = _entry[0], _entry[1]
             state = self.hybrid._saving.get(rid)
             if state is None:
                 raise RuntimeError(f"Store request {rid} is missing")
