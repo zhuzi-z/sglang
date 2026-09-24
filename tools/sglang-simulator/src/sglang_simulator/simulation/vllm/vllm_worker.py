@@ -1,48 +1,53 @@
 """
-vLLM Worker - High-level worker class that wraps vLLM's LLM engine
+vLLM Worker - High-level worker class that wraps vLLM's AsyncLLM engine
 for use in the simulation benchmark framework.
 
 Similar to SGLangWorker, this class:
 1. Installs hooks before importing vLLM
-2. Creates an LLM instance with hijacked backend
+2. Creates an AsyncLLM instance with hijacked backend
 3. Provides generate()/async_generate() interface compatible with BaseWorker
-4. Supports MultiInstanceBenchmarkRunner via native enqueue/wait_for_completion API
+4. Supports MultiInstanceBenchmarkRunner via per-request async streaming
+
+AsyncLLM runs the EngineCore in a background process (EngineCoreProc), so
+connectors that need an engine-side runtime (e.g. HybridConnector's
+engine_proxy.core_init) initialize natively there.  Per-request / iteration
+stats are recorded by the child-process hooks, exported to
+SGLANG_SIMULATOR_OUTPUT_DIR by the profile hook on each round boundary
+(trigger_simulation), and loaded back from disk by get_*_stats().
 """
 
 import asyncio
-import dataclasses
+import json
 import os
-from concurrent.futures import ThreadPoolExecutor
+import uuid
 
 from sglang_simulator.dataset import GenericRequest
 from sglang_simulator.simulation.benchmark import BaseWorker
-from sglang_simulator.simulation.manager import StateManager
-from sglang_simulator.simulation.req_stats_manager import request_stats_manager
-from sglang_simulator.utils import get_logger
 from sglang_simulator.simulation.vllm.startup import init_hook
+from sglang_simulator.utils import get_logger
 
 # Environment must be set before vllm import
-os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
 
 init_hook()
 
-from vllm import LLM, SamplingParams  # noqa: E402
-from vllm.engine.arg_utils import EngineArgs  # noqa: E402
+from vllm import SamplingParams  # noqa: E402
+from vllm.engine.arg_utils import AsyncEngineArgs  # noqa: E402
+from vllm.v1.engine.async_llm import AsyncLLM  # noqa: E402
 
-# Hook modules are imported only after init_hook(): by then they are already
-# loaded by the hook installation sequence, and any future transitive
-# dependency can never precede hook installation.
-from sglang_simulator.simulation.vllm.engine_core_pipeline import C_VLLMSchedulerHook  # noqa: E402
+# AsyncLLM.from_engine_args requires AsyncEngineArgs (adds enable_log_requests
+# etc.); it is an EngineArgs subclass accepting the same fields, so re-export
+# it under the old name to keep callers unchanged.
+EngineArgs = AsyncEngineArgs
 
 logger = get_logger("sglang_simulator")
 
 
-# Simulation-fixed defaults applied to EngineArgs
+# Simulation-fixed defaults applied to EngineArgs. async_scheduling remains
+# user-controlled; BLOCKING supports both synchronous and asynchronous modes.
 _SIMULATION_DEFAULTS = {
     "enforce_eager": True,
     "load_format": "dummy",
-    "async_scheduling": False,
 }
 
 
@@ -61,8 +66,8 @@ class VLLMWorker(BaseWorker):
     """High-level vLLM worker for simulation benchmarks.
 
     Accepts a vLLM EngineArgs directly. Simulation-fixed defaults are applied
-    automatically (enforce_eager, load_format, enable_prefix_caching) but can
-    be overridden in the EngineArgs if needed.
+    automatically (enforce_eager, load_format) but can be overridden in
+    the EngineArgs if needed.
     """
 
     def __init__(
@@ -72,61 +77,35 @@ class VLLMWorker(BaseWorker):
     ):
         super().__init__(name)
 
+        # The engine-core child inherits this at spawn time; its profile hook
+        # dumps request/iteration stats here.  setdefault so an explicit
+        # SGLANG_SIMULATOR_OUTPUT_DIR from the environment wins.
+        os.environ.setdefault(
+            "SGLANG_SIMULATOR_OUTPUT_DIR", f"/tmp/sglang_simulator/{name}"
+        )
+        self.output_dir = os.path.realpath(os.environ["SGLANG_SIMULATOR_OUTPUT_DIR"])
+
         # Apply simulation defaults for fields still at their EngineArgs default
         for field_name, sim_default in _SIMULATION_DEFAULTS.items():
             current = getattr(engine_args, field_name)
-            ea_default = getattr(EngineArgs, field_name, None)
+            ea_default = getattr(AsyncEngineArgs, field_name, None)
             if current == ea_default:
                 setattr(engine_args, field_name, sim_default)
 
-        self._llm = LLM(
-            **{
-                f.name: getattr(engine_args, f.name)
-                for f in dataclasses.fields(engine_args)
-            }
-        )
+        # Construction is safe outside a running event loop: AsyncLLM defers
+        # its output handler to the first generate() call.
+        self._llm = AsyncLLM.from_engine_args(engine_args)
         logger.info("[VLLMWorker] Initialized with model=%s", engine_args.model)
 
-        # Detect API availability: newer vLLM has enqueue/wait_for_completion
-        self._has_enqueue_api = hasattr(self._llm, "enqueue")
-
-        # Async state
-        self._completed_reqs: list[tuple[GenericRequest, object]] = []
-        self._executor = ThreadPoolExecutor(max_workers=1)
-        # Batch coordination for async_generate
-        self._enqueue_count = 0
-        self._batch_outputs: list = []
-        self._batch_processed = False
-        self._batch_lock = asyncio.Lock()
-        # For generate()-based fallback: collect prompts/params
-        self._batch_prompts: list = []
-        self._batch_sampling_params: list = []
+        # trigger_simulation alternates start/stop profile (round boundaries)
+        self._profile_is_start = True
 
     # ------------------------------------------------------------------
     # Async interface (for MultiInstanceBenchmarkRunner)
-    # Supports both enqueue/wait_for_completion (v0.23+) and generate() fallback
     # ------------------------------------------------------------------
 
-    async def trigger_simulation(self, output_dir: str | None = None):
-        """Reset batch coordination state between benchmark rounds.
-
-        Request and iteration statistics are collected directly by the
-        scheduler hook.  Do not call ``LLM.start_profile()`` here: this method
-        is invoked at both boundaries of a benchmark round, and the offline
-        dummy engine intentionally has no CUDA profiler configured.
-        """
-        self._enqueue_count = 0
-        self._batch_outputs = []
-        self._batch_processed = False
-        self._batch_prompts = []
-        self._batch_sampling_params = []
-
-    async def pause_generation(self):
-        """Called at the start of each benchmark round; clear previous stats."""
-        self._completed_reqs = []
-
     async def async_generate(self, req: GenericRequest):
-        """Enqueue a request and coordinate batch processing."""
+        """Stream a single request through the engine; returns the final output."""
         # Pass simulation metadata (created_time) via extra_args
         extra_args = None
         if req.custom_params:
@@ -143,128 +122,73 @@ class VLLMWorker(BaseWorker):
         )
         prompt = _resolve_prompt(req)
 
-        if self._has_enqueue_api:
-            # Newer vLLM: enqueue() is sync & fast, adds to engine queue
-            self._llm.enqueue(prompt, sp)
+        final_output = None
+        async for output in self._llm.generate(
+            prompt, sp, request_id=uuid.uuid4().hex
+        ):
+            final_output = output
+        return final_output
+
+    async def trigger_simulation(self, output_dir: str | None = None):
+        """Round separator: profile() in the engine-core child dumps
+        request/iteration stats to SGLANG_SIMULATOR_OUTPUT_DIR and resets
+        them (is_start=True additionally resets the local prefix cache)."""
+        if self._profile_is_start:
+            await self._llm.start_profile()
         else:
-            # Older vLLM: collect for batch generate()
-            self._batch_prompts.append(prompt)
-            self._batch_sampling_params.append(sp)
+            await self._llm.stop_profile()
+        self._profile_is_start = not self._profile_is_start
 
-        my_index = self._enqueue_count
-        self._enqueue_count += 1
-
-        # Yield to let all other concurrent tasks enqueue first
-        await asyncio.sleep(0)
-
-        # First task to acquire lock triggers batch processing
-        async with self._batch_lock:
-            if not self._batch_processed:
-                loop = asyncio.get_running_loop()
-                if self._has_enqueue_api:
-                    self._batch_outputs = await loop.run_in_executor(
-                        self._executor,
-                        lambda: self._llm.wait_for_completion(use_tqdm=True),
-                    )
-                else:
-                    # Fallback: use generate() with collected batch
-                    prompts = self._batch_prompts
-                    params = self._batch_sampling_params
-                    self._batch_outputs = await loop.run_in_executor(
-                        self._executor,
-                        lambda: self._llm.generate(prompts, params, use_tqdm=True),
-                    )
-                self._batch_processed = True
-
-        output = self._batch_outputs[my_index]
-        self._completed_reqs.append((req, output))
-        return output
+    async def pause_generation(self):
+        pass
 
     async def continue_generation(self):
         pass
 
     # ------------------------------------------------------------------
-    # Stats interface
+    # Stats interface (loaded back from the child-process dump)
     # ------------------------------------------------------------------
 
+    def _load_jsonl(self, filename: str) -> list[dict]:
+        data = []
+        file_path = os.path.join(self.output_dir, filename)
+        if os.path.exists(file_path):
+            with open(file_path) as f:
+                for line in f:
+                    if line.strip():
+                        data.append(json.loads(line))
+        else:
+            logger.error(f"The statistics data({file_path}) does not exist.")
+        return data
+
     def get_request_stats(self) -> list[dict]:
-        """Build per-request stats from scheduler-tracked data."""
-        stats = []
-        for req, output in self._completed_reqs:
-            input_len = len(req.token_ids) if req.token_ids else 0
-            output_len = len(output.outputs[0].token_ids) if output.outputs else 0
-
-            # Look up per-request stats recorded by the scheduler hook
-            req_id = output.request_id
-            tracked = request_stats_manager.stats.get(req_id)
-
-            if tracked:
-                gen_token_latencies = tracked.gen_token_latencies
-                created_time = tracked.created_time
-                queue_start = tracked.queue_start
-                queue_end = tracked.queue_end
-                last_event_time = tracked.last_event_time
-                final_device_hit_len = tracked.final_device_hit_len
-                local_kv_hit_len = tracked.local_kv_hit_len
-                ext_kv_hit_len = tracked.ext_kv_hit_len
-                final_host_hit_len = tracked.final_host_hit_len
-            else:
-                # Fallback for non-simulation requests
-                gen_token_latencies = [0.001] * max(1, output_len)
-                created_time = 0.0
-                queue_start = 0.0
-                queue_end = 0.0
-                last_event_time = sum(gen_token_latencies)
-                final_device_hit_len = 0
-                local_kv_hit_len = 0
-                ext_kv_hit_len = 0
-                final_host_hit_len = 0
-
-            stats.append(
-                {
-                    "gen_token_latencies": gen_token_latencies,
-                    "created_time": created_time,
-                    "queue_start": queue_start,
-                    "queue_end": queue_end,
-                    "last_event_time": last_event_time,
-                    "input_length": input_len,
-                    "output_length": output_len,
-                    "final_device_hit_len": final_device_hit_len,
-                    "local_kv_hit_len": local_kv_hit_len,
-                    "ext_kv_hit_len": ext_kv_hit_len,
-                    "final_host_hit_len": final_host_hit_len,
-                    "final_storage_hit_len": 0,
-                }
-            )
-        return stats
-
-    def reset_stats(self):
-        """Reset per-request stats for the next benchmark round."""
-        request_stats_manager.reset()
-        C_VLLMSchedulerHook.ITERATION_STATS.clear()
-        # Reset global simulation state (global_clock, iteration counter, etc.)
-        # to prevent state leakage across consecutive benchmark runs.
-        StateManager.reset()
+        return self._load_jsonl("request.jsonl")
 
     def get_iteration_stats(self) -> list[dict]:
-        """Return per-iteration stats collected by the scheduler hook."""
-        return list(C_VLLMSchedulerHook.ITERATION_STATS)
+        return self._load_jsonl("iteration.jsonl")
+
+    def reset_stats(self):
+        """No-op: stats live in the engine-core child and are reset by the
+        profile hook at each round boundary (trigger_simulation)."""
+        pass
 
     # ------------------------------------------------------------------
     # Sync interface
     # ------------------------------------------------------------------
 
     def generate(self, req: GenericRequest):
-        """Generate output for a single request (sync)."""
-        sp = SamplingParams(max_tokens=req.output_length, ignore_eos=True)
-        outputs = self._llm.generate([_resolve_prompt(req)], [sp])
-        return outputs[0]
+        """Generate output for a single request (sync).
+
+        Only safe as the first generate entrypoint on this worker: AsyncLLM
+        binds its output handler to the loop of the first generate() call.
+        """
+        return asyncio.run(self.async_generate(req))
 
     def flush_cache(self):
         """Not yet supported for vLLM simulation."""
         pass
 
     def shutdown(self):
-        """Shutdown the vLLM engine."""
-        self._executor.shutdown(wait=False)
+        """Shutdown the vLLM engine and its background process."""
+        self._llm.shutdown()
         logger.info("[VLLMWorker] Shutting down.")

@@ -17,6 +17,51 @@ from types import SimpleNamespace
 import torch
 import pytest
 
+from sglang_simulator.simulation.manager import StateManager
+from sglang_simulator.simulation.vllm.v6d.v6d_backend import SimulatedKVController
+
+
+def make_controller():
+    from collections import defaultdict
+    from vllm.v1.core.block_pool import BlockPool
+
+    cache = SimpleNamespace(_block_pool=BlockPool(8, True, 4224),
+                            _swap_protected_blocks=defaultdict(list), mamba_group_ids={0})
+    cache._release_protected_blocks = lambda rid: cache._block_pool.free_blocks(
+        cache._swap_protected_blocks.pop(rid, []))
+    req = SimpleNamespace(request_id="r", is_finished=lambda: True)
+    hybrid = SimpleNamespace(_backend=SimpleNamespace(_scheduler=cache),
+                             _saving={"r": SimpleNamespace(_req=req)},
+                             _saved=[], _loaded=[], pending_requests=[],
+                             _step_saved=MagicMock(), loop=None, _tp_size=lambda: 2)
+    return SimulatedKVController(hybrid)
+
+
+@pytest.fixture
+def controller(monkeypatch):
+    from sglang_simulator.simulation.vllm.v6d.bandwidth import BandwidthModel
+
+    monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE")
+    monkeypatch.setattr(StateManager, "_global_clock", 0.0)
+    monkeypatch.setattr(BandwidthModel, "get", lambda: SimpleNamespace(
+        enabled=True, store_completion_latency=lambda n: 0.5 if n else 0.0,
+        latency_for=lambda n, load: 0.5 if n else 0.0, seg1_latency=lambda n: 0.0))
+    return make_controller()
+
+
+def store_meta(controller, last=False, empty=False):
+    groups = {}
+    block = None
+    if not empty:
+        block = controller.cache._block_pool.get_new_blocks(1)[0]
+        block.ref_cnt += 1
+        controller.cache._swap_protected_blocks["r"].append(block)
+        groups = {0: (["hash"], [block.block_id])}
+    meta = SimpleNamespace(reqs=SimpleNamespace(v6d=SimpleNamespace(
+        inner=SimpleNamespace(reqs_to_store={"r": (groups, last)}))))
+    return meta, block
+
+
 # Ensure hooks are importable
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
@@ -325,156 +370,774 @@ class TestPlatformHookAdditions:
 #  docs/v6d_mamba_block_leak_hang_report.md)
 # ============================================================
 
-class TestHybridConnectorLeakFix:
-    """Verify save completion travels the REAL production channel.
+class TestLocalKVController:
+    @pytest.mark.parametrize("mode", ["OFFLINE", "BLOCKING"])
+    def test_store_waits_for_compute_then_copy(self, controller, monkeypatch, mode):
+        monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", mode)
+        with patch("sglang_simulator.simulation.vllm.v6d.v6d_backend.time.perf_counter",
+                   return_value=0.0) as wall, patch.object(controller, "_store_done") as done:
+            meta, block = store_meta(controller, last=True)
+            controller.capture_stores(meta)
+            controller.cache._block_pool.free_blocks([block])
+            assert controller._stores == []
+            assert block.ref_cnt == 1
+            StateManager.set_global_clock(2.0)
+            wall.return_value = 2.0
+            controller.progress()
+            assert controller.next_wakeup() == 2.5
+            for _ in range(3):
+                controller.progress()
+            assert controller.next_wakeup() == 2.5
+            if mode == "OFFLINE":
+                wall.return_value = 100.0
+            else:
+                StateManager.set_global_clock(100.0)
+            controller.progress()
+            done.assert_not_called()
+            StateManager.set_global_clock(2.5)
+            wall.return_value = 2.5
+            controller.progress()
+            done.assert_called_once()
+            assert block.ref_cnt == 0
+            assert not controller.has_pending()
 
-    In hybrid mode the v6d save-done is signalled via the worker's
-    _SAVE_DONE_REQ RPC (simulated by mark_backend_save_done), which drives
-    _do_save_done -> _saved/_try_teardown_save + async_cleanup (seal v6d
-    objects + release mamba protected blocks).  It does NOT travel via
-    kv_connector_output.finished_sending / update_connector_output —
-    both are upstream no-ops for hybrid and must stay untouched.
+    def test_completed_chunk_does_not_release_new_chunk(self, controller):
+        meta, first = store_meta(controller)
+        controller.capture_stores(meta)
+        controller.cache._block_pool.free_blocks([first])
+        controller.progress()
+        StateManager.set_global_clock(0.25)
+        meta, second = store_meta(controller, last=True)
+        controller.capture_stores(meta)
+        controller.cache._block_pool.free_blocks([second])
+        controller.progress()
+        with patch.object(controller, "_store_done") as done:
+            StateManager.set_global_clock(0.5)
+            controller.progress()
+            assert (first.ref_cnt, second.ref_cnt) == (0, 1)
+            done.assert_not_called()
+            StateManager.set_global_clock(1.0)
+            controller.progress()
+            done.assert_called_once()
+            assert second.ref_cnt == 0
 
-    1. bind_connector_metadata resolves reqs_to_store through the
-       v6d_object+kvt combo nesting (meta.reqs.v6d.inner.reqs_to_store)
-       and fires mark_backend_save_done for last-save events.
-    2. Non-last saves do not signal (v6d save_count=1 semantics).
-    3. BandwidthModel.store_completion_latency defers the signal to
-       model the real async save latency (max(DMA, poll) + rank_sync).
-    4. get_finished never reports store reqs; update_connector_output and
-       request_finished_all_groups are left untouched (fidelity).
-    """
+    def test_empty_last_marker_waits_for_prior_copy(self, controller):
+        meta, _block = store_meta(controller)
+        controller.capture_stores(meta)
+        controller.progress()
+        StateManager.set_global_clock(0.1)
+        meta, _ = store_meta(controller, last=True, empty=True)
+        controller.capture_stores(meta)
+        with patch.object(controller, "_store_done") as done:
+            controller.progress()
+            done.assert_not_called()
+            StateManager.set_global_clock(0.5)
+            controller.progress()
+            controller.progress()
+            done.assert_called_once()
 
-    def _make_hooked_connector_cls(self):
+    def test_abort_cleanup_cannot_release_staged_or_inflight_pins(self, controller):
+        meta, block = store_meta(controller)
+        controller.capture_stores(meta)
+        controller.cache._block_pool.free_blocks([block])
+        controller.cache._release_protected_blocks("r")
+        assert block.ref_cnt == 1
+        controller.progress()
+        controller.cache._release_protected_blocks("r")
+        assert block.ref_cnt == 1
+        StateManager.set_global_clock(0.5)
+        controller.progress()
+        assert block.ref_cnt == 0
+
+    def test_long_prefill_with_tiny_pool(self, controller):
+        pool = controller.cache._block_pool
+        with patch.object(controller, "_store_done") as done:
+            for chunk in range(256):
+                meta, block = store_meta(controller, last=chunk == 255)
+                controller.capture_stores(meta)
+                pool.free_blocks([block])
+                StateManager.step_global_clock(1.0)
+                controller.progress()
+                done.assert_not_called()
+            controller.reset()
+            done.assert_called_once_with(
+                controller.hybrid._saving["r"]._req, failed=True)
+        assert pool.get_num_free_blocks() == 7
+        assert not controller.has_pending()
+        controller.hybrid._step_saved.assert_called_once()
+
+    def test_load_deadline_is_not_spent_twice(self, controller):
+        req = SimpleNamespace(request_id="load")
+        groups = {0: (["key"], [1])}
+        controller.queue_load(req, 4224, groups)
+        StateManager.set_global_clock(0.25)
+        controller.queue_load(req, 4224, groups)
+        with patch.object(controller, "_load_done") as done:
+            for _ in range(3):
+                controller.progress()
+            done.assert_not_called()
+            assert controller.next_wakeup() == 0.5
+            StateManager.set_global_clock(0.5)
+            controller.progress()
+            controller.progress()
+            done.assert_called_once_with("load", 4224)
+
+    @pytest.mark.parametrize("last", [False, True])
+    @pytest.mark.parametrize("started", [False, True])
+    def test_abort_waits_for_copies_and_reports_failure_once(self, controller, last, started):
+        meta, block = store_meta(controller, last=last)
+        controller.capture_stores(meta)
+        controller.cache._block_pool.free_blocks([block])
+        if started:
+            controller.progress()
+        abort = SimpleNamespace(reqs=SimpleNamespace(v6d=SimpleNamespace(
+            aborted_save_ids=["r"], inner=None)))
+        controller.capture_stores(abort)
+        controller.capture_stores(abort)
+        with patch.object(controller, "_store_done") as done:
+            controller.progress()
+            done.assert_not_called()
+            assert block.ref_cnt == 1
+            assert controller.next_wakeup() == 0.5
+            StateManager.set_global_clock(0.5)
+            controller.progress()
+            controller.progress()
+            done.assert_called_once_with(controller.hybrid._saving["r"]._req, failed=True)
+        assert block.ref_cnt == 0
+        assert not controller.has_pending()
+
+    def test_reset_fails_unfinished_saves_and_releases_pins(self, controller):
+        controller.capture_stores(SimpleNamespace(aborted_save_ids=["r", "missing"]))
+        assert controller.has_pending()
+        assert controller.next_wakeup() == 0.0
+        with patch.object(controller, "_store_done") as done:
+            controller.reset()
+            done.assert_called_once_with(controller.hybrid._saving["r"]._req, failed=True)
+        assert not controller.has_pending()
+        assert StateManager.get_global_clock() == 0.0
+
+    def test_reset_refused_while_requests_active(self, controller):
+        meta, block = store_meta(controller, last=True)
+        controller.capture_stores(meta)
+        controller.cache._block_pool.free_blocks([block])
+        controller.hybrid._saving["r"]._req.is_finished = lambda: False
+        with patch.object(controller, "_store_done") as done:
+            assert not controller.reset()
+            done.assert_not_called()
+        assert controller.has_pending()
+        assert block.ref_cnt == 1
+
+    def test_controllers_do_not_share_state(self, controller):
+        second = make_controller()
+        meta, _ = store_meta(controller)
+        controller.capture_stores(meta)
+        assert controller.has_pending()
+        assert not second.has_pending()
+        assert second.backend._sim_controller is second
+
+    @pytest.mark.parametrize("failed", [False, True])
+    def test_native_source_rank_acknowledgements(self, controller, failed):
+        import asyncio
+        calls = []
+        async def save(rank, ret):
+            calls.append((rank, ret.reqid, ret.source, ret.n))
+        controller.hybrid._do_save_done = save
+        with patch.object(controller, "_run_control", side_effect=asyncio.run), \
+                patch("vllm.v1.hybrid_connector.get_param", return_value=("v6d_object", "kvt")):
+            controller._store_done(SimpleNamespace(request_id="r"), failed=failed)
+        n = 0 if failed else None
+        assert calls == [(0, "r", "v6d_object", n), (1, "r", "v6d_object", n),
+                         (0, "r", "kvt", n), (1, "r", "kvt", n)]
+
+
+class TestConnectorAdapters:
+    def test_worker_clear_and_bypass_do_not_publish_completion(self):
         from sglang_simulator.simulation.vllm.v6d.v6d_backend import (
-            C_HybridConnectorHook,
+            C_HybridConnectorHook, C_V6dObjectBackendHook,
         )
+        class Backend:
+            def clear_backend_metadata(self):
+                raise AssertionError("worker must not launch stores")
+            def bypass_bind(self, metadata):
+                raise AssertionError("worker must not schedule abort timers")
+        class Connector:
+            pass
+        C_V6dObjectBackendHook.hook(Backend)
+        C_HybridConnectorHook.hook(Connector)
+        backend = Backend()
+        metadata = SimpleNamespace(aborted_save_ids=["r"])
+        backend._bound_meta = metadata
+        backend.bypass_bind(metadata)
+        assert backend._bound_meta is metadata
+        worker = SimpleNamespace(_meta=metadata)
+        def clear():
+            backend.clear_backend_metadata()
+            worker._meta = None
+        worker.clear_connector_metadata = clear
+        connector = Connector()
+        connector._worker = worker
+        connector.clear_connector_metadata()
+        assert worker._meta is None
+        assert backend._bound_meta is None
 
-        class FakeHybridConnector:
+    @pytest.mark.parametrize("tokens,result", [(0, None), (16, "fallback"), (16, None)])
+    def test_backend_load_adapter(self, controller, tokens, result):
+        import asyncio
+        from sglang_simulator.simulation.vllm.v6d.v6d_backend import C_V6dObjectBackendHook
+        class Backend:
+            def __init__(self):
+                self._scheduler = SimpleNamespace(_reqs_to_load={"r": {0: (["key"], [1])}})
+                self._sim_controller = controller
+            async def async_update_state_after_alloc(self, request, blocks, n):
+                return result
+        C_V6dObjectBackendHook.hook(Backend)
+        backend = Backend()
+        assert asyncio.run(backend.async_update_state_after_alloc(
+            SimpleNamespace(request_id="r"), None, tokens)) == result
+        assert controller.has_pending() == (tokens > 0 and result is None)
+        async def worker_load():
+            return [ret async for ret in backend.async_load_kv(None)]
+        assert asyncio.run(worker_load()) == []
+
+    @pytest.mark.parametrize("failure", [False, True])
+    def test_preparation_joins_control_without_waiting_for_transfer(self, controller, failure):
+        import asyncio
+        import threading
+        from sglang_simulator.simulation.vllm.v6d.v6d_backend import C_HybridControlPlaneHook
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever)
+        thread.start()
+        class Hybrid:
+            def __init__(self):
+                self._backend = controller.backend
+                self._backend._sim_sync_prepare = True
+                self.loop = loop
+            async def _on_add_req(self, req, blocks):
+                await asyncio.sleep(0.01)
+                if failure:
+                    raise ValueError("lookup failed")
+                self._sim_controller.queue_load(req, 4224, {0: (["key"], [1])})
+            def _step_waiting(self):
+                self.task = asyncio.run_coroutine_threadsafe(
+                    self._on_add_req(SimpleNamespace(request_id="r"), None), loop)
+            def step(self):
+                self._step_waiting()
+        C_HybridControlPlaneHook.hook(Hybrid)
+        hybrid = Hybrid()
+        try:
+            if failure:
+                with pytest.raises(ValueError, match="lookup failed"):
+                    hybrid.step()
+                with pytest.raises(ValueError, match="lookup failed"):
+                    hybrid.task.result(timeout=1)
+            else:
+                hybrid.step()
+                assert hybrid._sim_controller.next_wakeup() == 0.5
+                assert StateManager.get_global_clock() == 0.0
+                hybrid.task.result(timeout=1)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=1)
+            loop.close()
+
+    def test_connector_build_captures_stores_and_keeps_native_finish(self, controller):
+        from sglang_simulator.simulation.vllm.v6d.v6d_backend import C_HybridConnectorHook
+        metadata, _block = store_meta(controller)
+        class Connector:
+            def build_connector_meta(self, output):
+                return metadata
+            def has_requests(self):
+                return False
             def bind_connector_metadata(self, metadata):
+                self.meta = metadata
+            def request_finished_all_groups(self, req, blocks):
+                return False, None
+        original_bind = Connector.bind_connector_metadata
+        original_finish = Connector.request_finished_all_groups
+        C_HybridConnectorHook.hook(Connector)
+        connector = Connector()
+        connector._sched = SimpleNamespace(_sim_controller=controller)
+        output = SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req_id="r")])
+        assert connector.build_connector_meta(output) is metadata
+        assert not hasattr(output, "_sim_external_computed_tokens")
+        assert connector.has_requests()
+        assert not hasattr(connector, "simulation_next_wakeup")
+        assert connector.get_finished(set()) == (set(), set())
+        assert Connector.bind_connector_metadata is original_bind
+        assert Connector.request_finished_all_groups is original_finish
+
+    @pytest.mark.parametrize(
+        "mode,settle_calls,reap_calls", [
+            ("OFFLINE", 1, 1),
+            ("BLOCKING", 0, 2),
+        ]
+    )
+    def test_control_plane_barrier_is_offline_only(
+            self, controller, monkeypatch, mode, settle_calls, reap_calls):
+        from sglang_simulator.simulation.vllm.v6d.v6d_backend import (
+            C_HybridControlPlaneHook,
+        )
+
+        monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", mode)
+
+        class Hybrid:
+            def __init__(self):
+                self._backend = controller.backend
+                self._backend._sim_sync_prepare = True
+                self.loop = None
+
+            async def _on_add_req(self, req, blocks):
+                return None
+
+            def _step_waiting(self):
+                return "waiting"
+
+            def step(self):
+                return self._step_waiting()
+
+        C_HybridControlPlaneHook.hook(Hybrid)
+        hybrid = Hybrid()
+        control = hybrid._sim_controller
+        control.settle_preparations = MagicMock()
+        control.reap_preparations = MagicMock()
+        control.progress = MagicMock()
+
+        assert hybrid.step() == "waiting"
+        assert control.settle_preparations.call_count == settle_calls
+        assert control.reap_preparations.call_count == reap_calls
+        assert control.progress.call_count == 2
+
+    def test_control_wait_rejects_its_own_loop(self, controller):
+        import asyncio
+        async def complete():
+            return None
+        async def attempt():
+            controller.hybrid.loop = asyncio.get_running_loop()
+            with pytest.raises(RuntimeError, match="current connector loop"):
+                controller._run_control(complete())
+        asyncio.run(attempt())
+
+
+class TestEngineClockBoundary:
+    @pytest.fixture(autouse=True)
+    def engine(self, monkeypatch):
+        from sglang_simulator.simulation.manager import StateManager
+        from sglang_simulator.simulation.vllm import engine_core_pipeline as pipeline
+        from sglang_simulator.simulation.types import SimulationMode
+
+        class Engine:
+            def __init__(self):
                 pass
+            def add_request(self, request, request_wave=0):
+                self.admitted.append((request.request_id, StateManager.get_global_clock()))
+            def step(self):
+                return self.native_step()
+            def _wait_model_output_future(self, future, step_sout):
+                return future.result(), {}
 
-            def clear_connector_metadata(self):
-                pass
+        monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE")
+        monkeypatch.setattr(StateManager, "_global_clock", 1.0)
+        monkeypatch.setattr(pipeline.ReqDispatcher, "_instance", None)
+        monkeypatch.setattr(pipeline.ReqDispatcher, "_initialized", False)
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "SIM_MODE", SimulationMode.OFFLINE)
+        pipeline.C_VLLMEngineCoreHook.hook(Engine)
+        self.engine = object.__new__(Engine)
+        self.engine.admitted = []
+        self.engine.native_step = lambda: ({}, False, None)
+        self.dispatcher = pipeline.ReqDispatcher()
+        self.dispatcher.all_received = True
+        self.active_requests = 0
+        # Public work counts include parked arrivals via C_VLLMSchedulerHook.
+        # No waiting/running queues or backend implementation are exposed.
+        self.engine.scheduler = SimpleNamespace(
+            get_kv_connector=lambda: None,
+            get_num_unfinished_requests=lambda: self.active_requests + len(self.dispatcher))
+        monkeypatch.setattr(StateManager, "_current_inference_dur", 0.0)
+        monkeypatch.setattr(StateManager, "_last_inference_dur", 0.0)
+        self.state = StateManager
 
-            def request_finished_all_groups(self, request, block_ids):
-                return False, {"kv_transfer_pending": True}
+    def park(self, when):
+        req = SimpleNamespace(request_id=f"future-{when}", prompt_token_ids=[1])
+        self.dispatcher.add(self.engine, req, 0, when)
 
-        C_HybridConnectorHook.hook(FakeHybridConnector)
-        return FakeHybridConnector
+    @pytest.mark.parametrize("owner", ["scheduler", "connector", "connector_loading"])
+    def test_pending_work_advances_fixed_tick(self, owner):
+        if owner == "scheduler":
+            self.active_requests = 1
+        else:
+            connector = SimpleNamespace(has_requests=lambda: owner == "connector",
+                                        pending_requests=[object()] if owner == "connector_loading" else [])
+            self.engine.scheduler.get_kv_connector = lambda: connector
+        self.engine.step()
+        assert StateManager.get_global_clock() == pytest.approx(1.005)
+        assert StateManager.get_current_inference_dur() == 0.005
 
-    def _make_kvt_combo_meta(self, reqs_to_store):
-        # Mirrors HybridMetadata -> V6dObjectKVTMeta -> V6dObjectBackendMeta
-        # -> V6dObjectConnectorMetadata nesting for backend "v6d_object+kvt".
-        inner = SimpleNamespace(reqs_to_store=reqs_to_store, reqs_to_load={})
-        v6d = SimpleNamespace(inner=inner)
-        return SimpleNamespace(reqs=SimpleNamespace(v6d=v6d, kvt=None))
+    def test_pending_work_does_not_jump_to_distant_arrival(self):
+        self.park(100.0)
+        self.engine.scheduler.get_kv_connector = lambda: SimpleNamespace(has_requests=lambda: True)
+        self.engine.step()
+        assert StateManager.get_global_clock() == pytest.approx(1.005)
+        assert self.engine.admitted == []
 
-    def _attach_nested_scheduler(self, connector):
-        scheduler = MagicMock()
-        backend = SimpleNamespace(_v6d=SimpleNamespace(_scheduler=scheduler))
-        connector._sched = SimpleNamespace(_backend=backend)
-        return scheduler
+    def test_arrival_within_tick_is_dispatched_on_next_pass(self):
+        self.park(1.003)
+        self.active_requests = 1
+        self.engine.step()
+        self.engine.step()
+        assert self.engine.admitted[0][0] == "future-1.003"
+        assert self.engine.admitted[0][1] == pytest.approx(1.005)
 
-    def _patch_save_done(self, requests):
-        # bind_connector_metadata imports mark_backend_save_done and
-        # sched_get_req from vllm.v1.hybrid_connector at call time.
-        mark = patch("vllm.v1.hybrid_connector.mark_backend_save_done")
-        get_req = patch("vllm.v1.hybrid_connector.sched_get_req",
-                        side_effect=lambda rid: requests.get(rid))
-        return mark, get_req
+    def test_no_pending_work_does_not_tick(self):
+        self.engine.step()
+        assert StateManager.get_global_clock() == 1.0
+        assert StateManager.get_current_inference_dur() == 0.0
 
-    def test_last_save_fires_save_done_via_real_channel(self):
-        cls = self._make_hooked_connector_cls()
-        connector = cls()
-        req = SimpleNamespace(request_id="req-1")
-        meta = self._make_kvt_combo_meta(
-            {"req-1": ({0: (["hash_0"], [19])}, True)}   # is_last_save=True
+    def test_future_only_replay_waits_until_all_received(self):
+        self.park(100.0)
+        self.dispatcher.all_received = False
+        self.engine.step()
+        assert StateManager.get_global_clock() == 1.0
+
+    def test_no_connector_idle_replay_advances_to_arrival(self):
+        self.park(3.0)
+        self.engine.step()
+        self.engine.step()
+        assert self.engine.admitted == [("future-3.0", 3.0)]
+
+    def test_model_execution_does_not_poll_pending_work_or_tick(self):
+        get_connector = MagicMock(side_effect=AssertionError("unexpected idle poll"))
+        self.engine.scheduler.get_kv_connector = get_connector
+        self.engine.native_step = lambda: ({}, True, None)
+        self.engine.step()
+        get_connector.assert_not_called()
+        assert StateManager.get_global_clock() == 1.0
+        assert StateManager.get_current_inference_dur() == 0.0
+
+    @pytest.mark.parametrize("transfer", ["load", "store"])
+    def test_idle_ticks_publish_transfer_only_after_ready_time(self, controller, monkeypatch, transfer):
+        from sglang_simulator.simulation.vllm.v6d.bandwidth import BandwidthModel
+
+        monkeypatch.setattr(BandwidthModel, "get", lambda: SimpleNamespace(
+            latency_for=lambda n, load: 0.012, seg1_latency=lambda n: 0.0,
+            store_completion_latency=lambda n: 0.012))
+        StateManager.set_global_clock(1.0)
+        if transfer == "load":
+            controller.queue_load(SimpleNamespace(request_id="r"), 4224, {0: (["key"], [1])})
+            method = "_load_done"
+        else:
+            metadata, block = store_meta(controller, last=True)
+            controller.capture_stores(metadata)
+            controller.cache._block_pool.free_blocks([block])
+            method = "_store_done"
+        # The engine sees only a native has_requests interface, not a deadline.
+        self.engine.scheduler.get_kv_connector = lambda: SimpleNamespace(
+            has_requests=controller.has_pending)
+        def native_step():
+            controller.progress()
+            return {}, False, None
+        self.engine.native_step = native_step
+        with patch.object(controller, method) as done:
+            for _ in range(3):
+                self.engine.step()
+                done.assert_not_called()
+            assert StateManager.get_global_clock() == pytest.approx(1.015)
+            self.engine.step()
+            done.assert_called_once()
+        assert not controller.has_pending()
+        assert StateManager.get_global_clock() == pytest.approx(1.015)
+        if transfer == "store":
+            assert block.ref_cnt == 0
+
+    def test_profile_does_not_implicitly_reset_connector(self, monkeypatch, tmp_path):
+        reset_connector_cache = MagicMock()
+        self.engine.scheduler.get_kv_connector = lambda: SimpleNamespace()
+        self.engine.scheduler.reset_connector_cache = reset_connector_cache
+        monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_DIR", str(tmp_path))
+        self.engine.profile(False)
+        reset_connector_cache.assert_not_called()
+        assert StateManager.get_global_clock() == 0.0
+
+    def test_blocking_step_never_polls_idle_work_or_advances_virtual_time(self, monkeypatch):
+        from sglang_simulator.simulation.vllm import engine_core_pipeline as pipeline
+        from sglang_simulator.simulation.types import SimulationMode
+
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "SIM_MODE", SimulationMode.BLOCKING)
+        get_connector = MagicMock(side_effect=AssertionError("BLOCKING polled idle work"))
+        self.engine.scheduler.get_kv_connector = get_connector
+        self.active_requests = 1
+        self.park(2.0)
+        assert self.engine.step() == ({}, False, None)
+        get_connector.assert_not_called()
+        assert StateManager.get_global_clock() == 1.0
+        assert StateManager.get_current_inference_dur() == 0.0
+        assert self.engine.admitted == []
+
+    @pytest.mark.parametrize("is_start", [False, True])
+    def test_blocking_profile_does_not_reset_connector(self, monkeypatch, tmp_path, is_start):
+        from sglang_simulator.simulation.vllm import engine_core_pipeline as pipeline
+        from sglang_simulator.simulation.types import SimulationMode
+
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "SIM_MODE", SimulationMode.BLOCKING)
+        reset = MagicMock(side_effect=AssertionError("BLOCKING profile reset connector"))
+        self.engine.scheduler.get_kv_connector = lambda: SimpleNamespace()
+        self.engine.scheduler.reset_connector_cache = reset
+        monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_DIR", str(tmp_path))
+        self.engine.profile(is_start)
+        reset.assert_not_called()
+
+    def test_blocking_transfer_deadline_survives_profile_reset(self, controller, monkeypatch, tmp_path):
+        from sglang_simulator.simulation.vllm import engine_core_pipeline as pipeline
+        from sglang_simulator.simulation.types import SimulationMode
+
+        monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", "BLOCKING")
+        monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_DIR", str(tmp_path))
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "SIM_MODE", SimulationMode.BLOCKING)
+        self.engine.scheduler.get_kv_connector = lambda: SimpleNamespace(
+            reset_cache=controller.reset)
+        self.engine.scheduler.reset_connector_cache = MagicMock(
+            side_effect=AssertionError("BLOCKING profile reset connector"))
+        with patch("sglang_simulator.simulation.vllm.v6d.v6d_backend.time.perf_counter",
+                   return_value=1.0) as wall, patch.object(controller, "_load_done") as done:
+            controller.queue_load(SimpleNamespace(request_id="load"), 4224, {0: (["key"], [1])})
+            self.engine.profile(False)
+            assert StateManager.get_global_clock() == 0.0
+            assert controller.next_wakeup() == 1.5
+            wall.return_value = 1.49
+            controller.progress()
+            done.assert_not_called()
+            wall.return_value = 1.5
+            controller.progress()
+            done.assert_called_once_with("load", 4224)
+        assert not controller.has_pending()
+
+    def test_executor_preserves_timing_and_existing_hit_statistics(self, monkeypatch):
+        from sglang_simulator.simulation.vllm import engine_core_pipeline as pipeline
+        from sglang_simulator.simulation.req_stats_manager import request_stats_manager
+
+        class Executor:
+            def execute_model(self, output):
+                assert not hasattr(output, "_sim_step_duration")
+                assert StateManager.get_global_clock() == 1.0
+                assert output._sim_token_emitted == {"r": True}
+                return "native-output"
+        predictor = SimpleNamespace(predict_infer_time=lambda batch: 1.0,
+                                    predict_sample_tokens_time=lambda tokens: 0.25)
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "INFERENCE_PREDICTOR", predictor)
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "ITERATION_STATS", [])
+        monkeypatch.setattr(request_stats_manager, "stats", {})
+        req = SimpleNamespace(request_id="r", prompt_token_ids=[1] * 16)
+        st = pipeline._new_request_stats(req, 0.0, 0.0, 0.0)
+        output = SimpleNamespace(
+            num_scheduled_tokens={"r": 4}, finished_req_ids=set(),
+            scheduled_new_reqs=[SimpleNamespace(
+                req_id="r", prompt_token_ids=req.prompt_token_ids,
+                num_computed_tokens=12, sampling_params=SimpleNamespace(max_tokens=1))])
+        monkeypatch.setattr(pipeline, "_ext_computed_tokens", lambda rid: 8)
+        pipeline.C_VLLMExecutorHook.hook(Executor)
+        assert Executor().execute_model(output) == "native-output"
+        assert StateManager.get_global_clock() == 2.25
+        assert (st.ext_kv_hit_len, st.local_kv_hit_len) == (8, 4)
+
+    @pytest.mark.parametrize("tokens", [0, 4])
+    @pytest.mark.parametrize("mode", ["OFFLINE", "BLOCKING"])
+    def test_executor_preserves_worker_future_and_execution_order(self, monkeypatch, tokens, mode):
+        from concurrent.futures import Future
+        from sglang_simulator.simulation.vllm import engine_core_pipeline as pipeline
+        from sglang_simulator.simulation.types import SimulationMode
+
+        calls = []
+        worker_future = Future()
+        worker_future.set_result("model-output")
+        class Executor:
+            # Fake executor with no scheduler_config -> async_scheduling reads
+            # False, exercising the P-side (non-async) deferred-future path.
+            def execute_model(self, output):
+                calls.append("execute")
+                return worker_future
+        def predict(batch):
+            calls.append("predict")
+            return 0.5
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "SIM_MODE", SimulationMode(mode))
+        monkeypatch.setattr(pipeline.C_VLLMExecutorHook, "_COLD_START_DONE", True)
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "INFERENCE_PREDICTOR", SimpleNamespace(
+            predict_infer_time=predict))
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "ITERATION_STATS", [])
+        pipeline.C_VLLMExecutorHook.hook(Executor)
+        output = SimpleNamespace(
+            num_scheduled_tokens={"r": tokens} if tokens else {},
+            scheduled_new_reqs=[SimpleNamespace(req_id="r", prompt_token_ids=[1] * tokens,
+                                               num_computed_tokens=0, sampling_params=None)])
+        with patch.object(pipeline.time, "sleep") as sleep:
+            returned = Executor().execute_model(output)
+            if not tokens:
+                # Empty sim batch: native passthrough, no accounting/deferral.
+                assert returned is worker_future
+                assert calls == ["execute"]
+                sleep.assert_not_called()
+                assert StateManager.get_global_clock() == 1.0
+                return
+            # Prediction runs before the original call in both modes.
+            assert calls == ["predict", "execute"]
+            # Non-async path never annotates the worker-side latency carrier.
+            assert not hasattr(output, "_sim_full_step_latency")
+            if mode == "OFFLINE":
+                # Synchronous virtual-clock path returns the worker future as-is.
+                assert returned is worker_future
+                sleep.assert_not_called()
+                assert StateManager.get_global_clock() == 1.5
+                assert len(pipeline.C_VLLMEngineCoreHook.ITERATION_STATS) == 1
+                return
+            # BLOCKING (async off): a NEW deferred future is returned; the span
+            # is slept on the sim GPU pool and stats publish only after it.
+            assert returned is not worker_future
+            assert isinstance(returned, Future)
+            assert returned.result(timeout=5) == "model-output"
+            sleep.assert_called_once_with(pytest.approx(0.5))
+            assert len(pipeline.C_VLLMEngineCoreHook.ITERATION_STATS) == 1
+            assert StateManager.get_global_clock() == 1.0
+
+    @pytest.mark.parametrize("async_scheduling", [False, True])
+    @pytest.mark.parametrize("mode", ["OFFLINE", "BLOCKING"])
+    @pytest.mark.parametrize("tokens", [0, 4])
+    def test_worker_lifecycle_leaves_transfer_progress_to_connector(
+            self, controller, monkeypatch, mode, tokens, async_scheduling):
+        from sglang_simulator.simulation.vllm import engine_core_pipeline as pipeline
+        from sglang_simulator.simulation.vllm.worker import C_VLLMWorkerHook
+        from sglang_simulator.simulation.types import SimulationMode
+        import vllm.distributed.kv_transfer as transfer
+
+        monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", mode)
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "SIM_MODE", SimulationMode(mode))
+        monkeypatch.setattr(pipeline.C_VLLMExecutorHook, "_COLD_START_DONE", True)
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "ITERATION_STATS", [])
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "INFERENCE_PREDICTOR", SimpleNamespace(
+            predict_infer_time=lambda batch: 0.5))
+        StateManager.set_global_clock(1.0)
+        metadata, block = store_meta(controller, last=True)
+        controller.capture_stores(metadata)
+        controller.cache._block_pool.free_blocks([block])
+        calls = []
+        def record(phase):
+            calls.append((phase, controller.now()))
+        connector = SimpleNamespace(
+            bind_connector_metadata=lambda metadata: record("bind"),
+            start_load_kv=lambda context: record("load"),
+            wait_for_save=lambda: record("save"),
+            get_finished=lambda ids: (set(), set()),
+            clear_connector_metadata=lambda: record("clear"))
+        monkeypatch.setattr(transfer, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(transfer, "get_kv_transfer_group", lambda: connector)
+        class Worker:
+            pass
+        C_VLLMWorkerHook.hook(Worker)
+        worker = Worker()
+        worker.vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(async_scheduling=async_scheduling)
         )
+        class Executor:
+            # Real UniProcExecutor exposes scheduler_config; mirror it so the
+            # executor-side async_scheduling read matches the worker-side.
+            scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
+            def execute_model(self, output):
+                result = worker.execute_model(output)
+                actual = getattr(result, "_output", result)
+                assert calls == [("bind", 1.0), ("load", 1.0),
+                                 ("save", 1.0), ("clear", 1.0)]
+                assert actual.kv_connector_output is not None
+                assert controller._stores == []
+                return result
+        pipeline.C_VLLMExecutorHook.hook(Executor)
+        new_reqs = [SimpleNamespace(req_id="r", prompt_token_ids=[1] * tokens,
+                                   num_computed_tokens=0, sampling_params=None)] if tokens else []
+        output = SimpleNamespace(num_scheduled_tokens={"r": tokens} if tokens else {},
+                                 scheduled_new_reqs=new_reqs, kv_connector_metadata=object())
+        with patch("sglang_simulator.simulation.vllm.v6d.v6d_backend.time.perf_counter",
+                   return_value=1.0) as wall, \
+                patch.object(pipeline.time, "sleep") as sleep:
+            sleep.side_effect = lambda duration: setattr(wall, "return_value", wall.return_value + duration)
+            result = Executor().execute_model(output)
+            if mode == "BLOCKING" and tokens:
+                if async_scheduling:
+                    result = worker.sample_tokens(None).get_output()
+                else:
+                    # Non-async path returns a deferred future; the span sleep
+                    # runs on the sim GPU pool. Block on it to synchronize.
+                    result = result.result(timeout=5)
+            end = 1.5 if tokens else 1.0
+            assert controller.now() == end
+            assert controller._stores == []
+            controller.progress()
+            assert controller.next_wakeup() == end + 0.5
+            assert block.ref_cnt == 1
+            with patch.object(controller, "_store_done") as done:
+                StateManager.set_global_clock(end + 0.5)
+                wall.return_value = end + 0.5
+                controller.progress()
+                done.assert_called_once()
+            assert block.ref_cnt == 0
+        assert calls == [("bind", 1.0), ("load", 1.0), ("save", 1.0), ("clear", 1.0)]
+        assert result.kv_connector_output is not None
+        assert not hasattr(output, "_sim_step_duration")
+        assert not hasattr(connector, "_sim_step_duration")
+        if mode == "BLOCKING":
+            assert sleep.call_count == int(bool(tokens))
 
-        mark, get_req = self._patch_save_done({"req-1": req})
-        with mark as mark_mock, get_req:
-            connector.bind_connector_metadata(meta)
+    def test_inference_scheduler_hook_only_changes_counts(self):
+        from sglang_simulator.simulation.vllm.engine_core_pipeline import C_VLLMSchedulerHook
 
-        mark_mock.assert_called_once_with(req)
-        # Fidelity: save completion must NOT surface as finished_sending
-        store, _ = connector.get_finished(set())
-        assert store == set()
+        class Scheduler:
+            def schedule(self):
+                return "native"
+            def update_from_output(self):
+                return "native"
+            def get_num_unfinished_requests(self):
+                return 0
+            def has_unfinished_requests(self):
+                return False
+        original = dict(Scheduler.__dict__)
+        C_VLLMSchedulerHook.hook(Scheduler)
+        changed = {key for key, value in Scheduler.__dict__.items()
+                   if value is not original.get(key)}
+        assert changed == {"get_num_unfinished_requests", "has_unfinished_requests"}
+        self.park(2.0)
+        assert Scheduler().get_num_unfinished_requests() == 1
+        assert Scheduler().has_unfinished_requests()
 
-    def test_intermediate_save_does_not_signal(self):
-        cls = self._make_hooked_connector_cls()
-        connector = cls()
-        req = SimpleNamespace(request_id="req-1")
-        meta = self._make_kvt_combo_meta(
-            {"req-1": ({0: (["hash_0"], [19])}, False)}  # is_last_save=False
-        )
 
-        mark, get_req = self._patch_save_done({"req-1": req})
-        with mark as mark_mock, get_req:
-            connector.bind_connector_metadata(meta)
+class TestChunkStoreReferenceOwnership:
+    def test_abort_cleanup_cannot_release_event_owned_references(self, controller):
+        scheduler = controller.cache
+        pool = scheduler._block_pool
+        meta, first = store_meta(controller)
+        controller.capture_stores(meta)
+        _, second = store_meta(controller)
+        pool.free_blocks([first, second])  # Scheduler drops its own references.
+        scheduler._release_protected_blocks("r")  # Abort on the async thread.
+        assert first.ref_cnt == 1
+        assert second.ref_cnt == 0
+        assert pool.get_num_free_blocks() == 6
+        controller.progress()
+        StateManager.set_global_clock(0.5)
+        controller.progress()
+        scheduler._release_protected_blocks("r")
+        assert pool.get_num_free_blocks() == 7
 
-        mark_mock.assert_not_called()
-
-    def test_noop_empty_last_save_still_signals(self):
-        cls = self._make_hooked_connector_cls()
-        connector = cls()
-        req = SimpleNamespace(request_id="req-1")
-        # Empty groups_data marks the noop last save — must still signal
-        meta = self._make_kvt_combo_meta({"req-1": ({}, True)})
-
-        mark, get_req = self._patch_save_done({"req-1": req})
-        with mark as mark_mock, get_req:
-            connector.bind_connector_metadata(meta)
-
-        mark_mock.assert_called_once_with(req)
-
-    def test_save_done_delay_defers_signal(self):
-        cls = self._make_hooked_connector_cls()
-        connector = cls()
-        req = SimpleNamespace(request_id="req-1")
-        meta = self._make_kvt_combo_meta(
-            {"req-1": ({0: (["hash_0"], [19])}, True)}
-        )
-
-        mark, get_req = self._patch_save_done({"req-1": req})
-        _bw_mock = MagicMock()
-        _bw_mock.store_completion_latency.return_value = 0.05  # 50ms
-        with mark as mark_mock, get_req, \
-                patch(
-                    "sglang_simulator.simulation.vllm.v6d.v6d_backend"
-                    ".BandwidthModel.get",
-                    return_value=_bw_mock,
-                ):
-            connector.bind_connector_metadata(meta)
-            # Not fired yet: models the in-flight async save holding
-            # block protection for the save duration
-            mark_mock.assert_not_called()
-
-            import time as _time
-            _time.sleep(0.08)
-            mark_mock.assert_called_once_with(req)
-
-    def test_update_connector_output_left_untouched(self):
-        """Fidelity: upstream HybridConnector has no update_connector_output
-        (base no-op); the hook must not add one."""
-        cls = self._make_hooked_connector_cls()
-        assert "update_connector_output" not in cls.__dict__
-
-    def test_request_finished_left_untouched(self):
-        """Fidelity: upstream has no finish-time release; the hook must
-        preserve the original request_finished_all_groups untouched (the
-        finish-time safety net is expected to be fixed upstream)."""
-        cls = self._make_hooked_connector_cls()
-        connector = cls()
-        scheduler = self._attach_nested_scheduler(connector)
-
-        request = SimpleNamespace(request_id="req-1")
-        should_wait, params = connector.request_finished_all_groups(
-            request, ([1, 2],))
-
-        assert should_wait is False
-        assert params == {"kv_transfer_pending": True}
-        scheduler.request_finished_all_groups.assert_not_called()
+    def test_repeated_reference_is_transferred_once_per_chunk(self, controller):
+        scheduler = controller.cache
+        pool = scheduler._block_pool
+        meta, block = store_meta(controller)
+        block.ref_cnt += 1
+        scheduler._swap_protected_blocks["r"].append(block)
+        controller.capture_stores(meta)
+        assert controller._staged[0].blocks == [block]
+        assert scheduler._swap_protected_blocks["r"] == [block]
+        scheduler._release_protected_blocks("r")
+        pool.free_blocks([block])
+        assert block.ref_cnt == 1
+        controller.progress()
+        StateManager.set_global_clock(0.5)
+        controller.progress()
+        assert pool.get_num_free_blocks() == 7
 
 
 if __name__ == "__main__":

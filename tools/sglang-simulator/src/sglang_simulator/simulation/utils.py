@@ -90,7 +90,10 @@ def calc_metrics(requests: list[Union[RequestStats, dict]]) -> dict:
         if not req.is_complete():
             continue
         completed += 1
-        ttfts.append(req.gen_token_latencies[0])
+        if req.gen_token_latencies:
+            # Requests finished without any recorded decode step (e.g.
+            # connector-side completion) contribute no TTFT sample.
+            ttfts.append(req.gen_token_latencies[0])
         queue_durs.append(req.queue_end - req.queue_start)
         if len(req.gen_token_latencies) > 1:
             # output length > 1

@@ -12,15 +12,316 @@ No DashServing/vLLM source file is modified on disk; all changes are installed
 through class monkey-patches at interpreter startup.
 """
 
+import asyncio
 import sys
+import threading
 import time
+from collections import Counter
+from concurrent.futures import Future
+from dataclasses import dataclass
 
+from sglang_simulator.simulation.manager import Envs, StateManager
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent
 from sglang_simulator.simulation.vllm.v6d.bandwidth import BandwidthModel
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
+
+class SimulatedKVController:
+    """One owner for KV progress, protection, and completion visibility.
+
+    Like the SGLang HiCacheController hook, native connector polling drives this
+    controller synchronously. Metadata generated before a forward is staged;
+    the next connector step observes the executor's updated clock and starts
+    those copies. Nothing is called back into the executor or worker.
+    """
+
+    @dataclass
+    class Store:
+        request: object
+        blocks: list
+        num_blocks: int
+        last: bool
+        ready_at: float = 0.0
+
+    def __init__(self, hybrid):
+        self.hybrid = hybrid
+        self.backend = getattr(hybrid._backend, "_v6d", hybrid._backend)
+        self.cache = self.backend._scheduler
+        self.backend._sim_controller = self
+        self._staged = []
+        self._stores = []
+        self._loads = {}
+        self._store_tails = {}
+        self._aborted_stores = {}
+        self._preparing = []
+        self._lock = threading.RLock()
+        # Native abort cleanup runs on the connector loop. Its remaining pins
+        # must not race with our transfer of ownership into a staged copy.
+        original_release = self.cache._release_protected_blocks
+
+        def release(req_id):
+            with self._lock:
+                return original_release(req_id)
+
+        self.cache._release_protected_blocks = release
+
+    @staticmethod
+    def now():
+        return (StateManager.get_global_clock() if Envs.simulation_mode() == "OFFLINE"
+                else time.perf_counter())
+
+    @staticmethod
+    def _metadata_objects(metadata):
+        seen, stack = set(), [metadata]
+        while stack:
+            obj = stack.pop()
+            if obj is None or id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            yield obj
+            stack.extend(getattr(obj, attr, None) for attr in ("reqs", "inner", "v6d"))
+
+    def capture_stores(self, metadata):
+        """Take this chunk's pins, but do not spend future compute time."""
+        stores = {}
+        for obj in self._metadata_objects(metadata):
+            stores.update(getattr(obj, "reqs_to_store", None) or {})
+            for rid in getattr(obj, "aborted_save_ids", ()):
+                state = self.hybrid._saving.get(rid)
+                if state is not None:
+                    self._aborted_stores[rid] = state._req
+        for rid, (groups, last) in stores.items():
+            state = self.hybrid._saving.get(rid)
+            if state is None:
+                raise RuntimeError(f"Store request {rid} is missing")
+            wanted = Counter(bid for gid, (_keys, ids) in groups.items()
+                             if gid in self.cache.mamba_group_ids for bid in ids)
+            with self._lock:
+                taken, remaining = [], []
+                for block in self.cache._swap_protected_blocks.get(rid, ()):
+                    if wanted[block.block_id]:
+                        wanted[block.block_id] -= 1
+                        taken.append(block)
+                    else:
+                        remaining.append(block)
+                if remaining:
+                    self.cache._swap_protected_blocks[rid] = remaining
+                else:
+                    self.cache._swap_protected_blocks.pop(rid, None)
+            self._staged.append(self.Store(
+                state._req, taken, sum(len(keys) for keys, _ids in groups.values()), last))
+
+    def prepare(self, coroutine):
+        future = Future()
+        self._preparing.append(future)
+
+        async def tracked():
+            try:
+                result = await coroutine
+            except BaseException as exc:
+                future.set_exception(exc)
+                raise
+            else:
+                future.set_result(result)
+                return result
+        return tracked()
+
+    def settle_preparations(self):
+        """Wait for control-plane RPCs (OFFLINE deterministic barrier)."""
+        preparing, self._preparing = self._preparing, []
+        for future in preparing:
+            future.result(timeout=30.0)
+
+    def reap_preparations(self):
+        """Publish completed RPCs without blocking the EngineCore thread."""
+        pending = []
+        for future in self._preparing:
+            if future.done():
+                # Surface connector-loop failures on the engine thread.
+                future.result()
+            else:
+                pending.append(future)
+        self._preparing = pending
+
+    def queue_load(self, request, num_tokens, groups):
+        nblocks = sum(len(keys) for keys, _ids in groups.values())
+        bw = BandwidthModel.get()
+        deadline = self.now() + bw.latency_for(nblocks, True) + bw.seg1_latency(nblocks)
+        with self._lock:
+            self._loads.setdefault(request.request_id, (deadline, num_tokens))
+
+    def _run_control(self, coroutine):
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        if current is self.hybrid.loop:
+            coroutine.close()
+            raise RuntimeError("Cannot synchronously wait on the current connector loop")
+        return asyncio.run_coroutine_threadsafe(coroutine, self.hybrid.loop).result(timeout=30.0)
+
+    def _load_done(self, rid, num_tokens):
+        from vllm.v1.hybrid_connector import IoRet
+
+        async def complete():
+            for rank in range(self.hybrid._tp_size()):
+                await self.hybrid._do_load_done(rank, IoRet(reqid=rid, n=num_tokens))
+        self._run_control(complete())
+
+    def _store_done(self, req, failed=False):
+        from vllm.v1.hybrid_connector import HB_SAVE_SOURCES, IoRet, get_param
+
+        sources = tuple(get_param(req, HB_SAVE_SOURCES, ()) or ())
+        if not sources:
+            raise RuntimeError(f"Missing save sources for {req.request_id}")
+
+        async def complete():
+            for source in sources:
+                for rank in range(self.hybrid._tp_size()):
+                    await self.hybrid._do_save_done(
+                        rank, IoRet(reqid=req.request_id, source=source,
+                                    n=0 if failed else None))
+        self._run_control(complete())
+
+    def progress(self):
+        """Settle work through this clock; future readiness stays private."""
+        now = self.now()
+        bw = BandwidthModel.get()
+        staged, self._staged = self._staged, []
+        for store in staged:
+            rid = store.request.request_id
+            store.ready_at = max(now, self._store_tails.get(rid, now))
+            store.ready_at += bw.store_completion_latency(store.num_blocks)
+            self._store_tails[rid] = store.ready_at
+            self._stores.append(store)
+        due = [store for store in self._stores if store.ready_at <= now]
+        self._stores = [store for store in self._stores if store.ready_at > now]
+        for store in due:
+            if store.blocks:
+                with self._lock:
+                    self.cache._block_pool.free_blocks(store.blocks)
+            rid = store.request.request_id
+            if self._store_tails.get(rid) == store.ready_at:
+                self._store_tails.pop(rid, None)
+            if store.last and rid not in self._aborted_stores:
+                self._store_done(store.request)
+        aborted = [rid for rid in self._aborted_stores if rid not in self._store_tails]
+        for rid in aborted:
+            self._store_done(self._aborted_stores.pop(rid), failed=True)
+        with self._lock:
+            loads = [(rid, n) for rid, (deadline, n) in self._loads.items() if deadline <= now]
+            for rid, _n in loads:
+                del self._loads[rid]
+        for rid, n in loads:
+            self._load_done(rid, n)
+        return len(due) + len(loads) + len(aborted)
+
+    def next_wakeup(self):
+        if self._staged or any(rid not in self._store_tails for rid in self._aborted_stores):
+            return self.now()
+        with self._lock:
+            deadlines = [deadline for deadline, _n in self._loads.values()]
+        deadlines.extend(store.ready_at for store in self._stores)
+        return min(deadlines, default=None)
+
+    def has_pending(self):
+        return bool(self._preparing) or self.next_wakeup() is not None
+
+    def reset(self):
+        """Settle controller-owned state at the native cache-reset boundary.
+
+        A round/profile reset starts a fresh clock epoch, so pending modeled
+        copies are released immediately (no GPU DMA exists to wait for) and
+        unfinished saves are failed through the native source/rank
+        acknowledgement chain — unsealed objects are discarded and block
+        references freed. No virtual time is advanced and nothing sleeps.
+        Refused while requests are still active.
+        """
+        if (self.hybrid.pending_requests or self.hybrid._loaded
+                or any(not state._req.is_finished()
+                       for state in self.hybrid._saving.values())):
+            logger.warning("[V6D Hijack] controller reset refused: requests active")
+            return False
+        self.settle_preparations()
+        with self._lock:
+            dropped_loads = len(self._loads)
+            self._loads.clear()
+            for store in self._staged + self._stores:
+                if store.blocks:
+                    self.cache._block_pool.free_blocks(store.blocks)
+            self._staged.clear()
+            self._stores.clear()
+            self._store_tails.clear()
+            self._aborted_stores.clear()
+        if dropped_loads:
+            logger.warning("[V6D Hijack] controller reset dropped %d pending load(s)",
+                           dropped_loads)
+        saved = set(self.hybrid._saved)
+        for rid, state in list(self.hybrid._saving.items()):
+            if rid not in saved:
+                self._store_done(state._req, failed=True)
+        self.hybrid._step_saved()
+        return not self.has_pending()
+
+
+class C_HybridControlPlaneHook(BaseHook):
+    """Join native V6D metadata preparation inside the connector, not inference.
+
+    HybridScheduler is the connector's internal controller. Its native waiting
+    loop still performs admission/allocation; only already-submitted lookup and
+    metadata preparation are synchronized before its normal loaded-queue pass.
+    """
+
+    HOOK_CLASS_NAME = "HybridScheduler"
+    HOOK_MODULE_NAME = "vllm.v1.hybrid_connector"
+
+    @classmethod
+    def hook(cls, target):
+        original_init = target.__init__
+        original_prepare = target._on_add_req
+        original_waiting = target._step_waiting
+        original_step = target.step
+
+        def init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            backend = getattr(self._backend, "_v6d", self._backend)
+            self._sim_controller = (SimulatedKVController(self)
+                                    if getattr(backend, "_sim_sync_prepare", False) else None)
+
+        def prepare(self, req, blocks):
+            coroutine = original_prepare(self, req, blocks)
+            controller = self._sim_controller
+            return controller.prepare(coroutine) if controller is not None else coroutine
+
+        def step_waiting(self):
+            result = original_waiting(self)
+            controller = self._sim_controller
+            if controller is not None:
+                if Envs.simulation_mode() == "OFFLINE":
+                    # Virtual time cannot advance while a real control-plane
+                    # coroutine is unresolved, so OFFLINE retains the explicit
+                    # synchronization barrier.
+                    controller.settle_preparations()
+                else:
+                    # BLOCKING mirrors production: lookup/allocation RPCs stay
+                    # on the connector asyncio loop while EngineCore continues
+                    # polling and overlapping them with the simulated GPU span.
+                    controller.reap_preparations()
+                controller.progress()
+            return result
+
+        def step(self):
+            if self._sim_controller is not None:
+                self._sim_controller.reap_preparations()
+                self._sim_controller.progress()
+            return original_step(self)
+
+        target.__init__ = init
+        target._on_add_req = prepare
+        target._step_waiting = step_waiting
+        target.step = step
 
 
 class C_HybridBackendHook(BaseHook):
@@ -43,243 +344,82 @@ class C_HybridBackendHook(BaseHook):
 
 
 class C_HybridConnectorHook(BaseHook):
-    """Report HybridConnector CPU no-op save/load completions."""
+    """Own modeled transfers while preserving native completion semantics."""
 
     HOOK_CLASS_NAME = "HybridConnector"
     HOOK_MODULE_NAME = "vllm.v1.hybrid_connector"
 
     @classmethod
     def hook(cls, target):
-        original_bind = target.bind_connector_metadata
+        original_has_requests = getattr(target, "has_requests", None)
+        original_build_meta = getattr(target, "build_connector_meta", None)
 
-        def _collect_req_ids(obj, attr_name, seen=None):
-            if obj is None:
-                return set()
-            if seen is None:
-                seen = set()
-            obj_id = id(obj)
-            if obj_id in seen:
-                return set()
-            seen.add(obj_id)
-            if isinstance(obj, dict):
-                ids = set()
-                for value in obj.values():
-                    ids.update(_collect_req_ids(value, attr_name, seen))
-                return ids
-            if isinstance(obj, (list, tuple, set)):
-                ids = set()
-                for value in obj:
-                    ids.update(_collect_req_ids(value, attr_name, seen))
-                return ids
-            value = getattr(obj, attr_name, None)
-            if isinstance(value, dict):
-                return set(value)
-            ids = set()
-            for value in vars(obj).values() if hasattr(obj, "__dict__") else ():
-                ids.update(_collect_req_ids(value, attr_name, seen))
-            return ids
+        def build_connector_meta(self, scheduler_output):
+            metadata = original_build_meta(self, scheduler_output)
+            controller = self._sched._sim_controller
+            if controller is not None:
+                controller.capture_stores(metadata)
+            return metadata
 
-        def _resolve_reqs_to_store(metadata):
-            # Walk the backend-meta nesting to find the v6d
-            # V6dObjectConnectorMetadata.reqs_to_store dict.  Layouts:
-            #   v6d_object:      metadata.reqs.inner.reqs_to_store
-            #   v6d_object+kvt:  metadata.reqs.v6d.inner.reqs_to_store
-            seen = set()
-            stack = [metadata]
-            while stack:
-                obj = stack.pop()
-                if obj is None or id(obj) in seen:
-                    continue
-                seen.add(id(obj))
-                value = getattr(obj, "reqs_to_store", None)
-                if isinstance(value, dict):
-                    return value
-                for attr in ("reqs", "inner", "v6d"):
-                    stack.append(getattr(obj, attr, None))
-            return {}
+        if original_build_meta is not None:
+            target.build_connector_meta = build_connector_meta
 
-        def _sim_block_count(groups_data):
-            """Blocks one swap call would move for this request.
+        def has_requests(self):
+            controller = self._sched._sim_controller
+            return original_has_requests(self) or (
+                controller is not None and controller.has_pending())
 
-            The real start_load_kv / start_store_kv merge every group's keys
-            into a single ops.v6d_swap_blocks call, so the block count is the
-            sum across groups.
-            """
-            try:
-                return sum(len(keys) for keys, _gids in groups_data.values())
-            except Exception:
-                return 0
-
-        def override_bind_connector_metadata(self, metadata):
-            original_bind(self, metadata)
-            reqs_to_store = _resolve_reqs_to_store(metadata)
-            # The CPU no-op "save" completes instantly, so here we only
-            # record store-completion deadlines.  The actual
-            # mark_backend_save_done signal is sent by get_finished() at the
-            # next step boundary where now >= deadline, preserving
-            # step-aligned timing (matches production: seal only at
-            # schedule->update_connector_output).  mark_backend_save_done()
-            # is the production channel (equivalent to the worker's
-            # _SAVE_DONE_REQ RPC) and drives the native chain
-            #   _do_save_done -> _saved/_try_teardown_save (block refs)
-            #                 -> _cleanup -> backend.async_cleanup
-            #                    (seal v6d objects + release mamba
-            #                     protected blocks + Redis announce).
-            # v6d save_count=1: the worker signals once, on the LAST save
-            # of the request (_is_last_save=True).  Empty groups_data is
-            # the noop last-save marker and must signal as well.
-            _bw = BandwidthModel.get()
-            _now = time.perf_counter()
-            _pending = getattr(self, "_sim_pending_store", {})
-            save_done_reqs = {
-                req_id
-                for req_id, (_groups_data, is_last_save) in reqs_to_store.items()
-                if is_last_save
-            }
-            if save_done_reqs:
-                from vllm.v1.hybrid_connector import sched_get_req
-                for req_id in sorted(save_done_reqs):
-                    req = sched_get_req(req_id)
-                    if req is None:
-                        logger.warning(
-                            "[V6D Hijack] save_done: request %s not "
-                            "found in scheduler, skipping", req_id)
-                        continue
-                    _groups = reqs_to_store[req_id][0]
-                    _nblk = _sim_block_count(_groups) if _groups else 0
-                    delay_s = _bw.store_completion_latency(_nblk)
-                    _pending[req_id] = (
-                        max(_pending.get(req_id, (0.0,))[0], _now + delay_s),
-                        req,
-                    )
-                logger.debug(
-                    "[V6D Hijack] store deadlines set: %s",
-                    sorted(save_done_reqs),
-                )
-            self._sim_pending_store = _pending
-            load_reqs = _collect_req_ids(metadata, "reqs_to_load")
-            # Loads: production only reports finished_recving once its DMA
-            # event fires, and the request cannot enter running before that.
-            # Model the load latency through a deadline (same as before).
-            _now = time.perf_counter()
-            _backend_meta = getattr(metadata, "reqs", None)
-            _reqs_to_load = getattr(metadata, "reqs_to_load", None)
-            if _reqs_to_load is None and _backend_meta is not None:
-                _reqs_to_load = getattr(_backend_meta, "reqs_to_load", None)
-                if _reqs_to_load is None:
-                    _inner = getattr(_backend_meta, "inner", None)
-                    _reqs_to_load = (getattr(_inner, "reqs_to_load", None)
-                                     if _inner is not None else None)
-            _pending_l = getattr(self, "_sim_pending_load", {})
-            _ext_tok = getattr(metadata, "external_tokens", None) or {}
-            for _rid in load_reqs:
-                _groups = (_reqs_to_load.get(_rid)
-                           if isinstance(_reqs_to_load, dict) else None)
-                _nload = _sim_block_count(_groups or {})
-                # A remote (cross-node) hit must first be fetched
-                # peer v6d -> local v6d (seg1) before the local load
-                # (seg2). external_tokens>0 marks a remote hit; seg1 is
-                # a placeholder (0) until calibrated on real hardware.
-                _rblk = _nload if int(_ext_tok.get(_rid, 0) or 0) > 0 else 0
-                _lat = _bw.latency_for(_nload, True) + _bw.seg1_latency(_rblk)
-                _pending_l[_rid] = max(_pending_l.get(_rid, 0.0), _now + _lat)
-            self._sim_pending_load = _pending_l
-            if reqs_to_store or load_reqs:
-                logger.debug(
-                    "[V6D Hijack] HybridConnector bind metadata: "
-                    "store=%s save_done=%s load=%s",
-                    sorted(reqs_to_store),
-                    sorted(save_done_reqs),
-                    sorted(load_reqs),
-                )
+        if original_has_requests is not None:
+            target.has_requests = has_requests
 
         def override_wait_for_save(self):
             return None
 
         def override_get_finished(self, finished_req_ids):
-            # Store completion is signalled via mark_backend_save_done (real
-            # _SAVE_DONE_REQ RPC channel, preserves mamba block release).
-            # We harvest the deadline here (step boundary = main thread) so
-            # the timing is step-aligned, matching production: seal/save-done
-            # only becomes visible at the scheduler's next get_finished call.
-            _now = time.perf_counter()
-            _pending = getattr(self, "_sim_pending_store", {})
-            _done_rids = {rid for rid, (deadline, _req) in _pending.items()
-                          if _now >= deadline}
-            if _done_rids:
-                from vllm.v1.hybrid_connector import (
-                    HB_SAVE_SOURCES,
-                    get_param,
-                    mark_backend_save_done,
-                )
-                for rid in sorted(_done_rids):
-                    _deadline, _req = _pending.pop(rid)
-                    # Save-done is tracked per backend source (v6d_object,
-                    # kvt, ...): the scheduler registers the expected labels
-                    # at save-prepare time and only seals the store once every
-                    # one of them has signalled, so echo them all here.
-                    _sources = tuple(get_param(_req, HB_SAVE_SOURCES, ()) or ())
-                    if _sources:
-                        for _source in _sources:
-                            mark_backend_save_done(_req, source=_source)
-                    else:
-                        mark_backend_save_done(_req)
-            self._sim_pending_store = _pending
-            _pending_l = getattr(self, "_sim_pending_load", {})
-            load_reqs = {r for r, deadline in _pending_l.items() if _now >= deadline}
-            for r in load_reqs:
-                _pending_l.pop(r, None)
-            self._sim_pending_load = _pending_l
-            if _done_rids or load_reqs:
-                logger.debug(
-                    "[V6D Hijack] get_finished: save_done=%s load=%s "
-                    "finished_req_ids=%s",
-                    sorted(_done_rids),
-                    sorted(load_reqs),
-                    sorted(finished_req_ids or []),
-                )
-            return set(), load_reqs
+            # Hybrid load/save completion uses native acknowledgement handlers,
+            # not the base connector's finished_recving/finished_sending path.
+            return set(), set()
 
         def override_clear_connector_metadata(self):
-            logger.debug(
-                "[V6D Hijack] HybridConnector.clear_connector_metadata: "
-                "skipped CUDA backend clear in CPU mode"
-            )
             if getattr(self, "_worker", None) is not None:
-                setattr(self._worker, "_meta", None)
+                self._worker.clear_connector_metadata()
             return None
 
         def override_start_load_kv(self, forward_context=None, **kwargs):
-            # Do not no-op: let HybridWorker.start_load_kv schedule _async_load_kv.
-            # V6dObjectBackend.async_load_kv is overridden to yield fake IoRet
-            # immediately (simulating instant load completion in CPU mode).
+            # Preserve worker lifecycle dispatch. The backend's no-op async
+            # generator leaves acknowledgement to the modeled load event.
             assert self._worker is not None
             self._worker.start_load_kv()
 
-        target.bind_connector_metadata = override_bind_connector_metadata
         target.wait_for_save = override_wait_for_save
         target.get_finished = override_get_finished
         target.clear_connector_metadata = override_clear_connector_metadata
         target.start_load_kv = override_start_load_kv
 
-        # NOTE (fidelity): update_connector_output and
-        # request_finished_all_groups are deliberately left untouched.
-        # Upstream HybridConnector implements neither (base no-op), and the
-        # inner v6d connector's update_connector_output is dead code in
-        # hybrid mode — its seal/release logic was moved to
-        # V6dObjectBackend.async_cleanup, driven by the save-done RPC that
-        # mark_backend_save_done simulates above.  Protected mamba blocks
-        # are therefore released ONLY via the save-done chain, exactly as
-        # in production; the finish-time safety net is expected to be
-        # fixed upstream (see docs/v6d_mamba_block_leak_hang_report.md).
+        # Request finish/seal semantics remain native. The simulation-specific
+        # correction is GPU snapshot ownership: completed chunk copies no longer
+        # pin Mamba blocks until the entire request's last save. The installed
+        # native hybrid backend retains those pins until async_cleanup, which
+        # can exhaust the pool during long prefills even in BLOCKING mode.
+        # Events own detached references, so native final/abort cleanup cannot
+        # free them twice or release a newer, still-in-flight chunk.
 
         def override_reset_cache(self):
-            # Upstream HybridConnector lacks reset_cache forwarding (falls
-            # back to the KVConnectorBase_V1 no-op), so the official
-            # /reset_prefix_cache?reset_external=true path never reaches the
-            # v6d managers.  Bridge it: walk _sched._backend[._v6d]._scheduler
-            # to the V6dObjectConnectorScheduler and reuse its reset_cache()
+            # Settle the simulated-transfer controller first (release
+            # copy-owned block pins, fail unfinished saves), then forward to
+            # the v6d managers.  Upstream HybridConnector lacks reset_cache
+            # forwarding (falls back to the KVConnectorBase_V1 no-op), so the
+            # official /reset_prefix_cache?reset_external=true path never
+            # reaches the v6d managers.  Bridge it: walk
+            # _sched._backend[._v6d]._scheduler to the
+            # V6dObjectConnectorScheduler and reuse its reset_cache()
             # (which resets every V6dObjectManager).
+            controller = getattr(self._sched, "_sim_controller", None)
+            if controller is not None and not controller.reset():
+                logger.warning(
+                    "[V6D Hijack] HybridConnector.reset_cache: controller "
+                    "still has active requests; caches NOT reset")
+                return False
             backend = getattr(getattr(self, "_sched", None), "_backend", None)
             for candidate in (backend, getattr(backend, "_v6d", None)):
                 scheduler = getattr(candidate, "_scheduler", None)
@@ -354,31 +494,42 @@ class C_V6dObjectBackendHook(BaseHook):
         if hasattr(target, "_record_event"):
             target._record_event = override_record_event
 
-        # Override async_load_kv to simulate instant load completion.
-        # In CPU simulation, no actual KV data transfer is needed.
-        # The original async_load_kv calls self._worker.async_start_load_kv(meta)
-        # which requires real V6D data-plane operations (CUDA events, DMA, etc.).
-        # We bypass that and directly yield IoRet for each reqs_to_load entry.
+        original_prepare = getattr(target, "async_update_state_after_alloc", None)
+
+        async def prepare_load(self, request, blocks, num_external_tokens):
+            # Complete real metadata lookup/allocation first. A modeled DMA is
+            # only scheduled here, never awaited by the preparation barrier.
+            result = await original_prepare(self, request, blocks, num_external_tokens)
+            if result is not None or num_external_tokens <= 0:
+                return result
+            groups = self._scheduler._reqs_to_load.get(request.request_id, {})
+            self._sim_controller.queue_load(request, num_external_tokens, groups)
+            return result
+
+        if original_prepare is not None:
+            target.async_update_state_after_alloc = prepare_load
+            target._sim_sync_prepare = True
+
         async def override_async_load_kv(self, m):
-            from vllm.v1.hybrid_connector import IoRet
-            meta = m.inner
-            if not meta or not getattr(meta, "reqs_to_load", None):
-                return
-            # Do NOT await here. BLOCKING mode advances the clock with a
-            # plain time.sleep() on the same thread, so a coroutine parked on
-            # asyncio.sleep() never gets resumed -- an earlier attempt that
-            # awaited the modelled latency here starved the load pipeline and
-            # three of four phases produced no output at all. The load latency
-            # is applied through the same deadline mechanism as the store,
-            # in bind_connector_metadata + get_finished.
-            for req_id in meta.reqs_to_load:
-                n = (m.external_tokens or {}).get(req_id, 0)
-                logger.debug(
-                    "[V6D Hijack] async_load_kv: yielding IoRet req=%s n=%d",
-                    req_id, n)
-                yield IoRet(reqid=req_id, n=n)
+            # Preparation schedules the native load acknowledgement at its
+            # modeled ready time. Yielding here would send an early/duplicate
+            # LOAD_DONE RPC and let the native scheduler run the request early.
+            return
+            yield  # Preserve the native async-generator interface.
 
         target.async_load_kv = override_async_load_kv
+
+        def clear_backend_metadata(self):
+            # The controller captured stores before forward and owns completion.
+            self._bound_meta = None
+
+        def bypass_bind(self, metadata):
+            # Aborts are captured on the scheduler side, including idle substeps.
+            # No worker timer may publish completion ahead of the modeled copy.
+            return None
+
+        target.clear_backend_metadata = clear_backend_metadata
+        target.bypass_bind = bypass_bind
 
         _bwm = BandwidthModel.get()
         logger.info("[V6D Hijack] V6dObjectBackend hook installed "
