@@ -549,10 +549,24 @@ class C_VLLMWorkerHook(BaseHook):
                         "[V6D Hijack] execute_model: no kv_transfer_group"
                     )
             except Exception:
-                logger.exception(
-                    "[V6D Hijack] execute_model: KV pre-forward lifecycle failed"
+                # Do NOT drop the connector here.  Setting kv_connector=None
+                # also skips the post-forward harvest below, so one broken
+                # engine-metadata contract stops every pending store/load
+                # deadline from ever being signalled and the engine stalls
+                # silently: no save-done -> v6d objects never sealed ->
+                # protected blocks never released -> nokvblks -> every request
+                # hits the 600s timeout -> INNER_ENGINE_STUCK -> pod kill.
+                # The post-forward path is safe to run after a pre-forward
+                # failure: wait_for_save is a sim no-op and get_finished only
+                # reads the sim's own _sim_pending_store/_sim_pending_load
+                # deadlines set by earlier steps.  Log loudly instead.
+                logger.critical(
+                    "[V6D Hijack] execute_model: KV pre-forward lifecycle "
+                    "failed (engine metadata contract changed?); continuing "
+                    "with the post-forward harvest so pending store/load "
+                    "deadlines keep draining",
+                    exc_info=True,
                 )
-                kv_connector = None
 
             # Build mock output
             req_ids = list(num_scheduled_tokens.keys()) if num_scheduled_tokens else []
