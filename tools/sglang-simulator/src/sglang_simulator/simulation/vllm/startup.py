@@ -151,6 +151,10 @@ def init_hook():
     from sglang_simulator.simulation.vllm.v6d.hooks import register_v6d_hooks
     register_v6d_hooks(hooks)
 
+    # Dashserving control-plane hook: add server_info endpoint
+    from sglang_simulator.simulation.vllm.dashllm.server_info_hook import C_DashservingControlHandlerHook
+    hooks.append(C_DashservingControlHandlerHook)
+
     sglang_simulator_hook.install_class_hooks(hooks)
 
     from sglang_simulator.simulation.vllm.dashllm.kv_transfer_hook import _install_dashllm_kv_transfer_hook
