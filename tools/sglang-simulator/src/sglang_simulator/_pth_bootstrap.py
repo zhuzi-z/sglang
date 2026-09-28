@@ -28,3 +28,23 @@ if os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "o
             C_EngineCoreHook,
         ]
     )
+
+if os.environ.get("SIM_DEBUG_ENABLE", "").lower() in ("1", "true", "yes", "on"):
+    # Standalone observability hooks for real deployments. Unlike the
+    # collector these are read-only (logs + GET /server_info on the dashserving
+    # control port), so they are safe to enable in a real serving process.
+    from sglang_simulator.debug import (
+        C_HitRateHook,
+        C_TieredVineyardPeerHook,
+        C_HitRateStatsHook,
+        C_DashservingControlHandlerHook,
+    )
+
+    install_class_hooks(
+        [
+            C_HitRateHook,
+            C_TieredVineyardPeerHook,
+            C_HitRateStatsHook,
+            C_DashservingControlHandlerHook,
+        ]
+    )
