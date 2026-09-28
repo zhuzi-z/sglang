@@ -1,6 +1,7 @@
 import gzip
 import json
 import os
+import sys
 import threading
 import time
 import torch
@@ -17,7 +18,7 @@ from sglang_simulator.utils.json import CustomJsonEncoder
 #   content: "ids" (default) keeps input_ids/output_ids, "no_ids" drops them
 #   format:  "gzip" (default) writes .jsonl.gz, "plain" writes plain .jsonl
 _EXPORT_FLAGS = frozenset(
-    os.getenv("SIM_COLLECTOR_EXPORT", "ids,gzip").lower().split(",")
+    os.getenv("SIM_COLLECTOR_EXPORT", "no_ids,gzip").lower().split(",")
 )
 EXPORT_TOKEN_IDS = "no_ids" not in _EXPORT_FLAGS
 EXPORT_GZIP = "plain" not in _EXPORT_FLAGS
@@ -55,9 +56,94 @@ class BatchInfos:
 
 
 BATCH_INFOS: list[BatchInfos] = []
-BATCH_SAMPLE_TOKENS_LATENCIES: list[float] = []
 
 REQUEST_INFOS: dict[str, RequestInfos] = defaultdict(RequestInfos)
+
+
+# --- CUDA-event based timing -------------------------------------------------
+# The collector must NOT call torch.cuda.synchronize(): a forced device sync
+# serializes the pipeline, wrecks async-scheduling overlap and skews the very
+# latencies we try to measure. Instead we bracket each measured region with a
+# pair of timing cuda events recorded on the main stream (mirroring the
+# async_event_pool pattern in vllm's GPUModelRunner). The elapsed time is read
+# lazily from AsyncModelRunnerOutput.get_output() -- i.e. right after vllm's own
+# synchronize has already drained the stream past our end event -- so the hook
+# never introduces any synchronization of its own.
+
+
+class _EventTimer:
+    """A start/end pair of timing cuda events for one measured region."""
+
+    __slots__ = ("_start", "_end")
+
+    def __init__(self) -> None:
+        self._start = torch.cuda.Event(enable_timing=True)
+        self._end = torch.cuda.Event(enable_timing=True)
+
+    def record_start(self) -> None:
+        self._start.record()
+
+    def record_end(self) -> None:
+        self._end.record()
+
+    def elapsed_s(self) -> Optional[float]:
+        """Elapsed seconds between the two events, or None if not ready yet.
+
+        Event.elapsed_time() returns milliseconds and raises if either event
+        has not completed. It is only safe to call after a native synchronize
+        has passed self._end; we still guard it so a rare not-ready race can
+        never crash the serving engine.
+        """
+        try:
+            return self._start.elapsed_time(self._end) / 1000.0
+        except RuntimeError:
+            return None
+
+
+# Bridges the execute_model (RPC-1) timing to the sample_tokens (RPC-2) call of
+# the same step. A single slot is enough because the two RPCs run back-to-back
+# within a step; only get_output() is overlapped across steps.
+_PENDING_EXEC: Optional[tuple] = None
+
+
+def _finalize_on_get_output(output, finalize):
+    """Run ``finalize`` right after vllm has synchronized this step's output.
+
+    In async scheduling ``output`` is an ``AsyncModelRunnerOutput`` whose
+    ``get_output()`` blocks on the D2H copy event -- our timing events are
+    guaranteed complete by then, so we read them there. In the synchronous
+    path there is no ``get_output`` and vllm has already synchronized before
+    returning, so we finalize immediately. Either way the hook never calls
+    synchronize itself.
+    """
+    original_get_output = getattr(output, "get_output", None)
+    if original_get_output is None:
+        finalize()
+        return output
+
+    def wrapped_get_output(*args, **kwargs):
+        result = original_get_output(*args, **kwargs)
+        finalize()
+        return result
+
+    output.get_output = wrapped_get_output
+    return output
+
+
+def _print_batch_info(batch_info: "BatchInfos") -> None:
+    """Print one recorded batch at its finalize point (no request ids).
+
+    The per-request tuples are (rid, extend_input_len, past_kv_len,
+    output_len); the leading rid is dropped so no request id is printed.
+
+    Writes directly to stdout's underlying buffer so that vLLM's
+    decorate_logs prefix (e.g. [2/4,TP2][pid=...]) is bypassed.
+    """
+    row = asdict(batch_info)
+    row["requests"] = [tuple(req[1:]) for req in row.get("requests", [])]
+    line = "[sim_colletor] " + json.dumps(row, cls=CustomJsonEncoder) + "\n"
+    sys.stdout.buffer.write(line.encode())
+    sys.stdout.buffer.flush()
 
 
 def _round6(value: Optional[float]) -> Optional[float]:
@@ -125,14 +211,17 @@ class C_VLLMEngineArgsHook(BaseHook):
         target.__post_init__ = wrapped_post_init
 
 
-class C_WorkerWrapperBaseHook(BaseHook):
-
-    HOOK_CLASS_NAME = "WorkerWrapperBase"    
-    HOOK_MODULE_NAME = "vllm.v1.worker.worker_base"
+class C_WorkerHook(BaseHook):
+    HOOK_MODULE_NAME = "vllm.v1.worker.gpu_worker"
+    HOOK_CLASS_NAME = "Worker"
 
     @classmethod
     def hook(cls, target) -> None:
 
+        # Window RPC-1: bracket execute_model's forward with timing cuda events
+        # (no synchronize). In the two-RPC architecture execute_model returns
+        # None, so the elapsed time is read later -- paired with the
+        # sample_tokens window under a single native get_output synchronize.
         original_execute_model = target.execute_model
 
         def wrapped_execute_model(self, scheduler_output: "SchedulerOutput"):
@@ -172,65 +261,93 @@ class C_WorkerWrapperBaseHook(BaseHook):
                     )
                     logprobs_n = max(logprobs_n, sp.logprobs)
 
-            torch.cuda.synchronize()
-            start = time.time()
+            global _PENDING_EXEC
+
+            # Bracket the forward with timing cuda events instead of syncing.
+            exec_timer = _EventTimer()
+            start_wall = time.time()
+            exec_timer.record_start()
             ret = original_execute_model(self, scheduler_output)
-            torch.cuda.synchronize()
-            end = time.time()
+            exec_timer.record_end()
 
+            batch_info = None
             if len(batch_req_infos):
-                BATCH_INFOS.append(
-                    BatchInfos(
-                        start_timestamp=_round6(start),
-                        end_timestamp=_round6(end),
-                        forward_mode=forward_mode,
-                        # Keep only the last 12 chars of rid.
-                        requests=[
-                            (
-                                rid[-12:],
-                                req_info["extend_input_len"],
-                                req_info["past_kv_len"],
-                                req_info["output_len"],
-                            )
-                            for rid, req_info in batch_req_infos.items()
-                        ],
-                        iter_latency=_round6(end - start),
-                        logprobs_req_count=logprobs_req_count,
-                        logprobs_tokens=logprobs_tokens,
-                        logprobs_n=logprobs_n,
-                    )
+                batch_info = BatchInfos(
+                    start_timestamp=_round6(start_wall),
+                    # end_timestamp / iter_latency are filled in once the timing
+                    # events are read after vllm's own synchronize (see below).
+                    forward_mode=forward_mode,
+                    # Keep only the last 12 chars of rid.
+                    requests=[
+                        (
+                            rid[-12:] if len(rid) > 12 else rid,
+                            req_info["extend_input_len"],
+                            req_info["past_kv_len"],
+                            req_info["output_len"],
+                        )
+                        for rid, req_info in batch_req_infos.items()
+                    ],
+                    logprobs_req_count=logprobs_req_count,
+                    logprobs_tokens=logprobs_tokens,
+                    logprobs_n=logprobs_n,
                 )
+                BATCH_INFOS.append(batch_info)
 
-            return ret
+            def _finalize_exec(sample_latency: Optional[float] = None):
+                if batch_info is None:
+                    return
+                iter_latency = exec_timer.elapsed_s()
+                if iter_latency is None:
+                    return
+                batch_info.iter_latency = _round6(iter_latency)
+                batch_info.end_timestamp = _round6(start_wall + iter_latency)
+                if sample_latency is not None:
+                    batch_info.sample_tokens_latency = _round6(sample_latency)
+                # Print the batch info at its recording (finalize) point.
+                _print_batch_info(batch_info)
+
+            # Two-RPC vllm: execute_model returns None and the real output
+            # (carrying get_output) comes from sample_tokens -- defer to it so
+            # both windows are read together after a single native synchronize.
+            if ret is None:
+                _PENDING_EXEC = (_finalize_exec,)
+                return ret
+
+            # Single-RPC vllm: this call already produced the output object.
+            return _finalize_on_get_output(ret, _finalize_exec)
         
         target.execute_model = wrapped_execute_model
 
-
-
-class C_WorkerHook(BaseHook):
-    HOOK_MODULE_NAME = "vllm.v1.worker.gpu_worker"
-    HOOK_CLASS_NAME = "Worker"
-
-    @classmethod
-    def hook(cls, target) -> None:
-
         # Two-window collection (X1): if this vllm version has sample_tokens
-        # (two-RPC architecture), clamp it with cuda.sync to measure the full
+        # (two-RPC architecture), time it with cuda events to measure the full
         # RPC-2 span (sampler + MTP draft forward + bookkeeping D2H + output
         # construction). It aligns 1:1 by call order with the execute_model
-        # window (RPC-1, measured by C_WorkerWrapperBaseHook).
+        # window (RPC-1, measured above).
         # Skipped automatically on older vllm without this method; the
         # iter_latency semantics remain unchanged.
         original_sample_tokens = getattr(target, "sample_tokens", None)
         if original_sample_tokens is not None:
 
             def wrapped_sample_tokens(self, *args, **kwargs):
-                torch.cuda.synchronize()
-                start = time.time()
+                global _PENDING_EXEC
+
+                # Bracket RPC-2 with timing cuda events instead of syncing.
+                sample_timer = _EventTimer()
+                sample_timer.record_start()
                 ret = original_sample_tokens(self, *args, **kwargs)
-                torch.cuda.synchronize()
-                BATCH_SAMPLE_TOKENS_LATENCIES.append(_round6(time.time() - start))
-                return ret
+                sample_timer.record_end()
+
+                pending_exec = _PENDING_EXEC
+                _PENDING_EXEC = None
+
+                def _finalize():
+                    sample_latency = sample_timer.elapsed_s()
+                    # Hand the paired sample latency to the execute_model
+                    # window, which records it on the batch and prints it.
+                    if pending_exec is not None:
+                        pending_exec[0](sample_latency)
+
+                return _finalize_on_get_output(ret, _finalize)
 
             target.sample_tokens = wrapped_sample_tokens
 
@@ -242,18 +359,10 @@ class C_WorkerHook(BaseHook):
             output_dir = get_output_dir()
             rank_suffix = f"rank{self.rank}"
 
-            n_st = len(BATCH_SAMPLE_TOKENS_LATENCIES)
-            for i, batch_info in enumerate(BATCH_INFOS):
-                # Backward compatible: under the old hook / old vllm,
-                # i >= n_st and sample_tokens_latency stays 0.0.
-                if i < n_st:
-                    batch_info.sample_tokens_latency = (
-                        BATCH_SAMPLE_TOKENS_LATENCIES[i]
-                    )
-
+            # sample_tokens_latency is already recorded on each batch at its
+            # finalize point (paired 1:1 with the sample_tokens call).
             batch_infos = BATCH_INFOS
             BATCH_INFOS = []
-            BATCH_SAMPLE_TOKENS_LATENCIES.clear()
 
             def _export():
                 path = f"{output_dir}/{rank_suffix}.schedule_batch.jsonl"
