@@ -719,6 +719,19 @@ class TestConnectorAdapters:
 
 
 class TestEngineClockBoundary:
+    @pytest.mark.parametrize(
+        "value, expected",
+        [(None, False), ("1", True), ("true", True), ("0", False), ("false", False)],
+    )
+    def test_record_stats_env(self, monkeypatch, value, expected):
+        from sglang_simulator.simulation.manager.env import Envs
+
+        if value is None:
+            monkeypatch.delenv("SGLANG_SIMULATOR_RECORD_STATS", raising=False)
+        else:
+            monkeypatch.setenv("SGLANG_SIMULATOR_RECORD_STATS", value)
+        assert Envs.record_stats() is expected
+
     @pytest.fixture(autouse=True)
     def engine(self, monkeypatch):
         from sglang_simulator.simulation.manager import StateManager
@@ -872,6 +885,52 @@ class TestEngineClockBoundary:
         assert StateManager.get_current_inference_dur() == 0.0
         assert self.engine.admitted == []
 
+    def test_blocking_stats_recording_can_be_disabled(self, monkeypatch, tmp_path):
+        from sglang_simulator.simulation.req_stats_manager import request_stats_manager
+        from sglang_simulator.simulation.types import SimulationMode
+        from sglang_simulator.simulation.vllm import engine_core_pipeline as pipeline
+
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "SIM_MODE", SimulationMode.BLOCKING)
+        monkeypatch.setattr(pipeline, "_RECORD_STATS", False)
+        monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_DIR", str(tmp_path))
+        request_stats_manager.reset()
+        pipeline.C_VLLMEngineCoreHook.ITERATION_STATS.clear()
+
+        req = SimpleNamespace(request_id="r", prompt_token_ids=[1])
+        assert pipeline._new_request_stats(req, 0.0, 0.0, 0.0) is None
+        assert request_stats_manager.stats == {}
+
+        output = SimpleNamespace(
+            _sim_iteration_stat={"forward_latency": 1.0},
+            num_scheduled_tokens={"r": 1},
+        )
+        pipeline._finalize_step_stats(output, 1.0)
+        assert pipeline.C_VLLMEngineCoreHook.ITERATION_STATS == []
+
+        self.engine.profile(False)
+        assert (tmp_path / "request.jsonl").read_text() == ""
+        assert (tmp_path / "iteration.jsonl").read_text() == ""
+
+    def test_stats_switch_does_not_disable_offline_recording(self, monkeypatch):
+        from sglang_simulator.simulation.req_stats_manager import request_stats_manager
+        from sglang_simulator.simulation.types import SimulationMode
+        from sglang_simulator.simulation.vllm import engine_core_pipeline as pipeline
+
+        monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "SIM_MODE", SimulationMode.OFFLINE)
+        monkeypatch.setattr(pipeline, "_RECORD_STATS", False)
+        request_stats_manager.reset()
+        pipeline.C_VLLMEngineCoreHook.ITERATION_STATS.clear()
+
+        req = SimpleNamespace(request_id="r", prompt_token_ids=[1])
+        assert pipeline._new_request_stats(req, 0.0, 0.0, 0.0) is not None
+        output = SimpleNamespace(
+            _sim_iteration_stat={"forward_latency": 1.0},
+            num_scheduled_tokens={"r": 1},
+            _sim_token_emitted={"r": True},
+        )
+        pipeline._finalize_step_stats(output, 1.0)
+        assert len(pipeline.C_VLLMEngineCoreHook.ITERATION_STATS) == 1
+
     @pytest.mark.parametrize("is_start", [False, True])
     def test_blocking_profile_does_not_reset_connector(self, monkeypatch, tmp_path, is_start):
         from sglang_simulator.simulation.vllm import engine_core_pipeline as pipeline
@@ -958,6 +1017,7 @@ class TestEngineClockBoundary:
             calls.append("predict")
             return 0.5
         monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "SIM_MODE", SimulationMode(mode))
+        monkeypatch.setattr(pipeline, "_RECORD_STATS", True)
         monkeypatch.setattr(pipeline.C_VLLMExecutorHook, "_COLD_START_DONE", True)
         monkeypatch.setattr(pipeline.C_VLLMEngineCoreHook, "INFERENCE_PREDICTOR", SimpleNamespace(
             predict_infer_time=predict))

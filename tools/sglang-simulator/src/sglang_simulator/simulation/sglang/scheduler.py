@@ -552,16 +552,8 @@ class C_SchedulerHook(BaseHook):
                             f.write(json.dumps(item) + "\n")
 
                     with open(f"{output_dir}/request.jsonl", "w") as f:
-                        record_raw_request = Envs.record_raw_request()
                         for item in stats:
-                            data = asdict(item)
-                            # Raw token ids are never recorded on the sglang
-                            # backend; strip the keys unless the recording
-                            # switch explicitly opts into the extended schema.
-                            if not record_raw_request:
-                                data.pop("input_ids", None)
-                                data.pop("output_ids", None)
-                            f.write(json.dumps(data) + "\n")
+                            f.write(json.dumps(asdict(item)) + "\n")
 
                     logger.info(f"Simulation results saved to {output_dir}.")
 

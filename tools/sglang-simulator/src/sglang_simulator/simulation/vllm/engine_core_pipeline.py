@@ -52,14 +52,24 @@ logger = get_logger()
 # None means no override (use original sampling_params.max_tokens)
 _MAX_DECODE_STEPS = int(v) if (v := os.environ.get("SGLANG_SIMULATOR_MAX_DECODE_STEPS")) is not None else None
 
-# Record raw input_ids/output_ids on RequestStats
-# (VLLM_SIMULATOR_RECORD_RAW_REQUEST, off by default). Read once here so
-# the schedule hot path pays no env lookup.
-_RECORD_RAW_REQUEST = Envs.record_raw_request()
+# BLOCKING stats collection is opt-in for latency-sensitive serving.
+# Read once so the schedule hot path pays no environment lookup.
+_RECORD_STATS = Envs.record_stats()
+
+
+def _stats_recording_enabled() -> bool:
+    # OFFLINE metrics such as TTFT depend on gen_token_latencies, so stats
+    # collection must remain enabled there regardless of the environment flag.
+    return (
+        C_VLLMEngineCoreHook.SIM_MODE != SimulationMode.BLOCKING or _RECORD_STATS
+    )
+
 
 def _new_request_stats(request, created_time, queue_start, last_event_time):
-    """Initialize the shared RequestStats entry for a request so every
-    dumped record carries length / hit fields (0 by default)."""
+    """Initialize one RequestStats entry when stats collection is enabled."""
+    if not _stats_recording_enabled():
+        return None
+
     input_length = getattr(request, "num_prompt_tokens", None)
     if input_length is None:
         input_length = len(getattr(request, "prompt_token_ids", None) or [])
@@ -71,13 +81,6 @@ def _new_request_stats(request, created_time, queue_start, last_event_time):
     st.last_event_time = last_event_time
     st.input_length = input_length
     st.output_length = 0
-    # Raw prompt token ids (mirrors sglang hook's raw_request export),
-    # enabling trace-level join back to the original dataset.
-    if _RECORD_RAW_REQUEST:
-        prompt_token_ids = getattr(request, "prompt_token_ids", None)
-        st.input_ids = (
-            list(prompt_token_ids) if prompt_token_ids is not None else []
-        )
     return st
 
 
@@ -208,6 +211,8 @@ def _ext_computed_tokens(req_id) -> int:
 
 def _finalize_step_stats(scheduler_output, event_time: float) -> None:
     """Publish one step's stats when its model-output future is complete."""
+    if not _stats_recording_enabled():
+        return
     if getattr(scheduler_output, "_sim_stats_finalized", False):
         return
     iteration_stat = getattr(scheduler_output, "_sim_iteration_stat", None)
@@ -340,24 +345,6 @@ class C_VLLMEngineCoreHook(BaseHook):
             if offline and dispatcher.all_received:
                 dispatcher.dispatch(self)
 
-            # --- Capture output_ids BEFORE original_step() ---
-            # step()->schedule() removes finished requests from
-            # scheduler.requests, so a post-step lookup returns None.
-            # output_token_ids at this point reflects all tokens generated
-            # up to the previous step (update_from_output runs between
-            # consecutive steps), which is the complete output for requests
-            # finishing this step.
-            if _RECORD_RAW_REQUEST:
-                _scheduler = getattr(self, "scheduler", None)
-                for req_id, request in (
-                        getattr(_scheduler, "requests", None) or {}).items():
-                    st = request_stats_manager.stats.get(req_id)
-                    if st is None:
-                        continue
-                    output_token_ids = getattr(request, "output_token_ids", None)
-                    if output_token_ids:
-                        st.output_ids = list(output_token_ids)
-
             result = original_step(self, *args, **kwargs)
             if offline and not result[1]:
                 # The count hook includes parked arrivals; they are not active work.
@@ -403,17 +390,9 @@ class C_VLLMEngineCoreHook(BaseHook):
         def wrapped_profile(self, is_start: bool = True):
             req_stats = request_stats_manager.get_all_req_stats()
             output_dir = Envs.output_dir()
-            record_raw_request = Envs.record_raw_request()
             with open(os.path.join(output_dir, "request.jsonl"), "w") as f:
                 for item in req_stats:
-                    data = asdict(item)
-                    # Raw token ids are only part of the schema when the
-                    # recording switch is on; otherwise strip the keys so
-                    # the line schema matches the pre-feature request.jsonl.
-                    if not record_raw_request:
-                        data.pop("input_ids", None)
-                        data.pop("output_ids", None)
-                    f.write(json.dumps(data, default=str) + "\n")
+                    f.write(json.dumps(asdict(item), default=str) + "\n")
             with open(os.path.join(output_dir, "iteration.jsonl"), "w") as f:
                 for item in cls.ITERATION_STATS:
                     f.write(json.dumps(item, default=str) + "\n")
