@@ -176,14 +176,47 @@ def _run_export(export_fn, is_start: bool) -> None:
         export_fn()
 
 
-def get_output_dir() -> str:
+# Per-round export subdirectory --------------------------------------------
+# EngineCore.profile and every Worker.profile fire exactly once per profile
+# call (start_profile/stop_profile fan out via collective_rpc to all
+# workers), so each process can keep its own call counter and the counters
+# stay aligned 1:1 across the EngineCore and Worker processes. The run
+# subdirectory below is therefore pairable across processes purely by the
+# "run{NNN}" counter -- no cross-process coordination (shared files, extra
+# RPC fields) is needed to match rank0.requests.jsonl with the
+# rank{N}.schedule_batch.jsonl of the same round.
+_PROFILE_ROUND = 0
+# Readable wall-clock tag of this process, fixed once at import time. Only a
+# human-friendly prefix; the run counter above is the pairing key.
+_PROCESS_START_TS = time.strftime("%Y%m%d_%H%M%S")
+# Run subdirectory minted by the latest start_profile; reused by stop_profile
+# so one round's start/stop exports land in the same directory.
+_CURRENT_RUN_SUBDIR: Optional[str] = None
+
+
+def get_output_dir(is_start: bool = True) -> str:
+    """Export dir of the current profile round:
+    $SIM_COLLECTOR_OUTPUT_DIR/engine{RANK}/{proc_start_ts}_run{NNN}/
+    (pid{PID} instead of engine{RANK} when DS_LLM_PROC_RANK is unset).
+
+    A fresh run subdirectory is minted on every start_profile (and lazily on
+    a stop_profile that never saw a start), so successive profile rounds and
+    service restarts no longer overwrite earlier exports -- previously the
+    fixed directory plus "w"-mode files kept only the latest round.
+    bandwidth_profile.json intentionally stays at the top level (node-level
+    hardware property, calibrated once).
+    """
+    global _PROFILE_ROUND, _CURRENT_RUN_SUBDIR
     base = os.getenv("SIM_COLLECTOR_OUTPUT_DIR", os.getcwd())
     engine_rank = os.getenv("DS_LLM_PROC_RANK")
     if engine_rank is not None:
         sub_dir = f"engine{engine_rank}"
     else:
         sub_dir = f"pid{os.getpid()}"
-    output_dir = os.path.join(base, sub_dir)
+    if is_start or _CURRENT_RUN_SUBDIR is None:
+        _PROFILE_ROUND += 1
+        _CURRENT_RUN_SUBDIR = f"{_PROCESS_START_TS}_run{_PROFILE_ROUND:03d}"
+    output_dir = os.path.join(base, sub_dir, _CURRENT_RUN_SUBDIR)
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
@@ -356,7 +389,7 @@ class C_WorkerHook(BaseHook):
         def override_profile(self, is_start: bool = True):
             global BATCH_INFOS
 
-            output_dir = get_output_dir()
+            output_dir = get_output_dir(is_start=is_start)
             rank_suffix = f"rank{self.rank}"
 
             # sample_tokens_latency is already recorded on each batch at its
@@ -394,7 +427,7 @@ class C_EngineCoreHook(BaseHook):
         def wrapped_profile(self, is_start: bool = True):
             global REQUEST_INFOS
 
-            output_dir = get_output_dir()
+            output_dir = get_output_dir(is_start=is_start)
 
             request_infos = REQUEST_INFOS
             REQUEST_INFOS = defaultdict(RequestInfos)
