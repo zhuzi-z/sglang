@@ -445,8 +445,11 @@ def install_v6d_runtime_hooks():
     """Apply all v6d-side simulation hooks; call once before v6d.cli main
     (class hooks must precede the imports that define the target classes).
     """
+    from sglang_simulator.simulation.vllm.v6d.tair_kvcm_simulation import C_TairKVCMTransferRuntimeHook
+
     install_class_hooks([
         C_VineyardPeerHook,
         C_TieredVineyardPeerHook,
         C_HitRateStatsHook,
+        C_TairKVCMTransferRuntimeHook,
     ])
