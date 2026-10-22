@@ -4,6 +4,7 @@ from worker_hook import (
     C_WorkerHook,
     C_SchedulerHook,
     C_EngineCoreHook,
+    C_ModelRunnerSegHook,
 )
 
 install_class_hooks(
@@ -12,6 +13,7 @@ install_class_hooks(
         C_WorkerHook,
         C_SchedulerHook,
         C_EngineCoreHook,
+        C_ModelRunnerSegHook,
     ]
 )
 
