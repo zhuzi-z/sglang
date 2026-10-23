@@ -37,6 +37,7 @@ class RequestInfos:
     total_kv_hit_len: int = 0
     local_kv_hit_len: int = 0
     ext_kv_hit_len: int = 0
+    remote_kv_ready_ts: float = 0.0  # scheduler first sees finished_recving
     input_ids: array = field(default_factory=lambda: array("i"))
     output_ids: array = field(default_factory=lambda: array("i"))
 
@@ -593,6 +594,15 @@ class C_SchedulerHook(BaseHook):
             return original_add_request(self, request)
 
         def wrapped_schedule(self):
+            # D1: timestamp when remote-KV readiness first becomes visible
+            # to the scheduler (consumed from finished_recving this round).
+            try:
+                for _rid in getattr(self, "finished_recving_kv_req_ids", ()):
+                    _ri = REQUEST_INFOS.get(_rid)
+                    if _ri is not None and _ri.remote_kv_ready_ts == 0.0:
+                        _ri.remote_kv_ready_ts = round(time.time(), 6)
+            except Exception:
+                pass
             scheduler_output = original_schedule(self)
 
             if scheduler_output.scheduled_new_reqs:
