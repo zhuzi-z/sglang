@@ -674,6 +674,18 @@ class C_V6dWorkerHook(BaseHook):
 
         target.async_start_load_kv = wrapped_async_start_load_kv
 
+        # Store side: same submit-timestamp stash, so store rows get a
+        # queued_s symmetric to load rows.
+        original_async_start_store_kv = target.async_start_store_kv
+
+        def wrapped_async_start_store_kv(self, metadata):
+            now = time.time()
+            for req_id in (getattr(metadata, "reqs_to_store", None) or {}):
+                _REQ_STORE_SUBMIT_TS[req_id] = now
+            return original_async_start_store_kv(self, metadata)
+
+        target.async_start_store_kv = wrapped_async_start_store_kv
+
 
 class C_V6dSwapHook(BaseHook):
     """Measure per-transfer latency inside V6dSwapHandler.async_swap.
