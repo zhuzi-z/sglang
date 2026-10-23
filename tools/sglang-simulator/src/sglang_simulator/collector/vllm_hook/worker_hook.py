@@ -208,8 +208,10 @@ class TransferInfos:
     num_blocks: int = 0         # len(keys)
     nbytes: int = 0             # num_blocks * block_bytes (0 if unknown)
     cross_node: Optional[bool] = None  # None = unknown (see _REQ_CROSS_NODE)
+    queued_s: float = 0.0       # submit -> coroutine entry (event-loop queue)
     job_id: int = 0
-    submit_ts: float = 0.0      # async_swap entry
+    submit_ts: float = 0.0      # async_start_load_kv submit time (main thread)
+    start_ts: float = 0.0       # async_swap coroutine entry (transfer begins)
     done_ts: float = 0.0        # async_swap pre-return (event.query done)
     error: str = ""
 
@@ -218,6 +220,8 @@ TRANSFER_INFOS: list[TransferInfos] = []
 # req_id -> cross_node, stashed by C_V6dWorkerHook at submit time from
 # metadata.external_tokens (>0 == remote hit), consumed by C_V6dSwapHook.
 _REQ_CROSS_NODE: dict[str, bool] = {}
+# req_id -> submit wall-clock, paired with the cross_node stash above.
+_REQ_SUBMIT_TS: dict[str, float] = {}
 
 
 def get_output_dir(is_start: bool = True) -> str:
@@ -578,8 +582,10 @@ class C_V6dWorkerHook(BaseHook):
 
         def wrapped_async_start_load_kv(self, metadata):
             ext = getattr(metadata, "external_tokens", None) or {}
+            now = time.time()
             for req_id in (getattr(metadata, "reqs_to_load", None) or {}):
                 _REQ_CROSS_NODE[req_id] = int(ext.get(req_id, 0) or 0) > 0
+                _REQ_SUBMIT_TS[req_id] = now  # queue-wait anchor (T2/T3)
             return original_async_start_load_kv(self, metadata)
 
         target.async_start_load_kv = wrapped_async_start_load_kv
@@ -608,7 +614,8 @@ class C_V6dSwapHook(BaseHook):
             keys = args[1] if len(args) > 1 else kwargs.get("keys") or []
             request_id = (args[3] if len(args) > 3
                           else kwargs.get("request_id", ""))
-            start_ts = time.time()
+            start_ts = time.time()  # T4: transfer actually begins here
+            submit_ts = _REQ_SUBMIT_TS.pop(request_id, None)
             err = None
             try:
                 return await original_async_swap(self, *args, **kwargs)
@@ -625,8 +632,11 @@ class C_V6dSwapHook(BaseHook):
                     num_blocks=len(keys) if keys else 0,
                     nbytes=0,
                     cross_node=_REQ_CROSS_NODE.get(request_id),
+                    queued_s=(round(start_ts - submit_ts, 6)
+                              if submit_ts else 0.0),
                     job_id=job_id,
-                    submit_ts=round(start_ts, 6),
+                    submit_ts=(round(submit_ts, 6) if submit_ts else 0.0),
+                    start_ts=round(start_ts, 6),
                     done_ts=round(end_ts, 6),
                     error=err or "",
                 ))
