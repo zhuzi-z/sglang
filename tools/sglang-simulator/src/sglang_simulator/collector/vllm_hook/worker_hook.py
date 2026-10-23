@@ -53,6 +53,10 @@ class BatchInfos:
     logprobs_req_count: int = 0
     logprobs_tokens: int = 0
     logprobs_n: int = 0
+    # X2: per-segment RPC-2 breakdown in ms
+    # ({sample, draft, bookkeep, eplb, other}); None when segment hooks are
+    # unavailable on this vllm version.
+    st_segments_ms: Optional[dict] = None
 
 
 BATCH_INFOS: list[BatchInfos] = []
@@ -104,6 +108,17 @@ class _EventTimer:
 # the same step. A single slot is enough because the two RPCs run back-to-back
 # within a step; only get_output() is overlapped across steps.
 _PENDING_EXEC: Optional[tuple] = None
+
+# --- RPC-2 per-segment timing (X2) -----------------------------------------
+# CPU wall-clock contribution of the four hookable boundaries inside
+# Worker.sample_tokens: _sample / propose_draft_token_ids /
+# _bookkeeping_sync / eplb_step+fluid_step. No extra cuda.synchronize is
+# inserted, so engine behavior is unchanged; an async GPU tail of one segment
+# surfaces as CPU wait inside the next segment that synchronizes on it
+# (e.g. draft's GPU time lands in bookkeep's D2H wait), and the residual
+# (sample_tokens_latency - sum(segments)) is reported as "other".
+SEG_KEYS = ("sample", "draft", "bookkeep", "eplb")
+_SEG_STATE = {"active": False, "cur": None}
 
 
 def _finalize_on_get_output(output, finalize):
@@ -222,6 +237,8 @@ TRANSFER_INFOS: list[TransferInfos] = []
 _REQ_CROSS_NODE: dict[str, bool] = {}
 # req_id -> submit wall-clock, paired with the cross_node stash above.
 _REQ_SUBMIT_TS: dict[str, float] = {}
+# store-side queue anchor (async_start_store_kv submit time).
+_REQ_STORE_SUBMIT_TS: dict[str, float] = {}
 
 
 def get_output_dir(is_start: bool = True) -> str:
@@ -356,7 +373,8 @@ class C_WorkerHook(BaseHook):
                 )
                 BATCH_INFOS.append(batch_info)
 
-            def _finalize_exec(sample_latency: Optional[float] = None):
+            def _finalize_exec(sample_latency: Optional[float] = None,
+                               seg: Optional[dict] = None):
                 if batch_info is None:
                     return
                 iter_latency = exec_timer.elapsed_s()
@@ -366,6 +384,12 @@ class C_WorkerHook(BaseHook):
                 batch_info.end_timestamp = _round6(start_wall + iter_latency)
                 if sample_latency is not None:
                     batch_info.sample_tokens_latency = _round6(sample_latency)
+                if seg is not None:
+                    st_ms = (sample_latency or 0.0) * 1e3
+                    batch_info.st_segments_ms = {
+                        **{k: round(v, 4) for k, v in seg.items()},
+                        "other": round(st_ms - sum(seg.values()), 4),
+                    }
                 # Print the batch info at its recording (finalize) point.
                 _print_batch_info(batch_info)
 
@@ -397,18 +421,26 @@ class C_WorkerHook(BaseHook):
                 # Bracket RPC-2 with timing cuda events instead of syncing.
                 sample_timer = _EventTimer()
                 sample_timer.record_start()
-                ret = original_sample_tokens(self, *args, **kwargs)
+                # X2: open the per-segment timing window for this RPC-2 call.
+                _SEG_STATE["cur"] = {k: 0.0 for k in SEG_KEYS}
+                _SEG_STATE["active"] = True
+                try:
+                    ret = original_sample_tokens(self, *args, **kwargs)
+                finally:
+                    _SEG_STATE["active"] = False
                 sample_timer.record_end()
 
+                seg = _SEG_STATE["cur"]
                 pending_exec = _PENDING_EXEC
                 _PENDING_EXEC = None
 
                 def _finalize():
                     sample_latency = sample_timer.elapsed_s()
-                    # Hand the paired sample latency to the execute_model
-                    # window, which records it on the batch and prints it.
+                    # Hand the paired sample latency and the per-segment
+                    # breakdown to the execute_model window, which records
+                    # them on the batch and prints it.
                     if pending_exec is not None:
-                        pending_exec[0](sample_latency)
+                        pending_exec[0](sample_latency, seg)
 
                 return _finalize_on_get_output(ret, _finalize)
 
@@ -454,6 +486,48 @@ class C_WorkerHook(BaseHook):
             _run_export(_export_transfer, is_start)
 
         target.profile = override_profile
+
+
+
+class C_ModelRunnerSegHook(BaseHook):
+    """Per-segment timing inside Worker.sample_tokens (X2).
+
+    Wraps the four hookable boundaries of RPC-2 on GPUModelRunner:
+    _sample / propose_draft_token_ids / _bookkeeping_sync / eplb_step +
+    fluid_step (merged into "eplb"). Timing is active only inside the
+    sample_tokens window (_SEG_STATE["active"]), so calls from warmup /
+    dummy_run paths never pollute the step-aligned segments. Methods
+    missing on this vllm version are skipped with a warning.
+    """
+
+    HOOK_MODULE_NAME = "vllm.v1.worker.gpu_model_runner"
+    HOOK_CLASS_NAME = "GPUModelRunner"
+
+    @classmethod
+    def hook(cls, target) -> None:
+
+        def _timed(attr, key):
+            fn = getattr(target, attr, None)
+            if fn is None:
+                print(f"[seg-hook] {attr} not found on GPUModelRunner; skipped")
+                return
+
+            def wrapped(*args, **kwargs):
+                if not _SEG_STATE["active"]:
+                    return fn(*args, **kwargs)
+                t0 = time.perf_counter()
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    _SEG_STATE["cur"][key] += (time.perf_counter() - t0) * 1e3
+
+            setattr(target, attr, wrapped)
+
+        _timed("_sample", "sample")
+        _timed("propose_draft_token_ids", "draft")
+        _timed("_bookkeeping_sync", "bookkeep")
+        _timed("eplb_step", "eplb")
+        _timed("fluid_step", "eplb")
 
 
 
@@ -643,3 +717,44 @@ class C_V6dSwapHook(BaseHook):
                 _REQ_CROSS_NODE.pop(request_id, None)
 
         target.async_swap = wrapped_async_swap
+
+        # 同步 swap 路径：部分 vllm 版本/场景的 store（如 bypass 子步 store）
+        # 走同步 swap() 而非 async_swap()，必须同时包裹才能全覆盖。
+        original_swap = target.swap
+
+        def wrapped_swap(self, *args, **kwargs):
+            job_id = args[0] if len(args) > 0 else kwargs.get("job_id", 0)
+            keys = args[1] if len(args) > 1 else kwargs.get("keys") or []
+            request_id = (args[3] if len(args) > 3
+                          else kwargs.get("request_id", ""))
+            start_ts = time.time()
+            swap_in = getattr(self, "_swap_in", True)
+            submit_ts = (_REQ_SUBMIT_TS.pop(request_id, None) if swap_in
+                         else _REQ_STORE_SUBMIT_TS.pop(request_id, None))
+            err = None
+            try:
+                return original_swap(self, *args, **kwargs)
+            except Exception as e:
+                err = repr(e)
+                raise
+            finally:
+                end_ts = time.time()
+                TRANSFER_INFOS.append(TransferInfos(
+                    rid=request_id,
+                    direction=("load" if swap_in else "store"),
+                    latency_s=round(end_ts - start_ts, 6),
+                    num_blocks=len(keys) if keys else 0,
+                    nbytes=0,
+                    cross_node=_REQ_CROSS_NODE.get(request_id),
+                    queued_s=(round(start_ts - submit_ts, 6)
+                              if submit_ts else 0.0),
+                    job_id=job_id,
+                    submit_ts=(round(submit_ts, 6) if submit_ts else 0.0),
+                    start_ts=round(start_ts, 6),
+                    done_ts=round(end_ts, 6),
+                    error=err or "",
+                ))
+                _REQ_CROSS_NODE.pop(request_id, None)
+
+        target.swap = wrapped_swap
+
