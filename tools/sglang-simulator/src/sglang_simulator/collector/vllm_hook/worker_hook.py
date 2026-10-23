@@ -37,7 +37,6 @@ class RequestInfos:
     total_kv_hit_len: int = 0
     local_kv_hit_len: int = 0
     ext_kv_hit_len: int = 0
-    remote_kv_ready_ts: float = 0.0  # scheduler first sees finished_recving
     input_ids: array = field(default_factory=lambda: array("i"))
     output_ids: array = field(default_factory=lambda: array("i"))
 
@@ -223,7 +222,7 @@ TRANSFER_INFOS: list[TransferInfos] = []
 _REQ_CROSS_NODE: dict[str, bool] = {}
 # req_id -> submit wall-clock, paired with the cross_node stash above.
 _REQ_SUBMIT_TS: dict[str, float] = {}
-# req_id -> store submit wall-clock (async_start_store_kv), store-side queue anchor.
+# store-side queue anchor (async_start_store_kv submit time).
 _REQ_STORE_SUBMIT_TS: dict[str, float] = {}
 
 
@@ -522,15 +521,6 @@ class C_SchedulerHook(BaseHook):
             return original_add_request(self, request)
 
         def wrapped_schedule(self):
-            # D1: timestamp when remote-KV readiness first becomes visible
-            # to the scheduler (consumed from finished_recving this round).
-            try:
-                for _rid in getattr(self, "finished_recving_kv_req_ids", ()):
-                    _ri = REQUEST_INFOS.get(_rid)
-                    if _ri is not None and _ri.remote_kv_ready_ts == 0.0:
-                        _ri.remote_kv_ready_ts = _round6(time.time())
-            except Exception:
-                pass
             scheduler_output = original_schedule(self)
 
             if scheduler_output.scheduled_new_reqs:
@@ -602,18 +592,6 @@ class C_V6dWorkerHook(BaseHook):
 
         target.async_start_load_kv = wrapped_async_start_load_kv
 
-        # Store side: same submit-timestamp stash, so store rows get a
-        # queued_s symmetric to load rows.
-        original_async_start_store_kv = target.async_start_store_kv
-
-        def wrapped_async_start_store_kv(self, metadata):
-            now = time.time()
-            for req_id in (getattr(metadata, "reqs_to_store", None) or {}):
-                _REQ_STORE_SUBMIT_TS[req_id] = now
-            return original_async_start_store_kv(self, metadata)
-
-        target.async_start_store_kv = wrapped_async_start_store_kv
-
 
 class C_V6dSwapHook(BaseHook):
     """Measure per-transfer latency inside V6dSwapHandler.async_swap.
@@ -639,9 +617,7 @@ class C_V6dSwapHook(BaseHook):
             request_id = (args[3] if len(args) > 3
                           else kwargs.get("request_id", ""))
             start_ts = time.time()  # T4: transfer actually begins here
-            swap_in = getattr(self, "_swap_in", True)
-            submit_ts = (_REQ_SUBMIT_TS.pop(request_id, None) if swap_in
-                         else _REQ_STORE_SUBMIT_TS.pop(request_id, None))
+            submit_ts = _REQ_SUBMIT_TS.pop(request_id, None)
             err = None
             try:
                 return await original_async_swap(self, *args, **kwargs)
@@ -652,7 +628,7 @@ class C_V6dSwapHook(BaseHook):
                 end_ts = time.time()
                 TRANSFER_INFOS.append(TransferInfos(
                     rid=request_id,
-                    direction=("load" if swap_in
+                    direction=("load" if getattr(self, "_swap_in", True)
                                else "store"),
                     latency_s=round(end_ts - start_ts, 6),
                     num_blocks=len(keys) if keys else 0,
@@ -669,3 +645,44 @@ class C_V6dSwapHook(BaseHook):
                 _REQ_CROSS_NODE.pop(request_id, None)
 
         target.async_swap = wrapped_async_swap
+
+        # 同步 swap 路径：部分 vllm 版本/场景的 store（如 bypass 子步 store）
+        # 走同步 swap() 而非 async_swap()，必须同时包裹才能全覆盖。
+        original_swap = target.swap
+
+        def wrapped_swap(self, *args, **kwargs):
+            job_id = args[0] if len(args) > 0 else kwargs.get("job_id", 0)
+            keys = args[1] if len(args) > 1 else kwargs.get("keys") or []
+            request_id = (args[3] if len(args) > 3
+                          else kwargs.get("request_id", ""))
+            start_ts = time.time()
+            swap_in = getattr(self, "_swap_in", True)
+            submit_ts = (_REQ_SUBMIT_TS.pop(request_id, None) if swap_in
+                         else _REQ_STORE_SUBMIT_TS.pop(request_id, None))
+            err = None
+            try:
+                return original_swap(self, *args, **kwargs)
+            except Exception as e:
+                err = repr(e)
+                raise
+            finally:
+                end_ts = time.time()
+                TRANSFER_INFOS.append(TransferInfos(
+                    rid=request_id,
+                    direction=("load" if swap_in else "store"),
+                    latency_s=round(end_ts - start_ts, 6),
+                    num_blocks=len(keys) if keys else 0,
+                    nbytes=0,
+                    cross_node=_REQ_CROSS_NODE.get(request_id),
+                    queued_s=(round(start_ts - submit_ts, 6)
+                              if submit_ts else 0.0),
+                    job_id=job_id,
+                    submit_ts=(round(submit_ts, 6) if submit_ts else 0.0),
+                    start_ts=round(start_ts, 6),
+                    done_ts=round(end_ts, 6),
+                    error=err or "",
+                ))
+                _REQ_CROSS_NODE.pop(request_id, None)
+
+        target.swap = wrapped_swap
+
