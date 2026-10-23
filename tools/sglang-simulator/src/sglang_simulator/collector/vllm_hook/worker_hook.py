@@ -37,6 +37,7 @@ class RequestInfos:
     total_kv_hit_len: int = 0
     local_kv_hit_len: int = 0
     ext_kv_hit_len: int = 0
+    remote_kv_ready_ts: float = 0.0  # scheduler first sees finished_recving
     input_ids: array = field(default_factory=lambda: array("i"))
     output_ids: array = field(default_factory=lambda: array("i"))
 
@@ -222,6 +223,8 @@ TRANSFER_INFOS: list[TransferInfos] = []
 _REQ_CROSS_NODE: dict[str, bool] = {}
 # req_id -> submit wall-clock, paired with the cross_node stash above.
 _REQ_SUBMIT_TS: dict[str, float] = {}
+# req_id -> store submit wall-clock (async_start_store_kv), store-side queue anchor.
+_REQ_STORE_SUBMIT_TS: dict[str, float] = {}
 
 
 def get_output_dir(is_start: bool = True) -> str:
@@ -519,6 +522,15 @@ class C_SchedulerHook(BaseHook):
             return original_add_request(self, request)
 
         def wrapped_schedule(self):
+            # D1: timestamp when remote-KV readiness first becomes visible
+            # to the scheduler (consumed from finished_recving this round).
+            try:
+                for _rid in getattr(self, "finished_recving_kv_req_ids", ()):
+                    _ri = REQUEST_INFOS.get(_rid)
+                    if _ri is not None and _ri.remote_kv_ready_ts == 0.0:
+                        _ri.remote_kv_ready_ts = _round6(time.time())
+            except Exception:
+                pass
             scheduler_output = original_schedule(self)
 
             if scheduler_output.scheduled_new_reqs:
@@ -590,6 +602,18 @@ class C_V6dWorkerHook(BaseHook):
 
         target.async_start_load_kv = wrapped_async_start_load_kv
 
+        # Store side: same submit-timestamp stash, so store rows get a
+        # queued_s symmetric to load rows.
+        original_async_start_store_kv = target.async_start_store_kv
+
+        def wrapped_async_start_store_kv(self, metadata):
+            now = time.time()
+            for req_id in (getattr(metadata, "reqs_to_store", None) or {}):
+                _REQ_STORE_SUBMIT_TS[req_id] = now
+            return original_async_start_store_kv(self, metadata)
+
+        target.async_start_store_kv = wrapped_async_start_store_kv
+
 
 class C_V6dSwapHook(BaseHook):
     """Measure per-transfer latency inside V6dSwapHandler.async_swap.
@@ -615,7 +639,9 @@ class C_V6dSwapHook(BaseHook):
             request_id = (args[3] if len(args) > 3
                           else kwargs.get("request_id", ""))
             start_ts = time.time()  # T4: transfer actually begins here
-            submit_ts = _REQ_SUBMIT_TS.pop(request_id, None)
+            swap_in = getattr(self, "_swap_in", True)
+            submit_ts = (_REQ_SUBMIT_TS.pop(request_id, None) if swap_in
+                         else _REQ_STORE_SUBMIT_TS.pop(request_id, None))
             err = None
             try:
                 return await original_async_swap(self, *args, **kwargs)
@@ -626,7 +652,7 @@ class C_V6dSwapHook(BaseHook):
                 end_ts = time.time()
                 TRANSFER_INFOS.append(TransferInfos(
                     rid=request_id,
-                    direction=("load" if getattr(self, "_swap_in", True)
+                    direction=("load" if swap_in
                                else "store"),
                     latency_s=round(end_ts - start_ts, 6),
                     num_blocks=len(keys) if keys else 0,
