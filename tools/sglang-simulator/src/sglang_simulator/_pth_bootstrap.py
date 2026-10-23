@@ -8,6 +8,8 @@ if os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "o
         C_WorkerHook,
         C_SchedulerHook,
         C_EngineCoreHook,
+        C_V6dWorkerHook,
+        C_V6dSwapHook,
     )
 
     from sglang_simulator.collector.dashserving import (
@@ -26,5 +28,7 @@ if os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "o
             C_WorkerHook,
             C_SchedulerHook,
             C_EngineCoreHook,
+            C_V6dWorkerHook,
+            C_V6dSwapHook,
         ]
     )

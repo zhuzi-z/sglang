@@ -194,6 +194,36 @@ _PROCESS_START_TS = time.strftime("%Y%m%d_%H%M%S")
 _CURRENT_RUN_SUBDIR: Optional[str] = None
 
 
+# ---- HybridConnector KV transfer latency collection (load/store) ----
+# Timing brackets V6dSwapHandler.async_swap: start at coroutine entry (the
+# next stmt is `await client.async_get`, the real transfer kick-off), end
+# right before return (after the inline `while not event.query()` loop, i.e.
+# data truly landed). Wall clock on purpose: the path is CPU/RPC async, CUDA
+# events cannot see it.
+@dataclass(slots=True)
+class TransferInfos:
+    rid: str = ""               # request_id, joins with requests.jsonl
+    direction: str = ""         # "load"/"store" (self._swap_in)
+    latency_s: float = 0.0      # pure transfer latency (RPC pull + CUDA copy)
+    num_blocks: int = 0         # len(keys)
+    nbytes: int = 0             # num_blocks * block_bytes (0 if unknown)
+    cross_node: Optional[bool] = None  # None = unknown (see _REQ_CROSS_NODE)
+    queued_s: float = 0.0       # submit -> coroutine entry (event-loop queue)
+    job_id: int = 0
+    submit_ts: float = 0.0      # async_start_load_kv submit time (main thread)
+    start_ts: float = 0.0       # async_swap coroutine entry (transfer begins)
+    done_ts: float = 0.0        # async_swap pre-return (event.query done)
+    error: str = ""
+
+
+TRANSFER_INFOS: list[TransferInfos] = []
+# req_id -> cross_node, stashed by C_V6dWorkerHook at submit time from
+# metadata.external_tokens (>0 == remote hit), consumed by C_V6dSwapHook.
+_REQ_CROSS_NODE: dict[str, bool] = {}
+# req_id -> submit wall-clock, paired with the cross_node stash above.
+_REQ_SUBMIT_TS: dict[str, float] = {}
+
+
 def get_output_dir(is_start: bool = True) -> str:
     """Export dir of the current profile round:
     $SIM_COLLECTOR_OUTPUT_DIR/engine{RANK}/{proc_start_ts}_run{NNN}/
@@ -387,7 +417,7 @@ class C_WorkerHook(BaseHook):
         original_profile = getattr(target, "profile", None)
 
         def override_profile(self, is_start: bool = True):
-            global BATCH_INFOS
+            global BATCH_INFOS, TRANSFER_INFOS
 
             output_dir = get_output_dir(is_start=is_start)
             rank_suffix = f"rank{self.rank}"
@@ -408,7 +438,20 @@ class C_WorkerHook(BaseHook):
                         )
                 print(f"Schedule batch data has been saved to {path}")
 
+            transfer_infos = TRANSFER_INFOS
+            TRANSFER_INFOS = []
+
+            def _export_transfer():
+                path = f"{output_dir}/{rank_suffix}.transfer.jsonl"
+                if EXPORT_GZIP:
+                    path += ".gz"
+                with _open_export(path) as f:
+                    for t in transfer_infos:
+                        f.write(json.dumps(asdict(t), cls=CustomJsonEncoder) + "\n")
+                print(f"Transfer data has been saved to {path}")
+
             _run_export(_export, is_start)
+            _run_export(_export_transfer, is_start)
 
         target.profile = override_profile
 
@@ -520,3 +563,83 @@ class C_SchedulerHook(BaseHook):
         target.add_request = wrapped_add_request
         target.schedule = wrapped_schedule
         target._free_request = wrapped_free_request
+
+
+class C_V6dWorkerHook(BaseHook):
+    """Record per-request cross_node at transfer-submit time (worker side).
+
+    async_start_load_kv sees metadata.external_tokens (>0 == remote hit) --
+    the only spot the cross-node bit is visible on the worker side. Stash it
+    so C_V6dSwapHook can tag each transfer without re-deriving from keys.
+    """
+
+    HOOK_MODULE_NAME = "vllm.distributed.kv_transfer.kv_connector.v1.v6d_object_connector"
+    HOOK_CLASS_NAME = "V6dObjectConnectorWorker"
+
+    @classmethod
+    def hook(cls, target) -> None:
+        original_async_start_load_kv = target.async_start_load_kv
+
+        def wrapped_async_start_load_kv(self, metadata):
+            ext = getattr(metadata, "external_tokens", None) or {}
+            now = time.time()
+            for req_id in (getattr(metadata, "reqs_to_load", None) or {}):
+                _REQ_CROSS_NODE[req_id] = int(ext.get(req_id, 0) or 0) > 0
+                _REQ_SUBMIT_TS[req_id] = now  # queue-wait anchor (T2/T3)
+            return original_async_start_load_kv(self, metadata)
+
+        target.async_start_load_kv = wrapped_async_start_load_kv
+
+
+class C_V6dSwapHook(BaseHook):
+    """Measure per-transfer latency inside V6dSwapHandler.async_swap.
+
+    Start = coroutine entry (next stmt is `await client.async_get`, the real
+    transfer kick-off). End = just before return (after the inline
+    `while not event.query()` loop, i.e. data truly landed). load/store share
+    async_swap; direction via self._swap_in. Signature-agnostic passthrough:
+    async_swap kwargs differ across vllm versions (create_batch_id only on
+    0827+). Positional order: (job_id, keys, gpu_block_ids, request_id, ...).
+    """
+
+    HOOK_MODULE_NAME = "vllm.distributed.kv_transfer.kv_connector.v1.v6d_object_connector"
+    HOOK_CLASS_NAME = "V6dSwapHandler"
+
+    @classmethod
+    def hook(cls, target) -> None:
+        original_async_swap = target.async_swap
+
+        async def wrapped_async_swap(self, *args, **kwargs):
+            job_id = args[0] if len(args) > 0 else kwargs.get("job_id", 0)
+            keys = args[1] if len(args) > 1 else kwargs.get("keys") or []
+            request_id = (args[3] if len(args) > 3
+                          else kwargs.get("request_id", ""))
+            start_ts = time.time()  # T4: transfer actually begins here
+            submit_ts = _REQ_SUBMIT_TS.pop(request_id, None)
+            err = None
+            try:
+                return await original_async_swap(self, *args, **kwargs)
+            except Exception as e:  # record failed transfers too
+                err = repr(e)
+                raise
+            finally:
+                end_ts = time.time()
+                TRANSFER_INFOS.append(TransferInfos(
+                    rid=request_id,
+                    direction=("load" if getattr(self, "_swap_in", True)
+                               else "store"),
+                    latency_s=round(end_ts - start_ts, 6),
+                    num_blocks=len(keys) if keys else 0,
+                    nbytes=0,
+                    cross_node=_REQ_CROSS_NODE.get(request_id),
+                    queued_s=(round(start_ts - submit_ts, 6)
+                              if submit_ts else 0.0),
+                    job_id=job_id,
+                    submit_ts=(round(submit_ts, 6) if submit_ts else 0.0),
+                    start_ts=round(start_ts, 6),
+                    done_ts=round(end_ts, 6),
+                    error=err or "",
+                ))
+                _REQ_CROSS_NODE.pop(request_id, None)
+
+        target.async_swap = wrapped_async_swap
