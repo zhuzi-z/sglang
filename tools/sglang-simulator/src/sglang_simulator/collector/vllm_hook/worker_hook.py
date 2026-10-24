@@ -627,16 +627,30 @@ class C_SchedulerHook(BaseHook):
                         req_info.input_length = request.num_prompt_tokens
                         req_info.output_length = request.max_tokens
 
-                        req_info.total_kv_hit_len = (
-                            request.num_cached_tokens
+                        # Prefix-KV hit lengths. `Request.num_cached_tokens` is
+                        # gone in current vllm (AttributeError on the first
+                        # scheduled request would kill EngineCore). The hit
+                        # count must come from the scheduler snapshot on
+                        # NewRequestData: original_schedule() has already run,
+                        # so Request.num_computed_tokens now includes this
+                        # step's scheduled tokens. Same source as past_kv_len
+                        # below, keeping both fields on one definition.
+                        hit_len = getattr(new_req_data, "num_computed_tokens", None)
+                        if hit_len is None:
+                            # Older vllm: dedicated cache-hit field on Request.
+                            hit_len = getattr(request, "num_cached_tokens", None)
+                        if hit_len is None:
+                            hit_len = getattr(request, "num_computed_tokens", 0)
+                        ext_hit_len = getattr(
+                            request, "num_external_computed_tokens", None
                         )
-                        req_info.ext_kv_hit_len = (
-                            request.num_external_computed_tokens
-                        )
-                        req_info.local_kv_hit_len = (
-                            request.num_cached_tokens
-                            - request.num_external_computed_tokens
-                        )
+                        if ext_hit_len is None:
+                            ext_hit_len = getattr(
+                                new_req_data, "num_external_computed_tokens", 0
+                            )
+                        req_info.total_kv_hit_len = hit_len
+                        req_info.ext_kv_hit_len = ext_hit_len
+                        req_info.local_kv_hit_len = hit_len - ext_hit_len
 
             return scheduler_output
 
