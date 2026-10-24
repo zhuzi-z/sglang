@@ -305,7 +305,12 @@ class C_WorkerHook(BaseHook):
         # sample_tokens window under a single native get_output synchronize.
         original_execute_model = target.execute_model
 
-        def wrapped_execute_model(self, scheduler_output: "SchedulerOutput"):
+        # *args/**kwargs: callers differ across vllm builds -- e.g. the
+        # torchtpu PP executor passes intermediate_tensors positionally, so a
+        # fixed arity here turns one extra argument into a TypeError that kills
+        # EngineCore. Always forward verbatim to the original.
+        def wrapped_execute_model(self, scheduler_output: "SchedulerOutput",
+                                  *args, **kwargs):
 
             batch_req_infos = {}
             for req_id, sched_token in scheduler_output.num_scheduled_tokens.items():
@@ -348,7 +353,7 @@ class C_WorkerHook(BaseHook):
             exec_timer = _EventTimer()
             start_wall = time.time()
             exec_timer.record_start()
-            ret = original_execute_model(self, scheduler_output)
+            ret = original_execute_model(self, scheduler_output, *args, **kwargs)
             exec_timer.record_end()
 
             batch_info = None
@@ -584,16 +589,20 @@ class C_SchedulerHook(BaseHook):
         original_schedule = target.schedule
         original_free_request = target._free_request
 
-        def wrapped_add_request(self, request):
+        def wrapped_add_request(self, request, *args, **kwargs):
             recv_time = time.time()
             req_info = REQUEST_INFOS[request.request_id]
             req_info.rid = request.request_id
             req_info.queue_start = _round6(recv_time)
             req_info.server_created_time = _round6(request.arrival_time)
             req_info.created_time = _round6(request.arrival_time)
-            return original_add_request(self, request)
+            return original_add_request(self, request, *args, **kwargs)
 
-        def wrapped_schedule(self):
+        # Signature must stay call-site agnostic: vllm_torchtpu calls
+        # scheduler.schedule(throttle_prefills) with one positional argument,
+        # and a self-only wrapper raises TypeError inside the engine busy loop
+        # (EngineCore fatal -> EngineDeadError -> pod restart).
+        def wrapped_schedule(self, *args, **kwargs):
             # D1: timestamp when remote-KV readiness first becomes visible
             # to the scheduler (consumed from finished_recving this round).
             try:
@@ -603,7 +612,7 @@ class C_SchedulerHook(BaseHook):
                         _ri.remote_kv_ready_ts = round(time.time(), 6)
             except Exception:
                 pass
-            scheduler_output = original_schedule(self)
+            scheduler_output = original_schedule(self, *args, **kwargs)
 
             if scheduler_output.scheduled_new_reqs:
                 prefill_timestamp = time.time()
@@ -631,7 +640,7 @@ class C_SchedulerHook(BaseHook):
 
             return scheduler_output
 
-        def wrapped_free_request(self, request):
+        def wrapped_free_request(self, request, *args, **kwargs):
             # Token ids dominate REQUEST_INFOS memory; skip collecting them
             # entirely when they are not exported.
             if EXPORT_TOKEN_IDS and request.is_finished():
@@ -642,7 +651,7 @@ class C_SchedulerHook(BaseHook):
                     else array("i")
                 )
                 req_info.output_ids = array("i", request.output_token_ids)
-            return original_free_request(self, request)
+            return original_free_request(self, request, *args, **kwargs)
 
         target.add_request = wrapped_add_request
         target.schedule = wrapped_schedule
