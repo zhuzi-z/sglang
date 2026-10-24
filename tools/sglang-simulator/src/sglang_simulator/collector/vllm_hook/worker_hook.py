@@ -76,33 +76,71 @@ REQUEST_INFOS: dict[str, RequestInfos] = defaultdict(RequestInfos)
 # never introduces any synchronization of its own.
 
 
-class _EventTimer:
-    """A start/end pair of timing cuda events for one measured region."""
+# CUDA event timing is GPU-only. CPU/TPU builds (e.g. vllm 0.29.0+cpu on
+# torch_tpu) raise "Torch not compiled with CUDA enabled" from
+# torch.cuda.Event(...). Probe once at import so that failure can never happen
+# inside the engine busy loop (wrapped_execute_model constructs the timer before
+# delegating to the original forward).
+def _probe_cuda_event_timing() -> bool:
+    try:
+        torch.cuda.Event(enable_timing=True)
+        return True
+    except Exception:
+        return False
 
-    __slots__ = ("_start", "_end")
+
+_CUDA_EVENT_TIMING = _probe_cuda_event_timing()
+
+
+class _EventTimer:
+    """A start/end pair for one measured region.
+
+    Uses CUDA events when the build provides them (GPU) and falls back to wall
+    clock otherwise (CPU/TPU). The fallback measures the host-observed span
+    between the two record calls, i.e. it is NOT device time -- flag this when
+    comparing TPU numbers against GPU baselines.
+    """
+
+    __slots__ = ("_start", "_end", "_t0", "_t1")
 
     def __init__(self) -> None:
-        self._start = torch.cuda.Event(enable_timing=True)
-        self._end = torch.cuda.Event(enable_timing=True)
+        if _CUDA_EVENT_TIMING:
+            self._start = torch.cuda.Event(enable_timing=True)
+            self._end = torch.cuda.Event(enable_timing=True)
+        else:
+            self._start = None
+            self._end = None
+        self._t0 = 0.0
+        self._t1 = 0.0
 
     def record_start(self) -> None:
-        self._start.record()
+        if self._start is not None:
+            self._start.record()
+        else:
+            self._t0 = time.time()
 
     def record_end(self) -> None:
-        self._end.record()
+        if self._end is not None:
+            self._end.record()
+        else:
+            self._t1 = time.time()
 
     def elapsed_s(self) -> Optional[float]:
-        """Elapsed seconds between the two events, or None if not ready yet.
+        """Elapsed seconds for the region, or None if not available yet.
 
         Event.elapsed_time() returns milliseconds and raises if either event
         has not completed. It is only safe to call after a native synchronize
         has passed self._end; we still guard it so a rare not-ready race can
         never crash the serving engine.
         """
-        try:
-            return self._start.elapsed_time(self._end) / 1000.0
-        except RuntimeError:
+        if self._start is not None:
+            try:
+                return self._start.elapsed_time(self._end) / 1000.0
+            except RuntimeError:
+                return None
+        if self._t0 <= 0.0 or self._t1 <= 0.0:
             return None
+        return self._t1 - self._t0
 
 
 # Bridges the execute_model (RPC-1) timing to the sample_tokens (RPC-2) call of
@@ -269,6 +307,37 @@ def get_output_dir(is_start: bool = True) -> str:
     return output_dir
 
 
+def _export_engine_requests(is_start: bool) -> None:
+    """Dump the engine-side REQUEST_INFOS of the current profile round.
+
+    Called from the EngineCore profile hook (in-process / leader node, where
+    a Scheduler lives). Kept as a module-level function so a second caller
+    (e.g. an executor-level profile shim) can reuse it without duplicating
+    the JSON shaping.
+    """
+    global REQUEST_INFOS
+    output_dir = get_output_dir(is_start=is_start)
+
+    request_infos = REQUEST_INFOS
+    REQUEST_INFOS = defaultdict(RequestInfos)
+
+    def _export():
+        path = f"{output_dir}/rank0.requests.jsonl"
+        if EXPORT_GZIP:
+            path += ".gz"
+        with _open_export(path) as f:
+            for req_infos in request_infos.values():
+                row = asdict(req_infos)
+                if not EXPORT_TOKEN_IDS:
+                    # Token ids dominate the payload; drop on request.
+                    del row["input_ids"]
+                    del row["output_ids"]
+                f.write(json.dumps(row, cls=CustomJsonEncoder) + "\n")
+        print(f"Request data has been saved to {path}")
+
+    _run_export(_export, is_start)
+
+
 class C_VLLMEngineArgsHook(BaseHook):
     """Hook EngineArgs to default the profiler to nsys (cudaProfilerApi)."""
 
@@ -312,40 +381,53 @@ class C_WorkerHook(BaseHook):
         def wrapped_execute_model(self, scheduler_output: "SchedulerOutput",
                                   *args, **kwargs):
 
+            # SchedulerOutput shape is fork-dependent (torchtpu's PP chunk
+            # scheduler builds its own), so parse defensively: a missing or
+            # renamed field must never abort the forward -- an exception raised
+            # before the original call would kill the engine busy loop.
             batch_req_infos = {}
-            for req_id, sched_token in scheduler_output.num_scheduled_tokens.items():
-                batch_req_infos[req_id] = {"extend_input_len": sched_token}
-            
-            for req_id, completed_token, output_token in zip(
-                scheduler_output.scheduled_cached_reqs.req_ids, 
-                scheduler_output.scheduled_cached_reqs.num_computed_tokens,
-                scheduler_output.scheduled_cached_reqs.num_output_tokens
-            ):
-                batch_req_infos[req_id]["past_kv_len"] = completed_token
-                batch_req_infos[req_id]["output_len"] = output_token
-            
-            for req in scheduler_output.scheduled_new_reqs:
-                batch_req_infos[req.req_id]["past_kv_len"] = req.num_computed_tokens
-                batch_req_infos[req.req_id]["output_len"] = 0
-
-            forward_mode = 2 if all([num_token == 1 for num_token in scheduler_output.num_scheduled_tokens.values()]) else 1
-
-            # Per-step logprobs form (for independent logprobs-compensation
-            # training). Only new reqs carry sampling_params in SchedulerOutput;
-            # cached reqs (decode steps) would need engine-side hook or a
-            # differential stress test to capture. total_num_scheduled_tokens
-            # is the step-level token count used as the MTP-compensation feature.
+            forward_mode = 0
             logprobs_req_count = 0
             logprobs_tokens = 0
             logprobs_n = 0
-            for req in scheduler_output.scheduled_new_reqs:
-                sp = getattr(req, "sampling_params", None)
-                if sp is not None and getattr(sp, "logprobs", None):
-                    logprobs_req_count += 1
-                    logprobs_tokens += scheduler_output.num_scheduled_tokens.get(
-                        req.req_id, 0
-                    )
-                    logprobs_n = max(logprobs_n, sp.logprobs)
+            try:
+                for req_id, sched_token in scheduler_output.num_scheduled_tokens.items():
+                    batch_req_infos[req_id] = {"extend_input_len": sched_token}
+
+                for req_id, completed_token, output_token in zip(
+                    scheduler_output.scheduled_cached_reqs.req_ids,
+                    scheduler_output.scheduled_cached_reqs.num_computed_tokens,
+                    scheduler_output.scheduled_cached_reqs.num_output_tokens
+                ):
+                    batch_req_infos[req_id]["past_kv_len"] = completed_token
+                    batch_req_infos[req_id]["output_len"] = output_token
+
+                for req in scheduler_output.scheduled_new_reqs:
+                    batch_req_infos[req.req_id]["past_kv_len"] = req.num_computed_tokens
+                    batch_req_infos[req.req_id]["output_len"] = 0
+
+                forward_mode = 2 if all([num_token == 1 for num_token in scheduler_output.num_scheduled_tokens.values()]) else 1
+
+                # Per-step logprobs form (for independent logprobs-compensation
+                # training). Only new reqs carry sampling_params in SchedulerOutput;
+                # cached reqs (decode steps) would need engine-side hook or a
+                # differential stress test to capture. total_num_scheduled_tokens
+                # is the step-level token count used as the MTP-compensation feature.
+                for req in scheduler_output.scheduled_new_reqs:
+                    sp = getattr(req, "sampling_params", None)
+                    if sp is not None and getattr(sp, "logprobs", None):
+                        logprobs_req_count += 1
+                        logprobs_tokens += scheduler_output.num_scheduled_tokens.get(
+                            req.req_id, 0
+                        )
+                        logprobs_n = max(logprobs_n, sp.logprobs)
+            except Exception as e:
+                print(
+                    f"[sim_collector] step capture skipped: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                batch_req_infos = {}
 
             global _PENDING_EXEC
 
@@ -380,10 +462,23 @@ class C_WorkerHook(BaseHook):
                 BATCH_INFOS.append(batch_info)
 
             def _finalize_exec(sample_latency: Optional[float] = None,
-                               seg: Optional[dict] = None):
+                               seg: Optional[dict] = None,
+                               deferred: bool = False):
                 if batch_info is None:
                     return
-                iter_latency = exec_timer.elapsed_s()
+                if _CUDA_EVENT_TIMING or not deferred:
+                    # Same window as the GPU path: record_start/record_end
+                    # bracket the forward call itself. On CPU/TPU the pair is
+                    # host wall clock instead of device events, which is the
+                    # closest available equivalent while the forward is
+                    # synchronous.
+                    iter_latency = exec_timer.elapsed_s()
+                else:
+                    # The forward returned before the work completed
+                    # (AsyncModelRunnerOutput / two-RPC submission), so the
+                    # bracket only covers submission. Measure to this finalize
+                    # point instead -- it runs after vllm's own get_output.
+                    iter_latency = time.time() - start_wall
                 if iter_latency is None:
                     return
                 batch_info.iter_latency = _round6(iter_latency)
@@ -403,11 +498,18 @@ class C_WorkerHook(BaseHook):
             # (carrying get_output) comes from sample_tokens -- defer to it so
             # both windows are read together after a single native synchronize.
             if ret is None:
-                _PENDING_EXEC = (_finalize_exec,)
+                _PENDING_EXEC = (
+                    lambda sl=None, sg=None: _finalize_exec(sl, sg, deferred=True),
+                )
                 return ret
 
             # Single-RPC vllm: this call already produced the output object.
-            return _finalize_on_get_output(ret, _finalize_exec)
+            # If it exposes get_output the real work lands later (async), so the
+            # timing has to be settled at that point too.
+            _deferred = getattr(ret, "get_output", None) is not None
+            return _finalize_on_get_output(
+                ret, lambda: _finalize_exec(deferred=_deferred)
+            )
         
         target.execute_model = wrapped_execute_model
 
@@ -427,6 +529,7 @@ class C_WorkerHook(BaseHook):
                 # Bracket RPC-2 with timing cuda events instead of syncing.
                 sample_timer = _EventTimer()
                 sample_timer.record_start()
+                sample_wall = time.time()
                 # X2: open the per-segment timing window for this RPC-2 call.
                 _SEG_STATE["cur"] = {k: 0.0 for k in SEG_KEYS}
                 _SEG_STATE["active"] = True
@@ -440,8 +543,16 @@ class C_WorkerHook(BaseHook):
                 pending_exec = _PENDING_EXEC
                 _PENDING_EXEC = None
 
+                _deferred = getattr(ret, "get_output", None) is not None
+
                 def _finalize():
-                    sample_latency = sample_timer.elapsed_s()
+                    if _CUDA_EVENT_TIMING or not _deferred:
+                        # Bracket semantics of the GPU path (host clock here).
+                        sample_latency = sample_timer.elapsed_s()
+                    else:
+                        # RPC-2 returned before completion: settle the window at
+                        # get_output, after vllm's own synchronize.
+                        sample_latency = time.time() - sample_wall
                     # Hand the paired sample latency and the per-segment
                     # breakdown to the execute_model window, which records
                     # them on the batch and prints it.
@@ -454,11 +565,22 @@ class C_WorkerHook(BaseHook):
 
         original_profile = getattr(target, "profile", None)
 
-        def override_profile(self, is_start: bool = True):
+        # *args/**kwargs plus the optional trailing parameters: torchtpu's
+        # TPUWorker.profile takes (is_start, profile_prefix, profiler_kwargs)
+        # while the GPU Worker only takes is_start. A fixed arity here either
+        # raises TypeError on the TPU path or breaks the older GPU path.
+        def override_profile(self, is_start: bool = True, profile_prefix=None,
+                             profiler_kwargs=None, *args, **kwargs):
             global BATCH_INFOS, TRANSFER_INFOS
 
             output_dir = get_output_dir(is_start=is_start)
-            rank_suffix = f"rank{self.rank}"
+            # The worker class differs across forks: vllm's Worker always has
+            # .rank, torchtpu's TPUWorker may not -- fall back to the rank the
+            # launcher exports so the file name stays rank{N}.
+            rank = getattr(self, "rank", None)
+            if rank is None:
+                rank = os.getenv("DS_LLM_PROC_RANK", "0")
+            rank_suffix = f"rank{rank}"
 
             # sample_tokens_latency is already recorded on each batch at its
             # finalize point (paired 1:1 with the sample_tokens call).
@@ -547,35 +669,93 @@ class C_EngineCoreHook(BaseHook):
 
         original_profile = target.profile
 
-        def wrapped_profile(self, is_start: bool = True):
-            global REQUEST_INFOS
+        # Profile signature differs across vllm builds; forward every field the
+        # caller may have passed (the utility RPC dispatcher validates arity
+        # against this signature before invoking us).
+        def wrapped_profile(self, is_start: bool = True,
+                            profile_prefix: Optional[str] = None,
+                            *args, **kwargs):
+            _export_engine_requests(is_start)
 
-            output_dir = get_output_dir(is_start=is_start)
-
-            request_infos = REQUEST_INFOS
-            REQUEST_INFOS = defaultdict(RequestInfos)
-
-            def _export():
-                path = f"{output_dir}/rank0.requests.jsonl"
-                if EXPORT_GZIP:
-                    path += ".gz"
-                with _open_export(path) as f:
-                    for req_infos in request_infos.values():
-                        row = asdict(req_infos)
-                        if not EXPORT_TOKEN_IDS:
-                            # Token ids dominate the payload; drop on request.
-                            del row["input_ids"]
-                            del row["output_ids"]
-                        f.write(json.dumps(row, cls=CustomJsonEncoder) + "\n")
-                print(f"Request data has been saved to {path}")
-
-            _run_export(_export, is_start)
-            
             # Call the original profile method to trigger the lower-level worker
-            return original_profile(self, is_start)
+            return original_profile(self, is_start, profile_prefix)
 
         target.profile = wrapped_profile
 
+
+
+class C_TpuWorkerHook(C_WorkerHook):
+    """Same worker-side collection, registered on the torchtpu worker class.
+
+    Class hooks match (defining module, class name) exactly, so the GPU
+    declaration (vllm.v1.worker.gpu_worker.Worker) never fires on a TPU build
+    whose worker is vllm_torchtpu.worker.tpu_worker.TPUWorker. Subclassing
+    reuses the identical hook body without touching the GPU path.
+    """
+
+    HOOK_MODULE_NAME = "vllm_torchtpu.worker.tpu_worker"
+    HOOK_CLASS_NAME = "TPUWorker"
+
+
+class C_MultiprocExecutorProfileHook(BaseHook):
+    """Give MultiprocExecutor the start_profile/stop_profile pair.
+
+    vllm only defines Executor.profile(is_start, profile_prefix). dashllm's
+    multi-node PP branch, however, keeps a bare MultiprocExecutor as its
+    backend engine (node_rank > 0 headless executor) and calls
+    ``self._backend_engine.start_profile()`` directly, which raises
+    AttributeError: 'MultiprocExecutor' object has no attribute
+    'start_profile'. Forwarding into the worker-side profile hook keeps the
+    collection window semantics identical to the leader node.
+
+    The engine-side requests export is intentionally NOT duplicated here:
+    this branch has no Scheduler, so REQUEST_INFOS is empty and an extra
+    rank0.requests.jsonl would be misleading.
+    """
+
+    HOOK_MODULE_NAME = "vllm.v1.executor.multiproc_executor"
+    HOOK_CLASS_NAME = "MultiprocExecutor"
+
+    @classmethod
+    def hook(cls, target) -> None:
+        # A newer vllm may grow these methods itself; never shadow a real one.
+        if getattr(target, "start_profile", None) is not None:
+            return
+
+        def _profile_prefix(args, kwargs):
+            if "profile_prefix" in kwargs:
+                return kwargs["profile_prefix"]
+            return args[0] if args else None
+
+        # dashllm calls these with no arguments; stay permissive anyway.
+        def start_profile(self, *args, **kwargs):
+            try:
+                return self.collective_rpc(
+                    "profile", args=(True, _profile_prefix(args, kwargs))
+                )
+            except Exception as e:
+                print(
+                    f"[sim_collector] MultiprocExecutor.start_profile forward "
+                    f"failed: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return None
+
+        def stop_profile(self, *args, **kwargs):
+            try:
+                return self.collective_rpc("profile", args=(False, None))
+            except Exception as e:
+                print(
+                    f"[sim_collector] MultiprocExecutor.stop_profile forward "
+                    f"failed: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return None
+
+        target.start_profile = start_profile
+        target.stop_profile = stop_profile
 
 
 class C_SchedulerHook(BaseHook):
@@ -672,6 +852,25 @@ class C_SchedulerHook(BaseHook):
         target._free_request = wrapped_free_request
 
 
+class C_TpuSchedulerHook(C_SchedulerHook):
+    """Same scheduler recording, re-applied on torchtpu's scheduler subclass.
+
+    Class hooks match (defining module, class name) exactly, so patching
+    vllm.v1.core.sched.scheduler.Scheduler does not reach an override defined
+    in a subclass. Verified in-container: TpuPipelineChunkScheduler has
+    own add_request=False, own schedule=True, own _free_request=False -- i.e.
+    only ``schedule`` needs a second patch, and without it every request row
+    keeps input_length / output_length / *_kv_hit_len / queue_end at 0.
+
+    Re-running the base hook body wraps the inherited pair a second time,
+    which is harmless: both wrappers only stamp the same timestamps and
+    delegate once to the real implementation.
+    """
+
+    HOOK_MODULE_NAME = "vllm_torchtpu.core.pp_chunk_scheduler"
+    HOOK_CLASS_NAME = "TpuPipelineChunkScheduler"
+
+
 class C_V6dWorkerHook(BaseHook):
     """Record per-request cross_node at transfer-submit time (worker side).
 
@@ -685,7 +884,20 @@ class C_V6dWorkerHook(BaseHook):
 
     @classmethod
     def hook(cls, target) -> None:
-        original_async_start_load_kv = target.async_start_load_kv
+        original_async_start_load_kv = getattr(target, "async_start_load_kv", None)
+        if original_async_start_load_kv is None:
+            # Some connector builds (e.g. the kvs_connector package shipped on
+            # the TPU image) expose only the synchronous submit path. Without
+            # the async entry point there is nowhere to read
+            # metadata.external_tokens, so cross_node simply stays unknown --
+            # do not abort the hook installation.
+            print(
+                f"[sim_collector] {target.__name__}.async_start_load_kv not "
+                f"found; cross_node tagging disabled",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
 
         def wrapped_async_start_load_kv(self, metadata):
             ext = getattr(metadata, "external_tokens", None) or {}
@@ -714,7 +926,12 @@ class C_V6dSwapHook(BaseHook):
 
     @classmethod
     def hook(cls, target) -> None:
-        original_async_swap = target.async_swap
+        # Both entry points are optional on a given connector build: this TPU
+        # image's kvs_connector ships only the synchronous swap(), while the
+        # GPU image ships async_swap(). Define both wrappers but install each
+        # one only when the original exists -- never synthesize a method the
+        # connector does not have, since callers use hasattr() to pick a path.
+        original_async_swap = getattr(target, "async_swap", None)
 
         async def wrapped_async_swap(self, *args, **kwargs):
             job_id = args[0] if len(args) > 0 else kwargs.get("job_id", 0)
@@ -749,11 +966,19 @@ class C_V6dSwapHook(BaseHook):
                 ))
                 _REQ_CROSS_NODE.pop(request_id, None)
 
-        target.async_swap = wrapped_async_swap
+        if original_async_swap is not None:
+            target.async_swap = wrapped_async_swap
+        else:
+            print(
+                f"[sim_collector] {target.__name__}.async_swap not found; "
+                f"async transfer path not measured",
+                file=sys.stderr,
+                flush=True,
+            )
 
         # 同步 swap 路径：部分 vllm 版本/场景的 store（如 bypass 子步 store）
         # 走同步 swap() 而非 async_swap()，必须同时包裹才能全覆盖。
-        original_swap = target.swap
+        original_swap = getattr(target, "swap", None)
 
         def wrapped_swap(self, *args, **kwargs):
             job_id = args[0] if len(args) > 0 else kwargs.get("job_id", 0)
@@ -789,5 +1014,90 @@ class C_V6dSwapHook(BaseHook):
                 ))
                 _REQ_CROSS_NODE.pop(request_id, None)
 
-        target.swap = wrapped_swap
+        if original_swap is not None:
+            target.swap = wrapped_swap
+        else:
+            print(
+                f"[sim_collector] {target.__name__}.swap not found; "
+                f"sync transfer path not measured",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+class C_KvsV6dWorkerHook(C_V6dWorkerHook):
+    """Submit-time stash for the external kvs_connector package.
+
+    On this image the v6d connector ships as a top-level package
+    (kvs_connector/v6d_object_connector.py) instead of vllm's kv_connector
+    namespace, so the declaration above never matches.
+
+    Two differences force a dedicated body instead of reusing the parent:
+      1. only the synchronous entries exist (start_load_kv / start_store_kv),
+         there is no async_start_load_kv;
+      2. V6dObjectConnectorMetadata has no ``external_tokens`` field. The
+         cross-node bit is therefore derived from reqs_to_load presence: a
+         request that has remote blocks to pull is by definition a cross-node
+         hit (same meaning as external_tokens > 0). Requests absent from
+         reqs_to_load keep cross_node = None (unknown) -- we never default it
+         to False, which downstream would read as "definitely local".
+    """
+
+    HOOK_MODULE_NAME = "kvs_connector.v6d_object_connector"
+    HOOK_CLASS_NAME = "V6dObjectConnectorWorker"
+
+    @classmethod
+    def hook(cls, target) -> None:
+        original_load = getattr(target, "start_load_kv", None)
+        original_store = getattr(target, "start_store_kv", None)
+
+        if original_load is None and original_store is None:
+            print(
+                f"[sim_collector] {target.__name__}: neither start_load_kv nor "
+                f"start_store_kv found; transfer queue timing disabled",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
+        if original_load is not None:
+            def wrapped_start_load_kv(self, metadata, *args, **kwargs):
+                now = time.time()
+                # reqs_to_load: {req_id: {group_id: (keys, gpu_block_ids)}}
+                # Any non-empty key list means this request pulls KV from a
+                # remote node -- the same fact external_tokens > 0 encoded.
+                for req_id, groups_data in (
+                    getattr(metadata, "reqs_to_load", None) or {}
+                ).items():
+                    _REQ_SUBMIT_TS[req_id] = now  # queue-wait anchor (T2/T3)
+                    try:
+                        has_remote = any(
+                            len(keys) > 0
+                            for keys, _ids in (groups_data or {}).values()
+                        )
+                    except Exception:
+                        has_remote = True
+                    _REQ_CROSS_NODE[req_id] = bool(has_remote)
+                return original_load(self, metadata, *args, **kwargs)
+
+            target.start_load_kv = wrapped_start_load_kv
+
+        # Store side: keeps the store-direction queued_s anchor. Only the
+        # request ids are read, so the (groups_data, is_last_save[, batch_id])
+        # value shape of reqs_to_store does not matter.
+        if original_store is not None:
+            def wrapped_start_store_kv(self, metadata, *args, **kwargs):
+                now = time.time()
+                for req_id in (getattr(metadata, "reqs_to_store", None) or {}):
+                    _REQ_STORE_SUBMIT_TS[req_id] = now
+                return original_store(self, metadata, *args, **kwargs)
+
+            target.start_store_kv = wrapped_start_store_kv
+
+
+class C_KvsV6dSwapHook(C_V6dSwapHook):
+    """Same swap timing, registered on the external connector package."""
+
+    HOOK_MODULE_NAME = "kvs_connector.v6d_object_connector"
+    HOOK_CLASS_NAME = "V6dSwapHandler"
 
