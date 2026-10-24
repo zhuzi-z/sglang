@@ -758,6 +758,39 @@ class C_MultiprocExecutorProfileHook(BaseHook):
         target.stop_profile = stop_profile
 
 
+def _collect_remote_load_blocks(scheduler_output) -> dict:
+    """req_id -> number of KV blocks this step pulls from remote (v6d).
+
+    MultiKVConnectorMetadata.metadata aggregates one metadata object per child
+    connector, and the v6d child carries
+    ``reqs_to_load = {req_id: {group_id: (keys, gpu_block_ids)}}``. Having
+    this inside the scheduler means the engine process can compute the remote
+    split itself -- no cross-process hop through the workers.
+
+    The per-request value is the MIN across the groups present in
+    reqs_to_load, never the sum: ``num_computed_tokens`` is itself a minimum
+    over groups, and a group absent from reqs_to_load needs nothing from
+    remote so it does not constrain the length. Summing would double count
+    the attention and mamba groups.
+
+    Returns {} when the build exposes no such metadata, so callers keep the
+    previous Request-level behaviour.
+    """
+    out: dict = {}
+    meta = getattr(scheduler_output, "kv_connector_metadata", None)
+    for child in (getattr(meta, "metadata", None) or ()):
+        reqs = getattr(child, "reqs_to_load", None)
+        if not reqs:
+            continue
+        for req_id, groups in reqs.items():
+            counts = [
+                len(keys) for keys, _block_ids in (groups or {}).values()
+            ]
+            if counts:
+                out[req_id] = min(counts)
+    return out
+
+
 class C_SchedulerHook(BaseHook):
     HOOK_CLASS_NAME = "Scheduler"
     HOOK_MODULE_NAME = "vllm.v1.core.sched.scheduler"
@@ -794,6 +827,19 @@ class C_SchedulerHook(BaseHook):
                 pass
             scheduler_output = original_schedule(self, *args, **kwargs)
 
+            # Remote-hit accounting for this step. Parsed defensively: the
+            # metadata shape is connector/fork dependent and this runs on the
+            # engine hot path.
+            try:
+                remote_load_blocks = _collect_remote_load_blocks(scheduler_output)
+            except Exception as e:
+                print(
+                    f"[sim_collector] remote load meta skipped: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                remote_load_blocks = {}
+
             if scheduler_output.scheduled_new_reqs:
                 prefill_timestamp = time.time()
                 for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -828,6 +874,17 @@ class C_SchedulerHook(BaseHook):
                             ext_hit_len = getattr(
                                 new_req_data, "num_external_computed_tokens", 0
                             )
+                        # Remote split. Preferred source: the v6d block
+                        # accounting collected above -- exact whenever cache
+                        # hits are block aligned, which is the only granularity
+                        # vllm caches at. Falls back to the Request-level field
+                        # for builds that expose it (this fork does not).
+                        ext_blocks = remote_load_blocks.get(req_id)
+                        block_size = getattr(self, "block_size", None) or getattr(
+                            getattr(self, "cache_config", None), "block_size", None
+                        )
+                        if ext_blocks is not None and block_size:
+                            ext_hit_len = min(ext_blocks * int(block_size), hit_len)
                         req_info.total_kv_hit_len = hit_len
                         req_info.ext_kv_hit_len = ext_hit_len
                         req_info.local_kv_hit_len = hit_len - ext_hit_len
