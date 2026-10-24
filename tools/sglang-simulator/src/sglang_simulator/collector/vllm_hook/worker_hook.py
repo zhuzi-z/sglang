@@ -1153,8 +1153,19 @@ class C_KvsV6dWorkerHook(C_V6dWorkerHook):
 
 
 class C_KvsV6dSwapHook(C_V6dSwapHook):
-    """Same swap timing, registered on the external connector package."""
+    """Same swap timing, registered on the external connector package.
 
-    HOOK_MODULE_NAME = "kvs_connector.v6d_object_connector"
-    HOOK_CLASS_NAME = "V6dSwapHandler"
+    Name matters here: on this build the real class is
+    ``TorchTPUV6dSwapHandler`` and the module only binds
+    ``V6dSwapHandler = TorchTPUV6dSwapHandler`` (a plain alias, ~line 3973).
+    Class hooks match the name handed to ``__build_class__`` -- i.e. the real
+    class name -- so declaring the alias meant the hook silently never
+    installed and transfer.jsonl stayed empty. Match both spellings so the GPU
+    build (whose class really is V6dSwapHandler) keeps working too.
+    """
+
+    REGEX = True
+    # REGEX mode re.search()es the module name too, so anchor and escape it.
+    HOOK_MODULE_NAME = r"^kvs_connector\.v6d_object_connector$"
+    HOOK_CLASS_NAME = r"^(?:V6dSwapHandler|TorchTPUV6dSwapHandler)$"
 
