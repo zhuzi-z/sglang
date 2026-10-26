@@ -13,6 +13,7 @@ through class monkey-patches at interpreter startup.
 """
 
 import asyncio
+import os
 import sys
 import threading
 import time
@@ -42,6 +43,7 @@ class SimulatedKVController:
         request: object
         blocks: list
         num_blocks: int
+        keys: list
         last: bool
         ready_at: float = 0.0
 
@@ -55,6 +57,16 @@ class SimulatedKVController:
         self._loads = {}
         self._store_tails = {}
         self._aborted_stores = {}
+        self._local_keys: set = set()
+        # Which loads pay the seg1 cross-node latency. "local_registry"
+        # (default) applies seg1 only to loads whose keys were never stored
+        # by this instance (i.e. the owner lives on another sim instance);
+        # "all" restores the legacy always-apply behavior. TODO(calibrate):
+        # local registry ignores L2 eviction, so a locally-evicted key that
+        # only exists remotely is still treated as local — acceptable until
+        # eviction tracking lands here.
+        self._seg1_scope = os.environ.get("SIMULATOR_SEG1_SCOPE",
+                                          "local_registry")
         self._preparing = []
         self._lock = threading.RLock()
         # Native abort cleanup runs on the connector loop. Its remaining pins
@@ -149,8 +161,9 @@ class SimulatedKVController:
                     self.cache._swap_protected_blocks[rid] = remaining
                 else:
                     self.cache._swap_protected_blocks.pop(rid, None)
+            _s_keys = [k for keys, _ids in groups.values() for k in keys]
             self._staged.append(self.Store(
-                state._req, taken, sum(len(keys) for keys, _ids in groups.values()), last))
+                state._req, taken, len(_s_keys), _s_keys, last))
 
     def prepare(self, coroutine):
         future = Future()
@@ -187,7 +200,18 @@ class SimulatedKVController:
     def queue_load(self, request, num_tokens, groups):
         nblocks = sum(len(keys) for keys, _ids in groups.values())
         bw = BandwidthModel.get()
-        deadline = self.now() + bw.latency_for(nblocks, True) + bw.seg1_latency(nblocks)
+        latency = bw.latency_for(nblocks, True)
+        # Per-request seg1 gating: only cross-node loads pay the seg1 fetch.
+        # Locality comes from this instance's own store registry — keys it
+        # never stored live on another sim instance. See _seg1_scope note.
+        keys_all = [k for keys, _ids in groups.values() for k in keys]
+        cross_node = True
+        if (self._seg1_scope == "local_registry" and keys_all
+                and self._local_keys):
+            cross_node = any(k not in self._local_keys for k in keys_all)
+        if cross_node:
+            latency += bw.seg1_latency(nblocks)
+        deadline = self.now() + latency
         with self._lock:
             self._loads.setdefault(request.request_id, (deadline, num_tokens))
 
@@ -230,6 +254,7 @@ class SimulatedKVController:
         bw = BandwidthModel.get()
         staged, self._staged = self._staged, []
         for store in staged:
+            self._local_keys.update(store.keys or ())
             rid = store.request.request_id
             store.ready_at = max(now, self._store_tails.get(rid, now))
             store.ready_at += bw.store_completion_latency(store.num_blocks)

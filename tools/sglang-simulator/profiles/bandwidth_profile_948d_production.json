@@ -22,8 +22,9 @@
  },
  "control_plane": {
   "seg1_cross_node": {
-   "floor_ms": 0,
-   "per_block_ms": 0
+   "floor_ms": 22.0,
+   "bandwidth_bytes_per_s": 20937965568,
+   "_estimate": "TODO(calibrate): NO cross-node traffic exists in any collected window (507,268 loads, cross_node=False 100%). Values are placeholders per user-approved estimate: floor = local 19ms RPC overhead + ~3ms peer handshake; bandwidth = 30% of local 65 GiB/s = 19.5 GiB/s (SRPC/RDMA assumed slower than PCIe). Recalibrate with dedicated cross-node traffic once the sim-collector-crossnode-fix hook is deployed."
   },
   "store_completion": {
    "poll_granularity_ms": 10.0,
