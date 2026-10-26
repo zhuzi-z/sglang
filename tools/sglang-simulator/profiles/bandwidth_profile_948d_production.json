@@ -1,0 +1,33 @@
+{
+ "_comment": "Production-calibrated bandwidth profile for 948d (L20B, HybridConnector+v6d_object), fitted from 507,268 load + 1,349,677 store rows collected 2026-10-24/25. Replaces the DMA-sweep profile whose floor (1.7ms) misses the ~19ms RPC+objectization overhead seen in production async_swap wall clock.",
+ "_fit": {
+  "load": "lat_ms = 19.0 + 0.369*blocks  (fixed_overhead_s=0.019, eff_bw=65 GiB/s per rank)",
+  "store": "lat_ms ~ 20.7 constant (no block dependence in 0-27 blk range; fixed_overhead dominates)",
+  "note": "seg1_cross_node uncalibrated: the collection window had zero cross-node hits (507,268 loads, cross_node=False 100%). Needs dedicated cross-node traffic to calibrate.",
+  "concurrency": "load p50 grows 23ms->36.5ms at concurrency 1->8; per-request queued_s stays us-level. Slowdown factor NOT yet modeled (see TODO)."
+ },
+ "layout": {
+  "page_size_bytes": 2146304,
+  "num_layers": 12
+ },
+ "segments": {
+  "local_load": {
+   "fixed_overhead_s": 0.019,
+   "bandwidth_bytes_per_s": 69793218560
+  },
+  "local_store": {
+   "fixed_overhead_s": 0.0207,
+   "bandwidth_bytes_per_s": 536870912000
+  }
+ },
+ "control_plane": {
+  "seg1_cross_node": {
+   "floor_ms": 0,
+   "per_block_ms": 0
+  },
+  "store_completion": {
+   "poll_granularity_ms": 10.0,
+   "rank_sync_ms": 1.0
+  }
+ }
+}
