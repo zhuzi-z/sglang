@@ -65,6 +65,17 @@ class SimulatedKVController:
         # local registry ignores L2 eviction, so a locally-evicted key that
         # only exists remotely is still treated as local — acceptable until
         # eviction tracking lands here.
+        #
+        # TODO(design, option B): the registry does NOT track L2 evictions,
+        # and the sim DOES evict (capacity-injected runs fire the real
+        # AsyncEvictor at the 95% watermark). A locally-evicted key whose
+        # owner lives on another sim instance is then misclassified as
+        # local (seg1 skipped). Fix = sync evicted keys out of
+        # _local_keys: the daemon-side eviction hook (v6d_capacity
+        # wrapped_evict_batch) already sees the evicted key list, but it
+        # runs in the daemon process while this registry lives in the
+        # engine process -- an IPC channel (shared JSONL tail / tracker
+        # write) is required to bridge them.
         self._seg1_scope = os.environ.get("SIMULATOR_SEG1_SCOPE",
                                           "local_registry")
         self._preparing = []
