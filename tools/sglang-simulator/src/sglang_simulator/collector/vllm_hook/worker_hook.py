@@ -1,3 +1,4 @@
+import contextvars
 import gzip
 import json
 import os
@@ -223,6 +224,7 @@ class TransferInfos:
     latency_s: float = 0.0      # pure transfer latency (RPC pull + CUDA copy)
     num_blocks: int = 0         # len(keys)
     nbytes: int = 0             # num_blocks * block_bytes (0 if unknown)
+    remote_bytes: int = 0       # bytes resolved from a non-local v6d peer
     cross_node: Optional[bool] = None  # None = unknown (see _REQ_CROSS_NODE)
     queued_s: float = 0.0       # submit -> coroutine entry (event-loop queue)
     job_id: int = 0
@@ -687,6 +689,67 @@ class C_V6dWorkerHook(BaseHook):
         target.async_start_store_kv = wrapped_async_start_store_kv
 
 
+# ---- Data-plane cross-node capture --------------------------------------
+# The scheduler-side metadata (V6dObjectBackendMeta.external_tokens) marks
+# "has a v6d load", not node locality, so _REQ_CROSS_NODE can never detect
+# cross-node on this stack. The truth is data-plane: each resolved v6d
+# object carries meta["location"]; a non-"local" location means the bytes
+# came from a remote peer (cross-node fetch). We wrap the v6d client
+# get/async_get and, via a contextvar (same task as the awaiting
+# async_swap), attribute per-call nbytes / remote-ness back to the swap
+# record being built.
+_XFER_DATA_CTX: contextvars.ContextVar = contextvars.ContextVar(
+    "sim_xfer_data", default=None)
+_CLIENT_WRAPPED: set = set()
+
+
+def _ensure_client_capture(handler) -> None:
+    """Wrap type(handler._client).get / .async_get once per class."""
+    client = getattr(handler, "_client", None)
+    if client is None:
+        return
+    ccls = type(client)
+    if id(ccls) in _CLIENT_WRAPPED:
+        return
+    _CLIENT_WRAPPED.add(id(ccls))
+
+    def _absorb(ctx, objs):
+        if ctx is None or not objs:
+            return
+        for o in objs:
+            nbytes = int(getattr(o, "nbytes", 0) or 0)
+            ctx["nbytes"] += nbytes
+            meta = getattr(o, "meta", None) or {}
+            if str(meta.get("location", "local")) != "local":
+                ctx["remote_blocks"] += 1
+                ctx["remote_bytes"] += nbytes
+        ctx["blocks"] += len(objs)
+
+    original_get = ccls.get
+
+    def wrapped_get(*args, **kwargs):
+        objs = original_get(*args, **kwargs)
+        try:
+            _absorb(_XFER_DATA_CTX.get(), objs)
+        except Exception:
+            pass
+        return objs
+
+    ccls.get = wrapped_get
+
+    original_async_get = getattr(ccls, "async_get", None)
+    if original_async_get is not None:
+        async def wrapped_async_get(*args, **kwargs):
+            objs = await original_async_get(*args, **kwargs)
+            try:
+                _absorb(_XFER_DATA_CTX.get(), objs)
+            except Exception:
+                pass
+            return objs
+
+        ccls.async_get = wrapped_async_get
+
+
 class C_V6dSwapHook(BaseHook):
     """Measure per-transfer latency inside V6dSwapHandler.async_swap.
 
@@ -712,6 +775,10 @@ class C_V6dSwapHook(BaseHook):
                           else kwargs.get("request_id", ""))
             start_ts = time.time()  # T4: transfer actually begins here
             submit_ts = _REQ_SUBMIT_TS.pop(request_id, None)
+            _ensure_client_capture(self)
+            _xfer = {"nbytes": 0, "remote_blocks": 0, "remote_bytes": 0,
+                     "blocks": 0}
+            _xfer_tok = _XFER_DATA_CTX.set(_xfer)
             err = None
             try:
                 return await original_async_swap(self, *args, **kwargs)
@@ -719,6 +786,7 @@ class C_V6dSwapHook(BaseHook):
                 err = repr(e)
                 raise
             finally:
+                _XFER_DATA_CTX.reset(_xfer_tok)
                 end_ts = time.time()
                 TRANSFER_INFOS.append(TransferInfos(
                     rid=request_id,
@@ -726,8 +794,11 @@ class C_V6dSwapHook(BaseHook):
                                else "store"),
                     latency_s=round(end_ts - start_ts, 6),
                     num_blocks=len(keys) if keys else 0,
-                    nbytes=0,
-                    cross_node=_REQ_CROSS_NODE.get(request_id),
+                    nbytes=_xfer["nbytes"],
+                    remote_bytes=_xfer["remote_bytes"],
+                    cross_node=(_xfer["remote_blocks"] > 0
+                                if _xfer["blocks"]
+                                else _REQ_CROSS_NODE.get(request_id)),
                     queued_s=(round(start_ts - submit_ts, 6)
                               if submit_ts else 0.0),
                     job_id=job_id,
@@ -753,6 +824,10 @@ class C_V6dSwapHook(BaseHook):
             swap_in = getattr(self, "_swap_in", True)
             submit_ts = (_REQ_SUBMIT_TS.pop(request_id, None) if swap_in
                          else _REQ_STORE_SUBMIT_TS.pop(request_id, None))
+            _ensure_client_capture(self)
+            _xfer = {"nbytes": 0, "remote_blocks": 0, "remote_bytes": 0,
+                     "blocks": 0}
+            _xfer_tok = _XFER_DATA_CTX.set(_xfer)
             err = None
             try:
                 return original_swap(self, *args, **kwargs)
@@ -760,14 +835,18 @@ class C_V6dSwapHook(BaseHook):
                 err = repr(e)
                 raise
             finally:
+                _XFER_DATA_CTX.reset(_xfer_tok)
                 end_ts = time.time()
                 TRANSFER_INFOS.append(TransferInfos(
                     rid=request_id,
                     direction=("load" if swap_in else "store"),
                     latency_s=round(end_ts - start_ts, 6),
                     num_blocks=len(keys) if keys else 0,
-                    nbytes=0,
-                    cross_node=_REQ_CROSS_NODE.get(request_id),
+                    nbytes=_xfer["nbytes"],
+                    remote_bytes=_xfer["remote_bytes"],
+                    cross_node=(_xfer["remote_blocks"] > 0
+                                if _xfer["blocks"]
+                                else _REQ_CROSS_NODE.get(request_id)),
                     queued_s=(round(start_ts - submit_ts, 6)
                               if submit_ts else 0.0),
                     job_id=job_id,
