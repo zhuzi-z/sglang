@@ -49,7 +49,7 @@ python tools/bw_calib/collect_bandwidth.py \
 ## 配置（跑仿真时）
 
 ```bash
-export SGLANG_SIMULATOR_BW_PROFILE=/path/to/bandwidth_profile.json  # DMA 带宽 + 控制面
+export SIMULATOR_HICACHE_BW_PROFILE=/path/to/bandwidth_profile.json  # DMA 带宽 + 控制面
 export SGLANG_SIMULATOR_COLD_START_S=1.43                           # 首 iter 冷启动（秒）
 ```
 可选 env 覆盖（优先级 **env > profile > 0**）：

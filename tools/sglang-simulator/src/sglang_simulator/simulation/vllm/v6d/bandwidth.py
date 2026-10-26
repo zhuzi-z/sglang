@@ -20,7 +20,7 @@ Neither consumes engine time, which is why nothing here sleeps in the worker's
 main flow.
 
 Calibration comes from ``tools/bw_calib/collect_bandwidth.py``. Point
-``SGLANG_SIMULATOR_BW_PROFILE`` at its output to enable the model; with the
+``SIMULATOR_HICACHE_BW_PROFILE`` at its output to enable the model; with the
 variable unset the model stays disabled and behaviour is unchanged.
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ import os
 
 logger = logging.getLogger(__name__)
 
-_ENV_PROFILE = "SGLANG_SIMULATOR_BW_PROFILE"
+_ENV_PROFILE = "SIMULATOR_HICACHE_BW_PROFILE"
 
 
 class SegmentModel:
