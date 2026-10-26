@@ -105,6 +105,13 @@ class BandwidthModel:
         _s1 = cp.get("seg1_cross_node", {})
         self._seg1_floor_ms = float(_s1.get("floor_ms", 0) or 0)
         self._seg1_per_blk_ms = float(_s1.get("per_block_ms", 0) or 0)
+        # Preferred: bytes-based cross-node model (setup floor + SRPC/RDMA
+        # marginal bandwidth). Falls back to the per-block linear form when
+        # unset. Values come from dedicated cross-node traffic once
+        # collect_remote-style calibration lands.
+        self._seg1_floor_s = float(_s1.get("floor_ms", 0) or 0) / 1000.0
+        self._seg1_bw_bytes_per_s = float(
+            _s1.get("bandwidth_bytes_per_s", 0) or 0)
         # Store completion structure (see store_completion_latency):
         #   poll_granularity_ms: the async_swap loop polls the CUDA event with
         #     `await asyncio.sleep(0.01)` (v6d_object_connector async_swap), so
@@ -181,14 +188,24 @@ class BandwidthModel:
     def seg1_latency(self, nblocks: int) -> float:
         """Cross-node fetch (peer v6d -> local v6d), the seg1 transfer.
 
-        PLACEHOLDER: the CPU sim stubs the SRPC/RDMA data path, so this
-        cannot be calibrated here; it stays 0 unless the profile/env
-        supplies a figure measured on real hardware (collect_remote.py).
-        env overrides profile."""
+        Model: setup floor (metadata + peer handshake + stream setup) plus
+        the marginal SRPC/RDMA transfer of the payload bytes:
+
+            seg1_s = seg1_floor_s + seg2_bytes(nblocks) / seg1_bw_bytes_per_s
+
+        Parameters are supplied by the profile (control_plane.seg1_cross_node:
+        floor_ms / bandwidth_bytes_per_s) or by env overrides. Until real
+        cross-node traffic is captured (the 948d window had zero cross-node
+        hits), all parameters default to 0 and the model is a no-op.
+        """
+        if self._seg1_bw_bytes_per_s > 0 and self._seg1_floor_s >= 0:
+            nbytes = self.seg2_bytes(nblocks)
+            return self._seg1_floor_s + nbytes / self._seg1_bw_bytes_per_s
         return self._cp_latency(
             nblocks, "SGLANG_SIMULATOR_SEG1_FLOOR_MS",
             "SGLANG_SIMULATOR_SEG1_PER_BLK_MS",
             self._seg1_floor_ms, self._seg1_per_blk_ms)
+
 
     # -- singleton ----------------------------------------------------------
 
