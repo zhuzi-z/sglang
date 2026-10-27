@@ -76,6 +76,35 @@ class SimulatedKVController:
         # runs in the daemon process while this registry lives in the
         # engine process -- an IPC channel (shared JSONL tail / tracker
         # write) is required to bridge them.
+        #
+        # ---- Follow-up investigation (2026-10-27, code-verified) ----------
+        # 1. The sim's async_load_kv is fully overridden (returns at once,
+        #    see override_async_load_kv): loads NEVER reach a daemon-side
+        #    tiered read, so injecting seg1 inside the daemon data plane is
+        #    NOT viable for loads in this architecture.
+        # 2. The native control plane DOES have a locality-bearing step:
+        #    a P2P read resolves via two SRPC calls into the remote peer --
+        #    transfer.get_metas_by_names (metadata probe; also used by
+        #    VineyardPeer.get_remote_object_sizes) and transfer.load_data
+        #    (blob copy). The sim stubs BOTH (V6D_SIM_STUB_META_PROBE=1
+        #    fabricates metas locally; load_data is always a no-op). The
+        #    probe can be restored per-environment (set =0; SRPC stays
+        #    alive on the 2M-aligned sparse mmap) exactly as in production.
+        # 3. Candidate designs for per-request locality, in order of
+        #    fidelity:
+        #    (a) Un-stub the meta probe and extend the daemon `exists`
+        #        result to encode locality (local / remote-owner / miss);
+        #        a connector-side hook stashes it per request into the
+        #        metadata, replacing _local_keys entirely. Fidelity: the
+        #        same probe production issues; cost: one control-plane
+        #        SRPC per cross-node load (matches production).
+        #    (b) Keep the stub, but have patched_exists write
+        #        {request_id -> locality} plus eviction batches into a
+        #        shared daemon->engine side file that queue_load tails.
+        #        Solves eviction sync (option B) with the same channel.
+        #    (c) Current registry approximation (this code) — zero IPC,
+        #        known narrow misclassification documented above.
+        #    Revisit when cross-node calibration actually begins.
         self._seg1_scope = os.environ.get("SIMULATOR_SEG1_SCOPE",
                                           "local_registry")
         self._preparing = []
