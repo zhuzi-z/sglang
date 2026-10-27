@@ -12,6 +12,11 @@ if os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "o
         # torchtpu subclass overrides Scheduler.schedule; re-apply on it.
         C_TpuSchedulerHook,
         C_EngineCoreHook,
+        # TPU pipeline: hand-off wait vs this stage's own forward.
+        C_PPWaveHook,
+        # TPU pipeline lazy-push step loop: the only observable per-step
+        # forward time (EngineCore.step is replaced and non-blocking there).
+        C_LazyPushStepperHook,
         C_V6dWorkerHook,
         C_V6dSwapHook,
         # v6d connector ships as top-level kvs_connector/ on this image.
@@ -42,6 +47,11 @@ if os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "o
             # torchtpu subclass overrides Scheduler.schedule; re-apply on it.
             C_TpuSchedulerHook,
             C_EngineCoreHook,
+            # TPU pipeline: hand-off wait vs this stage's own forward.
+            C_PPWaveHook,
+            # TPU pipeline lazy-push step loop: the only observable per-step
+            # forward time (EngineCore.step is replaced and non-blocking there).
+            C_LazyPushStepperHook,
             C_V6dWorkerHook,
             C_V6dSwapHook,
             # v6d connector ships as top-level kvs_connector/ on this image.

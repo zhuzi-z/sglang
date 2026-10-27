@@ -38,6 +38,10 @@ class RequestInfos:
     local_kv_hit_len: int = 0
     ext_kv_hit_len: int = 0
     remote_kv_ready_ts: float = 0.0  # scheduler first sees finished_recving
+    # PP: wall clock when this request's first output token was produced
+    # (update_from_output sees output_token_ids go from empty to non-empty).
+    # TTFT = first_token_ts - created_time.
+    first_token_ts: float = 0.0
     input_ids: array = field(default_factory=lambda: array("i"))
     output_ids: array = field(default_factory=lambda: array("i"))
 
@@ -58,11 +62,103 @@ class BatchInfos:
     # ({sample, draft, bookkeep, eplb, other}); None when segment hooks are
     # unavailable on this vllm version.
     st_segments_ms: Optional[dict] = None
+    # PP wave (worker side, vllm_torchtpu.distributed.pp_wave.PPWave):
+    # time rank-0 spent waiting for the previous hand-off to complete, and
+    # the forward span its own stage ran afterwards. iter_latency covers
+    # both; these two split it, so "pure forward" and "downstream backpressure"
+    # can be told apart in one row.
+    handoff_wait_s: float = 0.0
+    stage0_forward_s: float = 0.0
+    # Burst counters at the time this step ended (PPWave.forwards/launches).
+    pp_forwards: int = 0
+    pp_launches: int = 0
+    # Position of this step inside its burst, read at start_forward (i.e. the
+    # 0-based PPWave.forwards value, the same quantity called pos_in_burst in
+    # the analysis), plus the burst serial (PPWave.bursts). Exported directly
+    # so consumers never have to subtract one from pp_forwards.
+    pos_in_burst: int = 0
+    burst_id: int = 0
 
 
 BATCH_INFOS: list[BatchInfos] = []
 
 REQUEST_INFOS: dict[str, RequestInfos] = defaultdict(RequestInfos)
+
+# --- PP step-level collection ------------------------------------------------
+# EngineCore-side records (LazyPushStepper), one or more rows per scheduler
+# step. Separate from BATCH_INFOS because it lives in the EngineCore process
+# while BATCH_INFOS belongs to each worker process.
+ENGINE_STEPS: list[dict] = []
+_ENGINE_STEPS_LOCK = threading.Lock()
+_ENGINE_STEP_SEQ = {"n": 0}
+
+# Worker-side scratch for the current step: PPWave.before_step writes the
+# hand-off wait, start_forward/end_forward write the forward span, and
+# _finalize_exec drains it into the BatchInfos row. One worker process owns
+# exactly one PPWave, so a module-level dict is enough.
+_PP_STEP_STATE: dict = {}
+
+
+def _record_engine_step(kind: str, stepper, slot=None,
+                        forward_s: Optional[float] = None) -> None:
+    """Append one EngineCore-side step record (defensive: never raises)."""
+    with _ENGINE_STEPS_LOCK:
+        _ENGINE_STEP_SEQ["n"] += 1
+        wave = getattr(stepper, "wave", None)
+        row = {
+            "seq": _ENGINE_STEP_SEQ["n"],
+            "kind": kind,
+            "wall_ts": round(time.time(), 6),
+            "mono_ts": round(time.monotonic(), 6),
+            "in_flight": len(getattr(stepper, "in_flight", None) or ()),
+            "slots": len(getattr(stepper, "slots", None) or ()),
+            "dropped": int(getattr(stepper, "dropped", 0) or 0),
+            "measured_s": round(float(getattr(stepper, "measured", 0.0) or 0.0), 6),
+            "ratio": round(float(getattr(stepper, "ratio", 1.0) or 1.0), 4),
+            "pushes": int(getattr(wave, "pushes", 0) or 0),
+            "settles": int(getattr(wave, "settles", 0) or 0),
+            "real_steps": int(getattr(wave, "real_steps", 0) or 0),
+            "pp_forwards": int(getattr(wave, "forwards", 0) or 0),
+            "pp_bursts": int(getattr(wave, "bursts", 0) or 0),
+        }
+        if slot is not None:
+            dispatched = getattr(slot, "dispatched", None)
+            expected = getattr(slot, "expected", None)
+            started = getattr(slot, "started_last", None)
+            row["slot_dispatched"] = (
+                round(float(dispatched), 6) if dispatched is not None else None
+            )
+            row["slot_expected"] = (
+                round(float(expected), 6) if expected is not None else None
+            )
+            row["slot_modelled_ms"] = getattr(slot, "modelled_ms", None)
+            row["slot_started_last"] = (
+                round(float(started), 6) if started is not None else None
+            )
+        # Queue / busy snapshot: the training set needs the same quantities the
+        # simulator can compute at inference time (waiting/running depth), so the
+        # two sides stay on one definition. Read straight off the Scheduler that
+        # lives in this process; missing attributes leave the keys out.
+        scheduler = getattr(getattr(stepper, "core", None), "scheduler", None)
+        if scheduler is not None:
+            for key, attr in (
+                ("num_waiting", "waiting"),
+                ("num_running", "running"),
+                ("num_skipped", "skipped_waiting"),
+            ):
+                queue = getattr(scheduler, attr, None)
+                if queue is not None:
+                    try:
+                        row[key] = len(queue)
+                    except TypeError:
+                        pass
+        if forward_s is not None:
+            row["forward_s"] = round(float(forward_s), 6)
+        ENGINE_STEPS.append(row)
+
+
+def _warn_once(where: str, exc: BaseException) -> None:
+    print(f"[sim_collector] {where} skipped: {exc}", file=sys.stderr, flush=True)
 
 
 # --- CUDA-event based timing -------------------------------------------------
@@ -338,6 +434,33 @@ def _export_engine_requests(is_start: bool) -> None:
     _run_export(_export, is_start)
 
 
+def _export_engine_steps(is_start: bool) -> None:
+    """Dump the EngineCore-side PP step records of the current round.
+
+    Written by the LazyPushStepper hook (leader node only: the lazy-push step
+    loop exists in the EngineCore process, not in a follower). One row per
+    recorded event; ``kind`` says whether it marks a dispatch, a sampling
+    reply (the only place a real per-step forward time is observable) or the
+    processing of a finished step.
+    """
+    global ENGINE_STEPS
+    output_dir = get_output_dir(is_start=is_start)
+    with _ENGINE_STEPS_LOCK:
+        steps = ENGINE_STEPS
+        ENGINE_STEPS = []
+
+    def _export():
+        path = f"{output_dir}/rank0.engine_steps.jsonl"
+        if EXPORT_GZIP:
+            path += ".gz"
+        with _open_export(path) as f:
+            for row in steps:
+                f.write(json.dumps(row, cls=CustomJsonEncoder) + "\n")
+        print(f"Engine step data has been saved to {path}")
+
+    _run_export(_export, is_start)
+
+
 class C_VLLMEngineArgsHook(BaseHook):
     """Hook EngineArgs to default the profiler to nsys (cudaProfilerApi)."""
 
@@ -465,6 +588,11 @@ class C_WorkerHook(BaseHook):
                                seg: Optional[dict] = None,
                                deferred: bool = False):
                 if batch_info is None:
+                    # The SchedulerOutput parse failed (batch_req_infos was
+                    # cleared), so this step has no row to carry the PP split.
+                    # Drop the scratch anyway: leaving it behind would attach
+                    # this step's hand-off wait / forward span to the NEXT row.
+                    _PP_STEP_STATE.clear()
                     return
                 if _CUDA_EVENT_TIMING or not deferred:
                     # Same window as the GPU path: record_start/record_end
@@ -491,6 +619,32 @@ class C_WorkerHook(BaseHook):
                         **{k: round(v, 4) for k, v in seg.items()},
                         "other": round(st_ms - sum(seg.values()), 4),
                     }
+                # PP wave split: what PPWave.before_step waited for the
+                # previous hand-off, and what this stage's own forward took.
+                # Missing keys simply mean the PPWave hook did not run on this
+                # build (GPU path), leaving the zeros in place.
+                try:
+                    handoff_wait = _PP_STEP_STATE.pop("handoff_wait_s", None)
+                    if handoff_wait is not None:
+                        batch_info.handoff_wait_s = _round6(handoff_wait)
+                    forward_s = _PP_STEP_STATE.pop("stage0_forward_s", None)
+                    if forward_s is not None:
+                        batch_info.stage0_forward_s = _round6(forward_s)
+                    batch_info.pp_forwards = int(
+                        _PP_STEP_STATE.pop("pp_forwards", 0) or 0
+                    )
+                    batch_info.pp_launches = int(
+                        _PP_STEP_STATE.pop("pp_launches", 0) or 0
+                    )
+                    batch_info.pos_in_burst = int(
+                        _PP_STEP_STATE.pop("pos_in_burst", 0) or 0
+                    )
+                    batch_info.burst_id = int(
+                        _PP_STEP_STATE.pop("burst_id", 0) or 0
+                    )
+                    _PP_STEP_STATE.pop("fwd_t0", None)
+                except Exception as e:
+                    _warn_once("pp step state", e)
                 # Print the batch info at its recording (finalize) point.
                 _print_batch_info(batch_info)
 
@@ -676,6 +830,12 @@ class C_EngineCoreHook(BaseHook):
                             profile_prefix: Optional[str] = None,
                             *args, **kwargs):
             _export_engine_requests(is_start)
+            # PP step loop records (empty unless LazyPushStepper is active on
+            # this node, i.e. a leader of a pipeline deeper than two stages).
+            try:
+                _export_engine_steps(is_start)
+            except Exception as e:
+                _warn_once("engine step export", e)
 
             # Call the original profile method to trigger the lower-level worker
             return original_profile(self, is_start, profile_prefix)
@@ -695,6 +855,154 @@ class C_TpuWorkerHook(C_WorkerHook):
 
     HOOK_MODULE_NAME = "vllm_torchtpu.worker.tpu_worker"
     HOOK_CLASS_NAME = "TPUWorker"
+
+
+class C_PPWaveHook(BaseHook):
+    """Split iter_latency into "waited for the previous hand-off" and
+    "this stage's own forward" on a TPU pipeline.
+
+    PPWave.before_step() is where rank 0 blocks on the previous hand-off
+    (_async_wait + _wait), so its wall span is the downstream backpressure
+    that the worker-side iter_latency otherwise hides. start_forward /
+    end_forward bracket the forward this stage runs afterwards. The three
+    land in BatchInfos (schedule_batch.jsonl) through _finalize_exec.
+
+    Missing methods leave the row's zeros in place, so the GPU path is
+    unaffected.
+    """
+
+    HOOK_MODULE_NAME = "vllm_torchtpu.distributed.pp_wave"
+    HOOK_CLASS_NAME = "PPWave"
+
+    @classmethod
+    def hook(cls, target) -> None:
+        original_before_step = getattr(target, "before_step", None)
+        original_start_forward = getattr(target, "start_forward", None)
+        original_end_forward = getattr(target, "end_forward", None)
+
+        if original_before_step is not None:
+
+            def wrapped_before_step(self, num_tokens, *args, **kwargs):
+                t0 = time.time()
+                ret = original_before_step(self, num_tokens, *args, **kwargs)
+                _PP_STEP_STATE["handoff_wait_s"] = time.time() - t0
+                return ret
+
+            target.before_step = wrapped_before_step
+
+        if original_start_forward is not None:
+
+            def wrapped_start_forward(self, rows, *args, **kwargs):
+                _PP_STEP_STATE["fwd_t0"] = time.time()
+                ret = original_start_forward(self, rows, *args, **kwargs)
+                # _open_burst() runs inside the original call, so by now
+                # `forwards` is this forward's 0-based position in the burst
+                # and `bursts` is the burst serial.
+                _PP_STEP_STATE["pos_in_burst"] = int(
+                    getattr(self, "forwards", 0) or 0
+                )
+                _PP_STEP_STATE["burst_id"] = int(getattr(self, "bursts", 0) or 0)
+                return ret
+
+            target.start_forward = wrapped_start_forward
+
+        if original_end_forward is not None:
+
+            def wrapped_end_forward(self, tensors, rows, *args, **kwargs):
+                ret = original_end_forward(self, tensors, rows, *args, **kwargs)
+                t0 = _PP_STEP_STATE.pop("fwd_t0", None)
+                if t0 is not None:
+                    _PP_STEP_STATE["stage0_forward_s"] = time.time() - t0
+                _PP_STEP_STATE["pp_forwards"] = int(
+                    getattr(self, "forwards", 0) or 0
+                )
+                _PP_STEP_STATE["pp_launches"] = int(
+                    getattr(self, "launches", 0) or 0
+                )
+                return ret
+
+            target.end_forward = wrapped_end_forward
+
+
+class C_LazyPushStepperHook(BaseHook):
+    """Record one row per scheduler step of the lazy-push loop.
+
+    LazyPushStepper replaces EngineCore.step when TPU_PP_LAZY_PUSH is set and
+    never blocks on a result, so EngineCore.step's wall clock is meaningless
+    on this path.
+
+    ``forward_s`` on a ``kind="sampled"`` row spans from ``slot.started_last``
+    to the sampling callback. ``started_last`` is stamped when the
+    ``execute_model`` future completes -- i.e. when **stage 0** accepted the
+    step (pp_lazy_step.py:293) -- and the sampling callback fires when the
+    last stage's ``sample_tokens`` returns (pp_lazy_step.py:294). The value is
+    therefore "everything after stage 0": the activations travelling through
+    stages 1..N-1 plus the last stage's forward and sampling.
+
+    It is NOT the last stage's own forward time, and stages 1..N-2 cannot be
+    separated from it: they run in follower processes that carry no
+    EngineCore, so there is nothing to hook there. Pairing it with the
+    worker-side ``stage0_forward_s`` gives the whole step end to end.
+
+    Rows are exported to rank0.engine_steps.jsonl by the EngineCore profile
+    hook. The class only exists on a leader of a pipeline deeper than two
+    stages, so the GPU path never installs it.
+    """
+
+    HOOK_MODULE_NAME = "vllm_torchtpu.core.pp_lazy_step"
+    HOOK_CLASS_NAME = "LazyPushStepper"
+
+    @classmethod
+    def hook(cls, target) -> None:
+        original_dispatch = getattr(target, "_dispatch", None)
+        original_sampled = getattr(target, "_sampled", None)
+        original_process = getattr(target, "_process", None)
+
+        if original_dispatch is not None:
+
+            def wrapped_dispatch(self, *args, **kwargs):
+                ret = original_dispatch(self, *args, **kwargs)
+                if ret:
+                    try:
+                        slot = self.slots[-1] if self.slots else None
+                        _record_engine_step("dispatch", self, slot=slot)
+                    except Exception as e:
+                        _warn_once("engine step dispatch", e)
+                return ret
+
+            target._dispatch = wrapped_dispatch
+
+        if original_sampled is not None:
+
+            def wrapped_sampled(self, slot, *args, **kwargs):
+                started = getattr(slot, "started_last", None)
+                forward_s = (
+                    time.monotonic() - started if started is not None else None
+                )
+                ret = original_sampled(self, slot, *args, **kwargs)
+                try:
+                    _record_engine_step(
+                        "sampled", self, slot=slot, forward_s=forward_s
+                    )
+                except Exception as e:
+                    _warn_once("engine step sampled", e)
+                return ret
+
+            target._sampled = wrapped_sampled
+
+        if original_process is not None:
+
+            def wrapped_process(self, step, *args, **kwargs):
+                ret = original_process(self, step, *args, **kwargs)
+                try:
+                    _record_engine_step(
+                        "process", self, slot=getattr(step, "slot", None)
+                    )
+                except Exception as e:
+                    _warn_once("engine step process", e)
+                return ret
+
+            target._process = wrapped_process
 
 
 class C_MultiprocExecutorProfileHook(BaseHook):
@@ -801,6 +1109,7 @@ class C_SchedulerHook(BaseHook):
         original_add_request = target.add_request
         original_schedule = target.schedule
         original_free_request = target._free_request
+        original_update_from_output = getattr(target, "update_from_output", None)
 
         def wrapped_add_request(self, request, *args, **kwargs):
             recv_time = time.time()
@@ -904,9 +1213,38 @@ class C_SchedulerHook(BaseHook):
                 req_info.output_ids = array("i", request.output_token_ids)
             return original_free_request(self, request, *args, **kwargs)
 
+        # PP: the first token of a request is only visible here -- the worker
+        # that samples it is the last stage, and this EngineCore is the first
+        # place the token meets the request object. update_from_output runs in
+        # the same process as the Scheduler, so no cross-process join is needed
+        # to turn `first_token_ts - created_time` into TTFT.
+        def wrapped_update_from_output(self, scheduler_output,
+                                       model_runner_output, *args, **kwargs):
+            result = original_update_from_output(
+                self, scheduler_output, model_runner_output, *args, **kwargs
+            )
+            try:
+                ts = time.time()
+                for _client_index, core_outputs in (result or {}).items():
+                    for out in (getattr(core_outputs, "outputs", None) or ()):
+                        rid = getattr(out, "request_id", None)
+                        if not rid:
+                            continue
+                        new_ids = getattr(out, "new_token_ids", None)
+                        if not new_ids:
+                            continue
+                        req_info = REQUEST_INFOS.get(rid)
+                        if req_info is not None and req_info.first_token_ts == 0.0:
+                            req_info.first_token_ts = _round6(ts)
+            except Exception as e:
+                _warn_once("first_token_ts", e)
+            return result
+
         target.add_request = wrapped_add_request
         target.schedule = wrapped_schedule
         target._free_request = wrapped_free_request
+        if original_update_from_output is not None:
+            target.update_from_output = wrapped_update_from_output
 
 
 class C_TpuSchedulerHook(C_SchedulerHook):
