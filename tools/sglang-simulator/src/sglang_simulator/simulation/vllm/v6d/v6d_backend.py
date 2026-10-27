@@ -551,11 +551,15 @@ class C_V6dObjectBackendHook(BaseHook):
     all events are immediately complete (DummyEvent.query() → True).
     """
 
-    HOOK_CLASS_NAME = "V6dObjectBackend"
-    HOOK_MODULE_NAME = "vllm.v1.hybrid_connector.v6d_object_backend"
-
     @classmethod
     def hook(cls, target):
+        # Load-timing injection mode:
+        #   controller (default): deadline model — async_load_kv bypassed,
+        #       acknowledgement scheduled by SimulatedKVController.
+        #   data_plane: native load chain runs (async_swap -> client.get);
+        #       modeled seg1/seg2 injected as sleep in the client wrapper;
+        #       locality/nbytes come from the data plane (meta.location/nbytes).
+        cls._load_timing = os.environ.get("SIMULATOR_LOAD_TIMING", "controller")
         original_init = target.__init__
 
         def override_init(self, *args, **kwargs):
@@ -600,28 +604,47 @@ class C_V6dObjectBackendHook(BaseHook):
 
         original_prepare = getattr(target, "async_update_state_after_alloc", None)
 
-        async def prepare_load(self, request, blocks, num_external_tokens):
-            # Complete real metadata lookup/allocation first. A modeled DMA is
-            # only scheduled here, never awaited by the preparation barrier.
-            result = await original_prepare(self, request, blocks, num_external_tokens)
-            if result is not None or num_external_tokens <= 0:
+        if cls._load_timing == "data_plane":
+            # Native alloc/bookkeeping runs; no modeled scheduling here.
+            async def prepare_load(self, request, blocks, num_external_tokens):
+                return await original_prepare(
+                    self, request, blocks, num_external_tokens)
+        else:
+            async def prepare_load(self, request, blocks, num_external_tokens):
+                # Complete real metadata lookup/allocation first. A modeled DMA is
+                # only scheduled here, never awaited by the preparation barrier.
+                result = await original_prepare(self, request, blocks, num_external_tokens)
+                if result is not None or num_external_tokens <= 0:
+                    return result
+                groups = self._scheduler._reqs_to_load.get(request.request_id, {})
+                self._sim_controller.queue_load(request, num_external_tokens, groups)
                 return result
-            groups = self._scheduler._reqs_to_load.get(request.request_id, {})
-            self._sim_controller.queue_load(request, num_external_tokens, groups)
-            return result
 
         if original_prepare is not None:
             target.async_update_state_after_alloc = prepare_load
             target._sim_sync_prepare = True
 
-        async def override_async_load_kv(self, m):
-            # Preparation schedules the native load acknowledgement at its
-            # modeled ready time. Yielding here would send an early/duplicate
-            # LOAD_DONE RPC and let the native scheduler run the request early.
-            return
-            yield  # Preserve the native async-generator interface.
+        if cls._load_timing == "data_plane":
+            original_async_load_kv = target.async_load_kv
 
-        target.async_load_kv = override_async_load_kv
+            async def native_async_load_kv(self, m):
+                # Run the native load chain, but first make sure the v6d
+                # client is wrapped with the modeled-latency injection
+                # (seg2 always; seg1 when the fetch resolves non-local).
+                _ensure_client_latency(self)
+                async for reqid in original_async_load_kv(self, m):
+                    yield reqid
+
+            target.async_load_kv = native_async_load_kv
+        else:
+            async def override_async_load_kv(self, m):
+                # Preparation schedules the native load acknowledgement at its
+                # modeled ready time. Yielding here would send an early/duplicate
+                # LOAD_DONE RPC and let the native scheduler run the request early.
+                return
+                yield  # Preserve the native async-generator interface.
+
+            target.async_load_kv = override_async_load_kv
 
         def clear_backend_metadata(self):
             # The controller captured stores before forward and owns completion.
@@ -638,6 +661,57 @@ class C_V6dObjectBackendHook(BaseHook):
         _bwm = BandwidthModel.get()
         logger.info("[V6D Hijack] V6dObjectBackend hook installed "
                     "(transfer-latency model enabled=%s)", _bwm.enabled)
+
+
+# ---- Data-plane latency injection (SIMULATOR_LOAD_TIMING=data_plane) ----
+# Wraps the v6d client used by V6dSwapHandler. After each real async_get:
+#   - nbytes / remote-ness recorded from the resolved objects
+#     (meta["location"] != "local" => cross-node fetch),
+#   - the modeled latency (seg2 always; seg1 when remote) is injected as an
+#     asyncio.sleep for the remainder beyond what the real (CPU-fast) read
+#     already took. Local reads pay seg2 only; cross-node reads pay seg1+seg2.
+_CLIENT_LATENCY_WRAPPED: set = set()
+
+
+def _ensure_client_latency(backend) -> None:
+    handler = getattr(backend, "_load_handler", None)
+    client = getattr(handler, "_client", None)
+    if client is None:
+        return
+    ccls = type(client)
+    if id(ccls) in _CLIENT_LATENCY_WRAPPED:
+        return
+    _CLIENT_LATENCY_WRAPPED.add(id(ccls))
+
+    original_async_get = ccls.async_get
+
+    async def wrapped_async_get(keys, *args, **kwargs):
+        t0 = time.perf_counter()
+        objs = await original_async_get(keys, *args, **kwargs)
+        elapsed = time.perf_counter() - t0
+        try:
+            bw = BandwidthModel.get()
+            if bw.enabled:
+                obj_list = objs if isinstance(objs, (list, tuple)) else [objs]
+                nbytes = 0
+                remote = False
+                for o in obj_list:
+                    nbytes += int(getattr(o, "nbytes", 0) or 0)
+                    meta = getattr(o, "meta", None) or {}
+                    if str(meta.get("location", "local")) != "local":
+                        remote = True
+                nblk = len(keys) if hasattr(keys, "__len__") else 0
+                modeled = bw.latency_for(nblk, True)
+                if remote:
+                    modeled += bw.seg1_latency(nblk)
+                delay = max(0.0, modeled - elapsed)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        except Exception:
+            pass
+        return objs
+
+    ccls.async_get = wrapped_async_get
 
 
 class _DummyBladeKVTModule:
