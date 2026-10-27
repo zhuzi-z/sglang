@@ -685,9 +685,11 @@ def _ensure_client_latency(backend) -> None:
 
     original_async_get = ccls.async_get
 
-    async def wrapped_async_get(keys, *args, **kwargs):
+    async def wrapped_async_get(self, keys, *args, **kwargs):
+        # Installed as a class attribute => bound method: first arg is the
+        # client instance, `keys` is the real key list.
         t0 = time.perf_counter()
-        objs = await original_async_get(keys, *args, **kwargs)
+        objs = await original_async_get(self, keys, *args, **kwargs)
         elapsed = time.perf_counter() - t0
         try:
             bw = BandwidthModel.get()
