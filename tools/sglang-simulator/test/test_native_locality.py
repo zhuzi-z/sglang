@@ -26,6 +26,7 @@ if __name__ == "__main__" and _native_missing():
 if os.environ.get("_SGLANG_RELEASE_CHILD") == "1":
     import ast, asyncio, copy, os, sys, types, unittest
     from pathlib import Path
+    from unittest.mock import patch
     import test_release_regressions as base
     V=base.ROOT
     N=_native_source("vllm", "vllm/distributed/kv_transfer/kv_connector/v1/v6d_object_connector.py")
