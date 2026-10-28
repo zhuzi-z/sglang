@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from sglang_simulator.simulation.manager import Envs, StateManager
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.vllm.cpu_stubs import DummyEvent
-from sglang_simulator.simulation.vllm.v6d.bandwidth import BandwidthModel
+from sglang_simulator.simulation.vllm.v6d.bandwidth import BandwidthModel, validate_load_timing
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
@@ -55,56 +55,13 @@ class SimulatedKVController:
         self._staged = []
         self._stores = []
         self._loads = {}
+        self._native_locality = {}
+        self._preparing_requests = Counter()
+        self._cancelled_preparations = set()
         self._store_tails = {}
         self._aborted_stores = {}
         self._local_keys: set = set()
-        # Which loads pay the seg1 cross-node latency. "local_registry"
-        # (default) applies seg1 only to loads whose keys were never stored
-        # by this instance (i.e. the owner lives on another sim instance);
-        # "all" restores the legacy always-apply behavior. TODO(calibrate):
-        # local registry ignores L2 eviction, so a locally-evicted key that
-        # only exists remotely is still treated as local — acceptable until
-        # eviction tracking lands here.
-        #
-        # TODO(design, option B): the registry does NOT track L2 evictions,
-        # and the sim DOES evict (capacity-injected runs fire the real
-        # AsyncEvictor at the 95% watermark). A locally-evicted key whose
-        # owner lives on another sim instance is then misclassified as
-        # local (seg1 skipped). Fix = sync evicted keys out of
-        # _local_keys: the daemon-side eviction hook (v6d_capacity
-        # wrapped_evict_batch) already sees the evicted key list, but it
-        # runs in the daemon process while this registry lives in the
-        # engine process -- an IPC channel (shared JSONL tail / tracker
-        # write) is required to bridge them.
-        #
-        # ---- Follow-up investigation (2026-10-27, code-verified) ----------
-        # 1. The sim's async_load_kv is fully overridden (returns at once,
-        #    see override_async_load_kv): loads NEVER reach a daemon-side
-        #    tiered read, so injecting seg1 inside the daemon data plane is
-        #    NOT viable for loads in this architecture.
-        # 2. The native control plane DOES have a locality-bearing step:
-        #    a P2P read resolves via two SRPC calls into the remote peer --
-        #    transfer.get_metas_by_names (metadata probe; also used by
-        #    VineyardPeer.get_remote_object_sizes) and transfer.load_data
-        #    (blob copy). The sim stubs BOTH (V6D_SIM_STUB_META_PROBE=1
-        #    fabricates metas locally; load_data is always a no-op). The
-        #    probe can be restored per-environment (set =0; SRPC stays
-        #    alive on the 2M-aligned sparse mmap) exactly as in production.
-        # 3. Candidate designs for per-request locality, in order of
-        #    fidelity:
-        #    (a) Un-stub the meta probe and extend the daemon `exists`
-        #        result to encode locality (local / remote-owner / miss);
-        #        a connector-side hook stashes it per request into the
-        #        metadata, replacing _local_keys entirely. Fidelity: the
-        #        same probe production issues; cost: one control-plane
-        #        SRPC per cross-node load (matches production).
-        #    (b) Keep the stub, but have patched_exists write
-        #        {request_id -> locality} plus eviction batches into a
-        #        shared daemon->engine side file that queue_load tails.
-        #        Solves eviction sync (option B) with the same channel.
-        #    (c) Current registry approximation (this code) — zero IPC,
-        #        known narrow misclassification documented above.
-        #    Revisit when cross-node calibration actually begins.
+        # 原生命中快照为主；本机存储 registry 仅用于缺失信息兜底。
         self._seg1_scope = os.environ.get("SIMULATOR_SEG1_SCOPE",
                                           "local_registry")
         self._preparing = []
@@ -118,6 +75,116 @@ class SimulatedKVController:
                 return original_release(req_id)
 
         self.cache._release_protected_blocks = release
+        self._install_locality_hooks()
+
+
+    def _capture_native_key(self, rid, gid, key, obj, cached=False):
+        # 只读复制 fetch 前的原生位置/对象字节数，不保留对象或租约。#
+        if rid is None or obj is None:
+            return
+        meta = getattr(obj, "meta", {}) or {}
+        location = meta.get("location")
+        note = meta.get("_sim_native_read_origin")
+        # 完整 request_id（含原生 -0 后缀）严格匹配，历史标签不跨请求。
+        matched_note = (isinstance(note, dict) and note.get("version") == 1
+                        and note.get("request_id") == rid
+                        and note.get("key") == key
+                        and isinstance(note.get("peer"), str) and bool(note["peer"]))
+        if matched_note:
+            location = note["peer"]
+        scope = getattr(getattr(obj, "_lease", None), "scope", None)
+        scope = getattr(scope, "value", scope)
+        # READ 缓存租约是原生驻留证据；历史 remote 属性不能推翻它。
+        if not matched_note and cached and str(scope).lower() == "read":
+            location = "local"
+        if not isinstance(location, str) or not location:
+            return
+        try:
+            size = int(note.get("size", 0) if matched_note else meta.get("size", 0))
+        except (ValueError, TypeError, OverflowError):
+            size = 0
+        with self._lock:
+            if rid in self._cancelled_preparations:
+                return
+            self._native_locality.setdefault(rid, {}).setdefault(
+                (gid, key), (location == "local", size if size > 0 else None))
+
+    def _forget_native_request(self, rid):
+        with self._lock:
+            if self._preparing_requests.get(rid):
+                self._cancelled_preparations.add(rid)
+            self._native_locality.pop(rid, None)
+            self._loads.pop(rid, None)
+
+    def _install_locality_hooks(self):
+        cache = self.cache
+        def capture_fetch(request, hashes, unfetched):
+            objs, cached, promoted = cache._prepare_fetch(hashes, unfetched)
+            by_key = {o.key: o for o in objs if o is not None}
+            for manager, key in cached + promoted:
+                self._capture_native_key(request.request_id, manager._group_id,
+                                         key, by_key.get(key), (manager, key) in cached)
+        def wrap_fetch(original, asynchronous):
+            if asynchronous:
+                async def fetch(request, hit_blocks_hashes, unfetched_objs=None):
+                    capture_fetch(request, hit_blocks_hashes, unfetched_objs)
+                    result = await original(request, hit_blocks_hashes, unfetched_objs)
+                    if not result:
+                        self._forget_native_request(request.request_id)
+                    return result
+            else:
+                def fetch(request, hit_blocks_hashes, unfetched_objs=None):
+                    capture_fetch(request, hit_blocks_hashes, unfetched_objs)
+                    result = original(request, hit_blocks_hashes, unfetched_objs)
+                    if not result:
+                        self._forget_native_request(request.request_id)
+                    return result
+            return fetch
+
+        for name, asynchronous in (("_fetch_intersection_blocks", False),
+                                   ("_async_fetch_intersection_blocks", True)):
+            original = getattr(cache, name, None)
+            if original is not None:
+                setattr(cache, name, wrap_fetch(original, asynchronous))
+        def wrap_key(manager, original, asynchronous):
+            def capture(key, rid):
+                if key is not None:
+                    self._capture_native_key(rid, manager._group_id, key,
+                                             manager._cached_objs.get(key), True)
+            if asynchronous:
+                async def get_key(block_hash, request_id=None):
+                    key = await original(block_hash, request_id=request_id)
+                    capture(key, request_id)
+                    return key
+            else:
+                def get_key(block_hash, request_id=None):
+                    key = original(block_hash, request_id=request_id)
+                    capture(key, request_id)
+                    return key
+            return get_key
+
+        def wrap_cleanup(original):
+            def cleanup(*args, **kwargs):
+                rid = (args[0] if args else kwargs.get("reqid",
+                       kwargs.get("req_id", kwargs.get("request_id"))))
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    self._forget_native_request(rid)
+            return cleanup
+
+        for manager in getattr(cache, "managers", {}).values():
+            for name, asynchronous in (("get_key", False), ("async_get_key", True)):
+                original = getattr(manager, name, None)
+                if original is not None:
+                    setattr(manager, name, wrap_key(manager, original, asynchronous))
+            original = getattr(manager, "cleanup_request", None)
+            if original is not None:
+                manager.cleanup_request = wrap_cleanup(original)
+        for name in ("on_abort_req", "_cleanup_req_tracking"):
+            original = getattr(cache, name, None)
+            if original is not None:
+                setattr(cache, name, wrap_cleanup(original))
 
     @staticmethod
     def now():
@@ -205,19 +272,30 @@ class SimulatedKVController:
             self._staged.append(self.Store(
                 state._req, taken, len(_s_keys), _s_keys, last))
 
-    def prepare(self, coroutine):
+    def prepare(self, coroutine, request_id=None):
         future = Future()
         self._preparing.append(future)
+        with self._lock:
+            if request_id is not None:
+                self._preparing_requests[request_id] += 1
 
         async def tracked():
             try:
                 result = await coroutine
             except BaseException as exc:
+                self._forget_native_request(request_id)
                 future.set_exception(exc)
                 raise
             else:
                 future.set_result(result)
                 return result
+            finally:
+                with self._lock:
+                    if request_id is not None:
+                        self._preparing_requests[request_id] -= 1
+                        if not self._preparing_requests[request_id]:
+                            self._preparing_requests.pop(request_id, None)
+                            self._cancelled_preparations.discard(request_id)
         return tracked()
 
     def settle_preparations(self):
@@ -241,19 +319,37 @@ class SimulatedKVController:
         nblocks = sum(len(keys) for keys, _ids in groups.values())
         bw = BandwidthModel.get()
         latency = bw.latency_for(nblocks, True)
-        # Per-request seg1 gating: only cross-node loads pay the seg1 fetch.
-        # Locality comes from this instance's own store registry — keys it
-        # never stored live on another sim instance. See _seg1_scope note.
-        keys_all = [k for keys, _ids in groups.values() for k in keys]
-        cross_node = True
-        if (self._seg1_scope == "local_registry" and keys_all
-                and self._local_keys):
-            cross_node = any(k not in self._local_keys for k in keys_all)
-        if cross_node:
-            latency += bw.seg1_latency(nblocks)
-        deadline = self.now() + latency
+        rid = request.request_id
         with self._lock:
-            self._loads.setdefault(request.request_id, (deadline, num_tokens))
+            if rid in self._cancelled_preparations:
+                return
+            facts = self._native_locality.pop(rid, {})
+            remote_blocks = remote_bytes = missing_bytes = 0
+            sources = Counter()
+            for gid, (keys, _ids) in groups.items():
+                for key in keys:
+                    fact = facts.get((gid, key))
+                    if fact is not None:
+                        local, size = fact
+                        sources["native"] += 1
+                    else:
+                        sources["fallback"] += 1
+                        local = self._seg1_scope == "local_registry" and key in self._local_keys
+                        size = None
+                    if not local:
+                        remote_blocks += 1
+                        if size is None:
+                            missing_bytes += 1
+                        else:
+                            remote_bytes += size
+            remote_bytes += bw.seg2_bytes(missing_bytes)
+            if remote_blocks:
+                latency += bw.seg1_latency(remote_blocks, nbytes=remote_bytes)
+            self._loads.setdefault(rid, (self.now() + latency, num_tokens))
+        source = "native" if not sources["fallback"] else "fallback"
+        logger.info("[V6D locality] req=%s source=%s native=%d fallback=%d remote_keys=%d seg1_bytes=%d bytes_fallback=%d",
+                    rid, source, sources["native"], sources["fallback"],
+                    remote_blocks, remote_bytes, missing_bytes)
 
     def _run_control(self, coroutine):
         try:
@@ -352,6 +448,8 @@ class SimulatedKVController:
         with self._lock:
             dropped_loads = len(self._loads)
             self._loads.clear()
+            self._native_locality.clear()
+            self._local_keys.clear()
             for store in self._staged + self._stores:
                 if store.blocks:
                     self.cache._block_pool.free_blocks(store.blocks)
@@ -397,7 +495,7 @@ class C_HybridControlPlaneHook(BaseHook):
         def prepare(self, req, blocks):
             coroutine = original_prepare(self, req, blocks)
             controller = self._sim_controller
-            return controller.prepare(coroutine) if controller is not None else coroutine
+            return controller.prepare(coroutine, req.request_id) if controller is not None else coroutine
 
         def step_waiting(self):
             result = original_waiting(self)
@@ -551,15 +649,13 @@ class C_V6dObjectBackendHook(BaseHook):
     all events are immediately complete (DummyEvent.query() → True).
     """
 
+    HOOK_CLASS_NAME = "V6dObjectBackend"
+    HOOK_MODULE_NAME = "vllm.v1.hybrid_connector.v6d_object_backend"
+
     @classmethod
     def hook(cls, target):
-        # Load-timing injection mode:
-        #   controller (default): deadline model — async_load_kv bypassed,
-        #       acknowledgement scheduled by SimulatedKVController.
-        #   data_plane: native load chain runs (async_swap -> client.get);
-        #       modeled seg1/seg2 injected as sleep in the client wrapper;
-        #       locality/nbytes come from the data plane (meta.location/nbytes).
-        cls._load_timing = os.environ.get("SIMULATOR_LOAD_TIMING", "controller")
+        # 入口在注册前同样校验；这里保护绕过标准入口直接安装的调用方。
+        validate_load_timing()
         original_init = target.__init__
 
         def override_init(self, *args, **kwargs):
@@ -604,47 +700,32 @@ class C_V6dObjectBackendHook(BaseHook):
 
         original_prepare = getattr(target, "async_update_state_after_alloc", None)
 
-        if cls._load_timing == "data_plane":
-            # Native alloc/bookkeeping runs; no modeled scheduling here.
-            async def prepare_load(self, request, blocks, num_external_tokens):
-                return await original_prepare(
-                    self, request, blocks, num_external_tokens)
-        else:
-            async def prepare_load(self, request, blocks, num_external_tokens):
-                # Complete real metadata lookup/allocation first. A modeled DMA is
-                # only scheduled here, never awaited by the preparation barrier.
-                result = await original_prepare(self, request, blocks, num_external_tokens)
-                if result is not None or num_external_tokens <= 0:
-                    return result
-                groups = self._scheduler._reqs_to_load.get(request.request_id, {})
-                self._sim_controller.queue_load(request, num_external_tokens, groups)
+        async def prepare_load(self, request, blocks, num_external_tokens):
+            # Complete real metadata lookup/allocation first. A modeled DMA is
+            # only scheduled here, never awaited by the preparation barrier.
+            result = await original_prepare(self, request, blocks, num_external_tokens)
+            if result is not None or num_external_tokens <= 0:
+                self._sim_controller._forget_native_request(request.request_id)
                 return result
+            groups = self._scheduler._reqs_to_load.get(request.request_id, {})
+            if groups:
+                self._sim_controller.queue_load(request, num_external_tokens, groups)
+            if not groups:
+                self._sim_controller._forget_native_request(request.request_id)
+            return result
 
         if original_prepare is not None:
             target.async_update_state_after_alloc = prepare_load
             target._sim_sync_prepare = True
 
-        if cls._load_timing == "data_plane":
-            original_async_load_kv = target.async_load_kv
+        async def override_async_load_kv(self, m):
+            # Preparation schedules the native load acknowledgement at its
+            # modeled ready time. Yielding here would send an early/duplicate
+            # LOAD_DONE RPC and let the native scheduler run the request early.
+            return
+            yield  # Preserve the native async-generator interface.
 
-            async def native_async_load_kv(self, m):
-                # Run the native load chain, but first make sure the v6d
-                # client is wrapped with the modeled-latency injection
-                # (seg2 always; seg1 when the fetch resolves non-local).
-                _ensure_client_latency(self)
-                async for reqid in original_async_load_kv(self, m):
-                    yield reqid
-
-            target.async_load_kv = native_async_load_kv
-        else:
-            async def override_async_load_kv(self, m):
-                # Preparation schedules the native load acknowledgement at its
-                # modeled ready time. Yielding here would send an early/duplicate
-                # LOAD_DONE RPC and let the native scheduler run the request early.
-                return
-                yield  # Preserve the native async-generator interface.
-
-            target.async_load_kv = override_async_load_kv
+        target.async_load_kv = override_async_load_kv
 
         def clear_backend_metadata(self):
             # The controller captured stores before forward and owns completion.
@@ -661,59 +742,6 @@ class C_V6dObjectBackendHook(BaseHook):
         _bwm = BandwidthModel.get()
         logger.info("[V6D Hijack] V6dObjectBackend hook installed "
                     "(transfer-latency model enabled=%s)", _bwm.enabled)
-
-
-# ---- Data-plane latency injection (SIMULATOR_LOAD_TIMING=data_plane) ----
-# Wraps the v6d client used by V6dSwapHandler. After each real async_get:
-#   - nbytes / remote-ness recorded from the resolved objects
-#     (meta["location"] != "local" => cross-node fetch),
-#   - the modeled latency (seg2 always; seg1 when remote) is injected as an
-#     asyncio.sleep for the remainder beyond what the real (CPU-fast) read
-#     already took. Local reads pay seg2 only; cross-node reads pay seg1+seg2.
-_CLIENT_LATENCY_WRAPPED: set = set()
-
-
-def _ensure_client_latency(backend) -> None:
-    handler = getattr(backend, "_load_handler", None)
-    client = getattr(handler, "_client", None)
-    if client is None:
-        return
-    ccls = type(client)
-    if id(ccls) in _CLIENT_LATENCY_WRAPPED:
-        return
-    _CLIENT_LATENCY_WRAPPED.add(id(ccls))
-
-    original_async_get = ccls.async_get
-
-    async def wrapped_async_get(self, keys, *args, **kwargs):
-        # Installed as a class attribute => bound method: first arg is the
-        # client instance, `keys` is the real key list.
-        t0 = time.perf_counter()
-        objs = await original_async_get(self, keys, *args, **kwargs)
-        elapsed = time.perf_counter() - t0
-        try:
-            bw = BandwidthModel.get()
-            if bw.enabled:
-                obj_list = objs if isinstance(objs, (list, tuple)) else [objs]
-                nbytes = 0
-                remote = False
-                for o in obj_list:
-                    nbytes += int(getattr(o, "nbytes", 0) or 0)
-                    meta = getattr(o, "meta", None) or {}
-                    if str(meta.get("location", "local")) != "local":
-                        remote = True
-                nblk = len(keys) if hasattr(keys, "__len__") else 0
-                modeled = bw.latency_for(nblk, True)
-                if remote:
-                    modeled += bw.seg1_latency(nblk)
-                delay = max(0.0, modeled - elapsed)
-                if delay > 0:
-                    await asyncio.sleep(delay)
-        except Exception:
-            pass
-        return objs
-
-    ccls.async_get = wrapped_async_get
 
 
 class _DummyBladeKVTModule:

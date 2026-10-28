@@ -5,6 +5,7 @@ import sys
 from typing import List, Union
 
 from sglang_simulator.hook.base_hook import BaseHook, _register_hooks
+from sglang_simulator.hook.class_hook_entry import _apply_with_diagnostics, _register_diagnostics
 from sglang_simulator.utils import get_logger
 
 logger = get_logger("sgl_simulator")
@@ -49,7 +50,7 @@ class HookLoader(importlib.abc.Loader):
                         )
                     )
                     try:
-                        hook.hook(module)
+                        _apply_with_diagnostics(hook, module, "module")
                     except Exception as e:
                         logger.warning(
                             f"Failed to hook module [{module.__name__}]. Error: {e}"
@@ -62,6 +63,7 @@ class HookLoader(importlib.abc.Loader):
 
 def install_module_hooks(hooks: Union[List[BaseHook], BaseHook]):
     _register_hooks(MODULE_HOOKS, hooks)
+    _register_diagnostics(MODULE_HOOKS, "module")
     sys.meta_path.insert(0, HookMetaPathFinder())
 
 

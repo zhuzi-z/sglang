@@ -8,15 +8,11 @@ arena + 2000 objects x 132MB declared -> 130MB RSS, 0.0s boot).  Capacity
 and eviction accounting are therefore the daemon's own — no virtual layer.
 
 The read path is the REAL ``TieredVineyardPeer._acquire_tiered_read``
-(reached via ``client.get`` from the connector).  By default the remote
-SRPC meta probe (``transfer.get_metas_by_names``) is stubbed (fabricated
-locally from the daemon's own uniform page size), fully severing the P2P
-SRPC network path for environments where no remote peer is reachable — at
-the cost of trusting the tracker fully (a stale remote announcement is no
-longer rejected by the probe).  Set ``V6D_SIM_STUB_META_PROBE=0`` to restore
-the real probe (the mmap is 2M-aligned, so the SRPC server registers the
-bulkstore fine under ``SRPC_STREAM_DISABLE_RDMA=1`` TCP mode), so stale
-tracker entries are re-confirmed by the remote exactly as in production.
+(reached via ``client.get`` from the connector).
+默认保留真实 SRPC 元数据 probe，远端对象存在性与大小按原生实现确认。
+稀疏 mmap 保留 2M 对齐，TCP-only SRPC 仍可注册 bulkstore。
+``V6D_SIM_STUB_META_PROBE=1`` 仅供显式隔离测试：它依赖本机已知 page size，
+无法证明真实远端可读性，不得用于跨节点发布验收。
 The payload copies (``transfer.load_data`` / ``async_load_data``, eager
 strategies only) are always no-ops, and a ``[V6D HitSource]`` line per read
 batch is logged (port of the production v6d_hitsource_patch; see
@@ -93,11 +89,11 @@ def _keysource_enabled() -> bool:
 def _stub_meta_probe_enabled() -> bool:
     """Stub the remote SRPC meta probe (get_metas_by_names).
 
-    Default ON: the P2P SRPC network path is fully cut (metas are fabricated
-    locally from the learned uniform page size).  Set to 0/false to restore
-    the real probe so stale tracker entries get re-confirmed by the remote.
+    默认保留原生 probe，确认远端对象仍存在且使用它的真实元数据。
+    显式设为 1 的测试模式才伪造元数据；不能据此验收真实跨节点命中。
     """
-    return os.environ.get(_ENV_STUB_META_PROBE, "1") not in ("0", "false", "False")
+    # 发布路径保留原生远端元数据校验；伪造 probe 仅允许显式测试开启。
+    return os.environ.get(_ENV_STUB_META_PROBE, "0") not in ("0", "false", "False")
 
 
 def _fmt_keys(object_keys) -> str:
@@ -119,7 +115,7 @@ def _fmt_keys(object_keys) -> str:
 #     reached by eager fetch strategies; the default lazy strategy never
 #     calls them (data load is client-side, and the sim connector never
 #     loads).
-#   * ``get_metas_by_names`` is stubbed by default: ``_sim_get_metas_by_names``
+#   * 仅显式测试开关才替换 ``get_metas_by_names`` 为 ``_sim_get_metas_by_names``：
 #     fabricates the meta locally — the declared size is the cluster-wide
 #     uniform page size learned from the daemon's own ``_object_info`` (any
 #     locally-tracked vineyard object's size), which keeps ``_check_and_evict``
@@ -258,6 +254,30 @@ class C_VineyardPeerHook(BaseHook):
             return original_init(self, argc, argv, *args, **kwargs)
 
         target.__init__ = patched_init
+        original_acquire = target.acquire
+
+        async def acquire(self, object_keys, metas, scope, term=None,
+                          request_id=None, **kwargs):
+            result = await original_acquire(
+                self, object_keys, metas, scope, term,
+                request_id=request_id, **kwargs)
+            if str(getattr(scope, "value", scope)).lower() == "read":
+                # 只标记本次返回对象；复制 metadata，绝不污染持久对象。
+                for obj in result[1]:
+                    if obj is None:
+                        continue
+                    meta = dict(obj.meta or {})
+                    meta.pop("_sim_native_read_origin", None)
+                    if isinstance(request_id, str) and request_id:
+                        meta["_sim_native_read_origin"] = {
+                            "version": 1, "request_id": request_id,
+                            "key": obj.key, "peer": kwargs.get("peer") or "local",
+                            "size": meta.get("size", getattr(obj, "size", None)),
+                        }
+                    obj.meta = meta
+            return result
+
+        target.acquire = acquire
         logger.info(
             "[v6d-sim] C_VineyardPeerHook installed: reserve_memory=false, "
             "SRPC init soft-fail")
@@ -279,9 +299,8 @@ class C_TieredVineyardPeerHook(BaseHook):
     2. Data-plane stubs: no-op the two payload-copy entry points in
        ``v6d.common.transfer`` (eager strategies only — never called by the
        default lazy strategy).  The remote SRPC meta probe
-       (``get_metas_by_names``) is stubbed with locally-fabricated metas by
-       default (cutting all remote SRPC traffic), or runs for real when
-       ``V6D_SIM_STUB_META_PROBE=0``.  Everything else on the read path (LRU
+       (``get_metas_by_names``) 默认保持真实，只在显式设置
+       ``V6D_SIM_STUB_META_PROBE=1`` 的测试中伪造。其他读取行为 (LRU
        touch, lease pin, tracker probe, eviction check, local admit +
        re-ANNOUNCE, ``record_*_hit``) runs unmodified.
     """
@@ -376,17 +395,23 @@ class C_TieredVineyardPeerHook(BaseHook):
         # v6d.server.peers.vineyard.peer), so this import is a sys.modules
         # lookup; the stubs apply process-wide, which is fine: the client
         # side never transfers data either (fetch is stubbed there).
-        # get_metas_by_names is stubbed by default, cutting the last remote
-        # SRPC call on the read path.  Set V6D_SIM_STUB_META_PROBE=0 to keep
-        # it REAL — the SRPC meta probe is what makes remote hits
-        # production-faithful (stale tracker entries get re-confirmed by the
-        # remote).
+        # 默认保留原生元数据 probe，确认 tracker 所指的远端对象。
+        # 显式 stub 只能用于隔离测试，不能替代跨节点功能验收。
         import v6d.common.transfer as transfer
         transfer.load_data = _sim_load_data_noop
         transfer.async_load_data = _sim_async_load_data_noop
         _stub_meta = _stub_meta_probe_enabled()
         if _stub_meta:
             transfer.get_metas_by_names = _sim_get_metas_by_names
+
+        original_init = target.__init__
+
+        def init_with_hook_report(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            from sglang_simulator.hook.class_hook_entry import emit_hook_report
+            emit_hook_report("daemon-initialized", "v6d-daemon")
+
+        target.__init__ = init_with_hook_report
 
         logger.info(
             "[v6d-sim] C_TieredVineyardPeerHook installed: real "
@@ -450,3 +475,5 @@ def install_v6d_runtime_hooks():
         C_TieredVineyardPeerHook,
         C_HitRateStatsHook,
     ])
+    from sglang_simulator.hook.class_hook_entry import emit_hook_report
+    emit_hook_report("daemon-registration", "v6d-daemon")

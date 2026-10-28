@@ -96,6 +96,9 @@ def init_hook():
     if _HOOKS_INSTALLED:
         return True
 
+    from sglang_simulator.simulation.vllm.v6d.bandwidth import validate_load_timing
+    validate_load_timing()
+
     # CPU-only v6d IPC: the SRPC engine natively supports
     # SRPC_STREAM_DISABLE_RDMA=1 (TCP-only mode, skipping libcuda/barex/
     # ibverbs).  setdefault so child processes (EngineCore workers,
@@ -160,4 +163,6 @@ def init_hook():
     from sglang_simulator.simulation.vllm.dashllm.kv_transfer_hook import _install_dashllm_kv_transfer_hook
     _install_dashllm_kv_transfer_hook()
     _HOOKS_INSTALLED = True
+    from sglang_simulator.hook.class_hook_entry import emit_hook_report
+    emit_hook_report("registration", "vllm-bootstrap")
     return True

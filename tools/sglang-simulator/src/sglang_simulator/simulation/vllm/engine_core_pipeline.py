@@ -300,6 +300,10 @@ class C_VLLMEngineCoreHook(BaseHook):
                 logger.error("Failed to initialize inference time predictor: %s", e)
                 raise
 
+            # 非阻塞全量hook报告：供人工启动验收，不按固定数量拒绝启动。
+            from sglang_simulator.hook.class_hook_entry import emit_hook_report
+            emit_hook_report("engine-ready", "EngineCore")
+
         def wrapped_add_request(self, request, request_wave=0, *args, **kwargs):
             """Park simulation requests in the shared future queue; forward
             everything else to the native path immediately."""

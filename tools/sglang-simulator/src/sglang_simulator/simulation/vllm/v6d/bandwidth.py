@@ -27,11 +27,22 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 
 logger = logging.getLogger(__name__)
 
 _ENV_PROFILE = "SIMULATOR_HICACHE_BW_PROFILE"
+
+
+def validate_load_timing():
+    """在安装 hook 前拒绝未实现的模式，不能静默降级或延后到首个请求。"""
+    mode = os.environ.get("SIMULATOR_LOAD_TIMING", "controller").strip() or "controller"
+    if mode != "controller":
+        raise ValueError(
+            f"SIMULATOR_LOAD_TIMING={mode!r} is unsupported by CPU simulation; "
+            "use controller (native GPU load handlers are unavailable)"
+        )
 
 
 class SegmentModel:
@@ -44,9 +55,13 @@ class SegmentModel:
     """
 
     def __init__(self, name: str, floor_s: float, t0_s: float, bw_bytes_per_s: float):
+        floor_s, t0_s, bw_bytes_per_s = map(float, (floor_s, t0_s, bw_bytes_per_s))
+        if any(not math.isfinite(value) or value < 0
+               for value in (floor_s, t0_s, bw_bytes_per_s)):
+            raise ValueError(f"Invalid latency parameters for {name}")
         self.name = name
-        self.floor_s = max(0.0, floor_s)
-        self.t0_s = max(0.0, t0_s)
+        self.floor_s = floor_s
+        self.t0_s = t0_s
         self.bw = bw_bytes_per_s if bw_bytes_per_s > 0 else float("inf")
 
     def latency(self, nbytes: int) -> float:
@@ -95,6 +110,10 @@ class BandwidthModel:
         self.peer_topology = None
         self._seg1_floor_ms = 0.0
         self._seg1_per_blk_ms = 0.0
+        self._seg1_floor_s = 0.0
+        self._seg1_bw_bytes_per_s = 0.0
+        self._poll_granularity_ms = 10.0
+        self._rank_sync_ms = 1.0
         if not profile:
             return
         layout = profile.get("layout", {})
@@ -121,6 +140,11 @@ class BandwidthModel:
         _st = cp.get("store_completion", {})
         self._poll_granularity_ms = float(_st.get("poll_granularity_ms", 10.0))
         self._rank_sync_ms = float(_st.get("rank_sync_ms", 1.0))
+        constants = (self._seg1_floor_ms, self._seg1_per_blk_ms,
+                     self._seg1_bw_bytes_per_s, self._poll_granularity_ms,
+                     self._rank_sync_ms)
+        if any(not math.isfinite(value) or value < 0 for value in constants):
+            raise ValueError("Invalid control-plane latency parameters")
         segs = profile.get("segments", {})
         if "local_load" in segs and "local_store" in segs:
             self.local_load = SegmentModel.from_samples("local_load", segs["local_load"])
@@ -177,15 +201,13 @@ class BandwidthModel:
     def _cp_latency(nblocks, env_floor, env_per, prof_floor, prof_per):
         f = os.environ.get(env_floor)
         p = os.environ.get(env_per)
-        if f is not None or p is not None:
-            floor_ms, per_ms = float(f or 0), float(p or 0)
-        else:
-            floor_ms, per_ms = prof_floor, prof_per
+        floor_ms = float(f) if f is not None else prof_floor
+        per_ms = float(p) if p is not None else prof_per
         if floor_ms <= 0 and per_ms <= 0:
             return 0.0
         return (floor_ms + per_ms * max(0, nblocks)) / 1000.0
 
-    def seg1_latency(self, nblocks: int) -> float:
+    def seg1_latency(self, nblocks: int, nbytes: int | None = None) -> float:
         """Cross-node fetch (peer v6d -> local v6d), the seg1 transfer.
 
         Model: setup floor (metadata + peer handshake + stream setup) plus
@@ -198,9 +220,17 @@ class BandwidthModel:
         cross-node traffic is captured (the 948d window had zero cross-node
         hits), all parameters default to 0 and the model is a no-op.
         """
-        if self._seg1_bw_bytes_per_s > 0 and self._seg1_floor_s >= 0:
-            nbytes = self.seg2_bytes(nblocks)
-            return self._seg1_floor_s + nbytes / self._seg1_bw_bytes_per_s
+        if nblocks <= 0:
+            return 0.0
+        # 显式 per-block 覆盖选择线性模型；floor 单独覆盖时仍保留字节模型。
+        per_override = os.environ.get("SGLANG_SIMULATOR_SEG1_PER_BLK_MS")
+        if self._seg1_bw_bytes_per_s > 0 and per_override is None:
+            floor_override = os.environ.get("SGLANG_SIMULATOR_SEG1_FLOOR_MS")
+            floor_s = (float(floor_override) / 1000.0 if floor_override is not None
+                       else self._seg1_floor_s)
+            # 原生对象 bytes 是 daemon 间完整 payload，不再按 TP 重复乘算。
+            nbytes = self.seg2_bytes(nblocks) if nbytes is None else max(0, nbytes)
+            return max(0.0, floor_s) + nbytes / self._seg1_bw_bytes_per_s
         return self._cp_latency(
             nblocks, "SGLANG_SIMULATOR_SEG1_FLOOR_MS",
             "SGLANG_SIMULATOR_SEG1_PER_BLK_MS",
@@ -229,11 +259,11 @@ class BandwidthModel:
         try:
             with open(path) as f:
                 profile = json.load(f)
+            model = cls(profile)
         except Exception as exc:
             logger.warning("[v6d-bw] cannot read profile %s (%s): "
                            "transfer-latency modelling disabled", path, exc)
             return cls(None)
-        model = cls(profile)
         if not model.enabled:
             logger.warning("[v6d-bw] profile %s incomplete: modelling disabled", path)
             return model
