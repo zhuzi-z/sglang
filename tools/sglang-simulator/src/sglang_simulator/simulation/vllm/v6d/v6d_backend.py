@@ -705,13 +705,18 @@ class C_V6dObjectBackendHook(BaseHook):
             # only scheduled here, never awaited by the preparation barrier.
             result = await original_prepare(self, request, blocks, num_external_tokens)
             if result is not None or num_external_tokens <= 0:
-                self._sim_controller._forget_native_request(request.request_id)
                 return result
             groups = self._scheduler._reqs_to_load.get(request.request_id, {})
-            if groups:
-                self._sim_controller.queue_load(request, num_external_tokens, groups)
-            if not groups:
-                self._sim_controller._forget_native_request(request.request_id)
+            # Reaching here means the native side decided to wait for a load,
+            # and the overridden async_load_kv never yields, so this controller
+            # is the only possible source of that acknowledgement. Register the
+            # deadline unconditionally: an empty groups models zero blocks,
+            # whose latency is 0.0, so the next progress() acknowledges it
+            # immediately. Skipping registration instead -- which an empty
+            # groups used to do -- strands the request in the native _loading
+            # set forever, because has_pending() then reports no work and
+            # EngineCore blocks on its input queue with no deadline to wake on.
+            self._sim_controller.queue_load(request, num_external_tokens, groups)
             return result
 
         if original_prepare is not None:
