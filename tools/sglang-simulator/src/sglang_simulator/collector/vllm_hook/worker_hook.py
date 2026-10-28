@@ -1,3 +1,4 @@
+import contextlib
 import gzip
 import json
 import os
@@ -22,6 +23,9 @@ _EXPORT_FLAGS = frozenset(
 )
 EXPORT_TOKEN_IDS = "no_ids" not in _EXPORT_FLAGS
 EXPORT_GZIP = "plain" not in _EXPORT_FLAGS
+# Suffix of a file that is still being written; removed by the atomic rename
+# that publishes the final name.
+_INPROGRESS_SUFFIX = ".profiling"
 
 
 @dataclass(slots=True)
@@ -78,6 +82,14 @@ class BatchInfos:
     # so consumers never have to subtract one from pp_forwards.
     pos_in_burst: int = 0
     burst_id: int = 0
+    # Wall clock at this stage's start_forward entry (PPWave hook fwd_t0):
+    # the closest observable point to "this chunk starts computing on
+    # stage 0" -- after the before_step hand-off wait, before the host
+    # submits the forward. Paired with the EngineCore-side sampled reply
+    # (engine_steps sampled.wall_ts) it yields the full per-chunk span
+    # T_step = sampled.wall_ts - stage0_start_ts. Both processes live on
+    # the leader host, so the two wall clocks are directly comparable.
+    stage0_start_ts: float = 0.0
 
 
 BATCH_INFOS: list[BatchInfos] = []
@@ -100,8 +112,17 @@ _PP_STEP_STATE: dict = {}
 
 
 def _record_engine_step(kind: str, stepper, slot=None,
-                        forward_s: Optional[float] = None) -> None:
-    """Append one EngineCore-side step record (defensive: never raises)."""
+                        forward_s: Optional[float] = None,
+                        rids: Optional[list] = None) -> None:
+    """Append one EngineCore-side step record (defensive: never raises).
+
+    ``rids`` (dispatch rows only): full request ids from this step's
+    SchedulerOutput.num_scheduled_tokens -- the same object the workers
+    parse into BatchInfos.requests (which keeps rid[-12:]), so the rid set
+    joins a dispatch row to the worker-side schedule_batch row of the same
+    step. sampled/process rows carry no rids; they join to the dispatch
+    row through slot_dispatched instead.
+    """
     with _ENGINE_STEPS_LOCK:
         _ENGINE_STEP_SEQ["n"] += 1
         wave = getattr(stepper, "wave", None)
@@ -154,6 +175,8 @@ def _record_engine_step(kind: str, stepper, slot=None,
                         pass
         if forward_s is not None:
             row["forward_s"] = round(float(forward_s), 6)
+        if rids is not None:
+            row["rids"] = rids
         ENGINE_STEPS.append(row)
 
 
@@ -301,11 +324,30 @@ def _round6(value: Optional[float]) -> Optional[float]:
     return round(value, 6) if value is not None else None
 
 
+@contextlib.contextmanager
 def _open_export(path: str):
-    """Open a JSONL export file; gzip-compressed (level 1) when EXPORT_GZIP."""
+    """Write into ``<path>.profiling`` and rename to ``path`` once complete.
+
+    Every export goes through this context manager, so a reader globbing
+    ``*.jsonl.gz`` never sees a file that is still being written: the final
+    name only appears after the file is closed (gzip trailer included) and
+    atomically renamed in the same directory. A leftover ``.profiling`` file
+    therefore means "this export did not finish" (write error or process
+    killed), which is exactly the signal the start-side async dump lacks.
+    """
+    tmp_path = path + _INPROGRESS_SUFFIX
     if EXPORT_GZIP:
-        return gzip.open(path, "wt", compresslevel=1)
-    return open(path, "w")
+        f = gzip.open(tmp_path, "wt", compresslevel=1)
+    else:
+        f = open(tmp_path, "w")
+    try:
+        yield f
+    finally:
+        f.close()
+    # Only reached when the with-body and close() both succeeded; a raise
+    # above leaves the .profiling file behind and never publishes the final
+    # name.
+    os.replace(tmp_path, path)
 
 
 _LAST_EXPORT_THREAD: Optional[threading.Thread] = None
@@ -326,22 +368,28 @@ def _run_export(export_fn, is_start: bool) -> None:
         export_fn()
 
 
-# Per-round export subdirectory --------------------------------------------
+# Per-call export subdirectory ---------------------------------------------
 # EngineCore.profile and every Worker.profile fire exactly once per profile
-# call (start_profile/stop_profile fan out via collective_rpc to all
-# workers), so each process can keep its own call counter and the counters
-# stay aligned 1:1 across the EngineCore and Worker processes. The run
-# subdirectory below is therefore pairable across processes purely by the
-# "run{NNN}" counter -- no cross-process coordination (shared files, extra
-# RPC fields) is needed to match rank0.requests.jsonl with the
-# rank{N}.schedule_batch.jsonl of the same round.
-_PROFILE_ROUND = 0
-# Readable wall-clock tag of this process, fixed once at import time. Only a
-# human-friendly prefix; the run counter above is the pairing key.
-_PROCESS_START_TS = time.strftime("%Y%m%d_%H%M%S")
-# Run subdirectory minted by the latest start_profile; reused by stop_profile
-# so one round's start/stop exports land in the same directory.
-_CURRENT_RUN_SUBDIR: Optional[str] = None
+# call (/start_profile and /stop_profile both fan out via collective_rpc to
+# all workers), so one call dumps one run directory shared by the EngineCore
+# and every worker of the node:
+#
+#   $SIM_COLLECTOR_OUTPUT_DIR/engine{RANK}/run{NNN}/
+#     rank0.requests.jsonl[.gz]         EngineCore
+#     rank0.engine_steps.jsonl[.gz]     EngineCore
+#     rank{N}.schedule_batch.jsonl[.gz] each worker
+#     rank{N}.transfer.jsonl[.gz]       each worker
+#
+# The rank in the file name keeps the processes apart inside the shared
+# directory. Every file is written as <name>.profiling and renamed to <name>
+# only once it is complete, so a partial (or still running) dump is never
+# mistaken for a finished one. The call number lives in a per-node marker
+# (.current_run) so a worker joins the directory the EngineCore minted for
+# this call instead of minting one of its own -- minting per process was what
+# split one call's files across run001 (requests) and run002 (engine_steps).
+# A worker that runs without a marker (node without an EngineCore) allocates
+# it itself and the remaining workers join.
+_RUN_MARKER = ".current_run"
 
 
 # ---- HybridConnector KV transfer latency collection (load/store) ----
@@ -376,66 +424,156 @@ _REQ_SUBMIT_TS: dict[str, float] = {}
 _REQ_STORE_SUBMIT_TS: dict[str, float] = {}
 
 
-def get_output_dir(is_start: bool = True) -> str:
-    """Export dir of the current profile round:
-    $SIM_COLLECTOR_OUTPUT_DIR/engine{RANK}/{proc_start_ts}_run{NNN}/
-    (pid{PID} instead of engine{RANK} when DS_LLM_PROC_RANK is unset).
+def _run_dir_name(n: int) -> str:
+    return f"run{n:03d}"
 
-    A fresh run subdirectory is minted on every start_profile (and lazily on
-    a stop_profile that never saw a start), so successive profile rounds and
-    service restarts no longer overwrite earlier exports -- previously the
-    fixed directory plus "w"-mode files kept only the latest round.
-    bandwidth_profile.json intentionally stays at the top level (node-level
-    hardware property, calibrated once).
-    """
-    global _PROFILE_ROUND, _CURRENT_RUN_SUBDIR
+
+def _run_number(name: str) -> int:
+    """Number of a ``runNNN`` directory; 0 for anything else (e.g. _old)."""
+    if len(name) != 6 or not name.startswith("run"):
+        return 0
+    digits = name[3:]
+    return int(digits) if digits.isdigit() else 0
+
+
+def _output_root() -> str:
     base = os.getenv("SIM_COLLECTOR_OUTPUT_DIR", os.getcwd())
     engine_rank = os.getenv("DS_LLM_PROC_RANK")
     if engine_rank is not None:
         sub_dir = f"engine{engine_rank}"
     else:
         sub_dir = f"pid{os.getpid()}"
-    if is_start or _CURRENT_RUN_SUBDIR is None:
-        _PROFILE_ROUND += 1
-        _CURRENT_RUN_SUBDIR = f"{_PROCESS_START_TS}_run{_PROFILE_ROUND:03d}"
-    output_dir = os.path.join(base, sub_dir, _CURRENT_RUN_SUBDIR)
-    os.makedirs(output_dir, exist_ok=True)
-    return output_dir
+    return os.path.join(base, sub_dir)
 
 
-def _export_engine_requests(is_start: bool) -> None:
-    """Dump the engine-side REQUEST_INFOS of the current profile round.
+def _read_run_marker(root: str) -> int:
+    try:
+        with open(os.path.join(root, _RUN_MARKER)) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
 
-    Called from the EngineCore profile hook (in-process / leader node, where
-    a Scheduler lives). Kept as a module-level function so a second caller
-    (e.g. an executor-level profile shim) can reuse it without duplicating
-    the JSON shaping.
+
+def _write_run_marker(root: str, n: int) -> None:
+    path = os.path.join(root, _RUN_MARKER)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        f.write(f"{n}\n")
+    os.replace(tmp_path, path)
+
+
+def _highest_run(root: str) -> int:
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+    return max((_run_number(name) for name in names), default=0)
+
+
+def _archive_run_dir(path: str) -> None:
+    """Move a colliding run dir aside; the caller keeps the plain runNNN."""
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    target = f"{path}_old_{stamp}"
+    n = 1
+    while os.path.exists(target):
+        target = f"{path}_old_{stamp}_{n}"
+        n += 1
+    os.rename(path, target)
+    print(
+        f"[sim_collector] {path} already exists, archived to {target}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def get_output_dir(join: bool = False) -> str:
+    """Directory of the current profile call: engine{RANK}/run{NNN}/.
+
+    The collector records continuously, so every profile call --
+    /start_profile and /stop_profile alike -- dumps what accumulated since
+    the previous call into its own run directory; nothing is overwritten.
+
+    ``join=False`` (EngineCore, the allocating side on a node that has one):
+    take the next free number and record it in the node's .current_run
+    marker. The number is max(marker, existing runNNN) + 1, so a restart
+    continues the sequence instead of reusing an existing directory; should
+    the name still be taken (concurrent allocator, stale marker), the
+    existing directory is archived as runNNN_old_<ts> rather than reused.
+
+    ``join=True`` (workers): adopt the number the EngineCore wrote for this
+    call -- the fan-out happens after the marker write, so it is the current
+    call -- and allocate instead when no marker exists. All processes of one
+    call therefore land in one directory, separated by the rank in the file
+    names.
     """
-    global REQUEST_INFOS
-    output_dir = get_output_dir(is_start=is_start)
+    root = _output_root()
+    os.makedirs(root, exist_ok=True)
 
+    if join:
+        n = _read_run_marker(root)
+        if n > 0:
+            path = os.path.join(root, _run_dir_name(n))
+            os.makedirs(path, exist_ok=True)
+            return path
+
+    n = max(_read_run_marker(root), _highest_run(root)) + 1
+    path = os.path.join(root, _run_dir_name(n))
+    if os.path.exists(path):
+        _archive_run_dir(path)
+    os.makedirs(path, exist_ok=True)
+    _write_run_marker(root, n)
+    return path
+
+
+def _export_or_warn(where: str, export_fn) -> None:
+    """Run one export; a collection failure must never break the profile
+    call (a raised wrapper would skip original_profile and leave the
+    profiler running)."""
+    try:
+        export_fn()
+    except Exception as e:
+        _warn_once(where, e)
+
+
+def _snapshot_engine_requests():
+    """Swap the request buffer out; returns this call's slice."""
+    global REQUEST_INFOS
     request_infos = REQUEST_INFOS
     REQUEST_INFOS = defaultdict(RequestInfos)
-
-    def _export():
-        path = f"{output_dir}/rank0.requests.jsonl"
-        if EXPORT_GZIP:
-            path += ".gz"
-        with _open_export(path) as f:
-            for req_infos in request_infos.values():
-                row = asdict(req_infos)
-                if not EXPORT_TOKEN_IDS:
-                    # Token ids dominate the payload; drop on request.
-                    del row["input_ids"]
-                    del row["output_ids"]
-                f.write(json.dumps(row, cls=CustomJsonEncoder) + "\n")
-        print(f"Request data has been saved to {path}")
-
-    _run_export(_export, is_start)
+    return request_infos
 
 
-def _export_engine_steps(is_start: bool) -> None:
-    """Dump the EngineCore-side PP step records of the current round.
+def _write_engine_requests(output_dir: str, request_infos) -> None:
+    """Write one cut of REQUEST_INFOS into this call's directory.
+
+    Kept as a module-level function so a second caller (e.g. an executor-level
+    profile shim) can reuse it without duplicating the JSON shaping.
+    """
+    path = f"{output_dir}/rank0.requests.jsonl"
+    if EXPORT_GZIP:
+        path += ".gz"
+    with _open_export(path) as f:
+        for req_infos in request_infos.values():
+            row = asdict(req_infos)
+            if not EXPORT_TOKEN_IDS:
+                # Token ids dominate the payload; drop on request.
+                del row["input_ids"]
+                del row["output_ids"]
+            f.write(json.dumps(row, cls=CustomJsonEncoder) + "\n")
+    print(f"Request data has been saved to {path}")
+
+
+def _snapshot_engine_steps():
+    """Swap the PP step buffer out; returns this call's slice."""
+    global ENGINE_STEPS
+    with _ENGINE_STEPS_LOCK:
+        steps = ENGINE_STEPS
+        ENGINE_STEPS = []
+    return steps
+
+
+def _write_engine_steps(output_dir: str, steps) -> None:
+    """Write one cut of the EngineCore-side PP step records.
 
     Written by the LazyPushStepper hook (leader node only: the lazy-push step
     loop exists in the EngineCore process, not in a follower). One row per
@@ -443,22 +581,13 @@ def _export_engine_steps(is_start: bool) -> None:
     reply (the only place a real per-step forward time is observable) or the
     processing of a finished step.
     """
-    global ENGINE_STEPS
-    output_dir = get_output_dir(is_start=is_start)
-    with _ENGINE_STEPS_LOCK:
-        steps = ENGINE_STEPS
-        ENGINE_STEPS = []
-
-    def _export():
-        path = f"{output_dir}/rank0.engine_steps.jsonl"
-        if EXPORT_GZIP:
-            path += ".gz"
-        with _open_export(path) as f:
-            for row in steps:
-                f.write(json.dumps(row, cls=CustomJsonEncoder) + "\n")
-        print(f"Engine step data has been saved to {path}")
-
-    _run_export(_export, is_start)
+    path = f"{output_dir}/rank0.engine_steps.jsonl"
+    if EXPORT_GZIP:
+        path += ".gz"
+    with _open_export(path) as f:
+        for row in steps:
+            f.write(json.dumps(row, cls=CustomJsonEncoder) + "\n")
+    print(f"Engine step data has been saved to {path}")
 
 
 class C_VLLMEngineArgsHook(BaseHook):
@@ -642,7 +771,9 @@ class C_WorkerHook(BaseHook):
                     batch_info.burst_id = int(
                         _PP_STEP_STATE.pop("burst_id", 0) or 0
                     )
-                    _PP_STEP_STATE.pop("fwd_t0", None)
+                    fwd_t0 = _PP_STEP_STATE.pop("fwd_t0", None)
+                    if fwd_t0 is not None:
+                        batch_info.stage0_start_ts = _round6(fwd_t0)
                 except Exception as e:
                     _warn_once("pp step state", e)
                 # Print the batch info at its recording (finalize) point.
@@ -727,7 +858,7 @@ class C_WorkerHook(BaseHook):
                              profiler_kwargs=None, *args, **kwargs):
             global BATCH_INFOS, TRANSFER_INFOS
 
-            output_dir = get_output_dir(is_start=is_start)
+            output_dir = get_output_dir(join=True)
             # The worker class differs across forks: vllm's Worker always has
             # .rank, torchtpu's TPUWorker may not -- fall back to the rank the
             # launcher exports so the file name stays rank{N}.
@@ -829,16 +960,42 @@ class C_EngineCoreHook(BaseHook):
         def wrapped_profile(self, is_start: bool = True,
                             profile_prefix: Optional[str] = None,
                             *args, **kwargs):
-            _export_engine_requests(is_start)
-            # PP step loop records (empty unless LazyPushStepper is active on
-            # this node, i.e. a leader of a pipeline deeper than two stages).
+            # Cut point first, write last: snapshotting both buffers before
+            # the fan-out keeps this node's requests / engine_steps on the
+            # same slice of traffic as the workers' schedule_batch / transfer
+            # (the fan-out alone takes seconds), and every record that lands
+            # while the files are being written goes to the next call.
+            # A collection failure is a warning, never a broken profile call:
+            # raising here would skip original_profile and leave the profiler
+            # running.
+            output_dir = snapshot = None
             try:
-                _export_engine_steps(is_start)
+                output_dir = get_output_dir()
+                snapshot = (_snapshot_engine_requests(), _snapshot_engine_steps())
             except Exception as e:
-                _warn_once("engine step export", e)
+                _warn_once("engine snapshot", e)
 
-            # Call the original profile method to trigger the lower-level worker
-            return original_profile(self, is_start, profile_prefix)
+            try:
+                # Call the original profile method to trigger the lower-level
+                # worker fan-out (and the real profiler, when configured).
+                return original_profile(self, is_start, profile_prefix)
+            finally:
+                if snapshot is not None:
+                    requests_cut, steps_cut = snapshot
+
+                    def _export():
+                        _export_or_warn(
+                            "request export",
+                            lambda: _write_engine_requests(output_dir, requests_cut),
+                        )
+                        _export_or_warn(
+                            "engine step export",
+                            lambda: _write_engine_steps(output_dir, steps_cut),
+                        )
+
+                    # start: side thread (the engine keeps serving);
+                    # stop: synchronous, files are on disk before returning.
+                    _run_export(_export, is_start)
 
         target.profile = wrapped_profile
 
@@ -965,7 +1122,17 @@ class C_LazyPushStepperHook(BaseHook):
                 if ret:
                     try:
                         slot = self.slots[-1] if self.slots else None
-                        _record_engine_step("dispatch", self, slot=slot)
+                        # The just-dispatched _Step carries the same
+                        # SchedulerOutput the workers receive; its
+                        # num_scheduled_tokens keys are this step's rids.
+                        # Empty for state-only steps without tokens.
+                        rids = None
+                        step = self.in_flight[-1] if self.in_flight else None
+                        sched_out = getattr(step, "scheduler_output", None)
+                        nst = getattr(sched_out, "num_scheduled_tokens", None)
+                        if nst:
+                            rids = list(nst.keys())
+                        _record_engine_step("dispatch", self, slot=slot, rids=rids)
                     except Exception as e:
                         _warn_once("engine step dispatch", e)
                 return ret
