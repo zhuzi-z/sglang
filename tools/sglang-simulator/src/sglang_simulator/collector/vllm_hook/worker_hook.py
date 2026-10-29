@@ -32,6 +32,12 @@ class RequestInfos:
     server_created_time: Optional[float] = None
     queue_start: float = 0.0
     queue_end: float = 0.0
+    # X3: scheduling rounds this request sat through between entering the
+    # waiting queue and first being scheduled. queue_end - queue_start only
+    # gives elapsed time; the round count tells whether the request was passed
+    # over repeatedly (admission constraint) or the queue was simply long.
+    sched_round_in: int = -1
+    sched_rounds_waited: int = -1
     output_length: int = 0
     input_length: int = 0
     total_kv_hit_len: int = 0
@@ -51,6 +57,18 @@ class BatchInfos:
     requests: list[tuple[str, int, int, int]] = field(default_factory=list)
     iter_latency: float = 0.0
     sample_tokens_latency: float = 0.0
+    # X3: CPU wall clock of the two RPCs and the inter-step gap. iter_latency /
+    # sample_tokens_latency above are CUDA-event (GPU stream) durations, while
+    # start_timestamp is a CPU clock -- mixing them leaves a per-step residual
+    # that cannot be attributed. These three are pure perf_counter deltas:
+    #   exec_cpu_s   CPU time inside execute_model   (RPC-1, launch + CPU prep)
+    #   sample_cpu_s CPU time inside sample_tokens   (RPC-2)
+    #   step_gap_s   previous step's CPU exit -> this step's CPU entry
+    # step_gap_s separates scheduler/engine CPU work and genuine idle from the
+    # measured windows; it is 0.0 for the first recorded step of a process.
+    exec_cpu_s: float = 0.0
+    sample_cpu_s: float = 0.0
+    step_gap_s: float = 0.0
     logprobs_req_count: int = 0
     logprobs_tokens: int = 0
     logprobs_n: int = 0
@@ -60,7 +78,33 @@ class BatchInfos:
     st_segments_ms: Optional[dict] = None
 
 
+@dataclass(slots=True)
+class SchedStateInfos:
+    """One scheduler round's admission state (EngineCore process).
+
+    Captured after Scheduler.schedule() returns, so the counters reflect what
+    the round actually admitted. Fields default to -1 when the attribute does
+    not exist on this vllm version -- a -1 means "not observable here", which
+    must not be read as zero.
+    """
+
+    ts: float = 0.0
+    round_index: int = 0
+    num_waiting: int = -1          # len(scheduler.waiting)
+    num_running: int = -1          # len(scheduler.running)
+    scheduled_new: int = -1        # requests starting prefill this round
+    scheduled_cached: int = -1     # requests continuing this round
+    scheduled_tokens: int = -1     # total_num_scheduled_tokens
+    token_budget: int = -1         # max_num_batched_tokens
+    kv_free_blocks: int = -1       # free blocks in the KV manager
+    kv_total_blocks: int = -1
+    head_wait_s: float = -1.0      # how long the waiting-queue head has waited
+    head_admitted: bool = False    # whether that head got in this round
+
+
 BATCH_INFOS: list[BatchInfos] = []
+
+SCHED_STATES: list[SchedStateInfos] = []
 
 REQUEST_INFOS: dict[str, RequestInfos] = defaultdict(RequestInfos)
 
@@ -120,6 +164,29 @@ _PENDING_EXEC: Optional[tuple] = None
 # (sample_tokens_latency - sum(segments)) is reported as "other".
 SEG_KEYS = ("sample", "draft", "bookkeep", "eplb")
 _SEG_STATE = {"active": False, "cur": None}
+
+# Method-name aliases per segment. vllm renames these across versions, and a
+# silent miss is what made every segment read 0.0 in the 20261024 collection
+# (other == 100% of RPC-2). The first attribute that exists wins; the outcome
+# per segment is recorded in SEG_HOOK_STATUS so the export can prove whether
+# the breakdown is trustworthy instead of leaving a zero to be misread as
+# "this segment costs nothing".
+SEG_ALIASES = {
+    "sample": ("_sample", "sample", "_sample_tokens"),
+    "draft": ("propose_draft_token_ids", "_propose_draft_token_ids"),
+    "bookkeep": ("_bookkeeping_sync", "bookkeeping_sync"),
+    "eplb": ("eplb_step", "fluid_step"),
+}
+SEG_HOOK_STATUS: dict = {}
+
+# Monotonic schedule-round counter (EngineCore process). A request's wait is
+# recorded as the number of scheduling rounds it sat through, which is what
+# distinguishes "the queue was long" from "the request was repeatedly passed
+# over" -- indistinguishable from queue_start/queue_end alone.
+_SCHED_ROUND = 0
+
+# Previous step's CPU exit, for BatchInfos.step_gap_s.
+_LAST_STEP_CPU_END: Optional[float] = None
 
 
 def _finalize_on_get_output(output, finalize):
@@ -345,11 +412,21 @@ class C_WorkerHook(BaseHook):
             global _PENDING_EXEC
 
             # Bracket the forward with timing cuda events instead of syncing.
+            global _LAST_STEP_CPU_END
+
             exec_timer = _EventTimer()
             start_wall = time.time()
+            cpu_entry = time.perf_counter()
+            step_gap = (
+                cpu_entry - _LAST_STEP_CPU_END
+                if _LAST_STEP_CPU_END is not None
+                else 0.0
+            )
             exec_timer.record_start()
             ret = original_execute_model(self, scheduler_output)
             exec_timer.record_end()
+            exec_cpu = time.perf_counter() - cpu_entry
+            _LAST_STEP_CPU_END = cpu_entry + exec_cpu
 
             batch_info = None
             if len(batch_req_infos):
@@ -368,6 +445,8 @@ class C_WorkerHook(BaseHook):
                         )
                         for rid, req_info in batch_req_infos.items()
                     ],
+                    exec_cpu_s=_round6(exec_cpu),
+                    step_gap_s=_round6(step_gap),
                     logprobs_req_count=logprobs_req_count,
                     logprobs_tokens=logprobs_tokens,
                     logprobs_n=logprobs_n,
@@ -375,7 +454,8 @@ class C_WorkerHook(BaseHook):
                 BATCH_INFOS.append(batch_info)
 
             def _finalize_exec(sample_latency: Optional[float] = None,
-                               seg: Optional[dict] = None):
+                               seg: Optional[dict] = None,
+                               sample_cpu: Optional[float] = None):
                 if batch_info is None:
                     return
                 iter_latency = exec_timer.elapsed_s()
@@ -385,6 +465,8 @@ class C_WorkerHook(BaseHook):
                 batch_info.end_timestamp = _round6(start_wall + iter_latency)
                 if sample_latency is not None:
                     batch_info.sample_tokens_latency = _round6(sample_latency)
+                if sample_cpu is not None:
+                    batch_info.sample_cpu_s = _round6(sample_cpu)
                 if seg is not None:
                     st_ms = (sample_latency or 0.0) * 1e3
                     batch_info.st_segments_ms = {
@@ -420,16 +502,23 @@ class C_WorkerHook(BaseHook):
                 global _PENDING_EXEC
 
                 # Bracket RPC-2 with timing cuda events instead of syncing.
+                global _LAST_STEP_CPU_END
+
                 sample_timer = _EventTimer()
                 sample_timer.record_start()
                 # X2: open the per-segment timing window for this RPC-2 call.
                 _SEG_STATE["cur"] = {k: 0.0 for k in SEG_KEYS}
                 _SEG_STATE["active"] = True
+                sample_cpu_entry = time.perf_counter()
                 try:
                     ret = original_sample_tokens(self, *args, **kwargs)
                 finally:
                     _SEG_STATE["active"] = False
                 sample_timer.record_end()
+                sample_cpu = time.perf_counter() - sample_cpu_entry
+                # RPC-2 is the step's last CPU work, so the inter-step gap of
+                # the next step must be measured from here.
+                _LAST_STEP_CPU_END = sample_cpu_entry + sample_cpu
 
                 seg = _SEG_STATE["cur"]
                 pending_exec = _PENDING_EXEC
@@ -441,7 +530,7 @@ class C_WorkerHook(BaseHook):
                     # breakdown to the execute_model window, which records
                     # them on the batch and prints it.
                     if pending_exec is not None:
-                        pending_exec[0](sample_latency, seg)
+                        pending_exec[0](sample_latency, seg, sample_cpu)
 
                 return _finalize_on_get_output(ret, _finalize)
 
@@ -510,8 +599,7 @@ class C_ModelRunnerSegHook(BaseHook):
         def _timed(attr, key):
             fn = getattr(target, attr, None)
             if fn is None:
-                print(f"[seg-hook] {attr} not found on GPUModelRunner; skipped")
-                return
+                return False
 
             def wrapped(*args, **kwargs):
                 if not _SEG_STATE["active"]:
@@ -523,12 +611,16 @@ class C_ModelRunnerSegHook(BaseHook):
                     _SEG_STATE["cur"][key] += (time.perf_counter() - t0) * 1e3
 
             setattr(target, attr, wrapped)
+            return True
 
-        _timed("_sample", "sample")
-        _timed("propose_draft_token_ids", "draft")
-        _timed("_bookkeeping_sync", "bookkeep")
-        _timed("eplb_step", "eplb")
-        _timed("fluid_step", "eplb")
+        for key, aliases in SEG_ALIASES.items():
+            hit = [attr for attr in aliases if _timed(attr, key)]
+            SEG_HOOK_STATUS[key] = "+".join(hit) if hit else "MISSING"
+        missing = [k for k, v in SEG_HOOK_STATUS.items() if v == "MISSING"]
+        print(
+            f"[seg-hook] installed={SEG_HOOK_STATUS} "
+            f"({'all segments covered' if not missing else 'MISSING ' + ','.join(missing)})"
+        )
 
 
 
@@ -543,12 +635,15 @@ class C_EngineCoreHook(BaseHook):
         original_profile = target.profile
 
         def wrapped_profile(self, is_start: bool = True):
-            global REQUEST_INFOS
+            global REQUEST_INFOS, SCHED_STATES
 
             output_dir = get_output_dir(is_start=is_start)
 
             request_infos = REQUEST_INFOS
             REQUEST_INFOS = defaultdict(RequestInfos)
+
+            sched_states = SCHED_STATES
+            SCHED_STATES = []
 
             def _export():
                 path = f"{output_dir}/rank0.requests.jsonl"
@@ -564,7 +659,19 @@ class C_EngineCoreHook(BaseHook):
                         f.write(json.dumps(row, cls=CustomJsonEncoder) + "\n")
                 print(f"Request data has been saved to {path}")
 
+            def _export_sched():
+                path = f"{output_dir}/rank0.sched_state.jsonl"
+                if EXPORT_GZIP:
+                    path += ".gz"
+                with _open_export(path) as f:
+                    for state in sched_states:
+                        f.write(
+                            json.dumps(asdict(state), cls=CustomJsonEncoder) + "\n"
+                        )
+                print(f"Scheduler state has been saved to {path}")
+
             _run_export(_export, is_start)
+            _run_export(_export_sched, is_start)
             
             # Call the original profile method to trigger the lower-level worker
             return original_profile(self, is_start)
@@ -588,6 +695,7 @@ class C_SchedulerHook(BaseHook):
             recv_time = time.time()
             req_info = REQUEST_INFOS[request.request_id]
             req_info.rid = request.request_id
+            req_info.sched_round_in = _SCHED_ROUND
             req_info.queue_start = _round6(recv_time)
             req_info.server_created_time = _round6(request.arrival_time)
             req_info.created_time = _round6(request.arrival_time)
@@ -603,7 +711,73 @@ class C_SchedulerHook(BaseHook):
                         _ri.remote_kv_ready_ts = round(time.time(), 6)
             except Exception:
                 pass
+            global _SCHED_ROUND
+            _SCHED_ROUND += 1
+
+            # Waiting-queue head before this round decides, so "did the head
+            # get in" is answerable afterwards. The queue is a deque of
+            # Request on current vllm; tolerate any other shape.
+            head_rid = None
+            head_wait = -1.0
+            try:
+                waiting = getattr(self, "waiting", None)
+                if waiting:
+                    head = next(iter(waiting))
+                    head_rid = getattr(head, "request_id", None)
+                    head_info = REQUEST_INFOS.get(head_rid) if head_rid else None
+                    if head_info is not None and head_info.queue_start:
+                        head_wait = time.time() - head_info.queue_start
+            except Exception:
+                pass
+
             scheduler_output = original_schedule(self)
+
+            # Admission state of this round. Every lookup is defensive: a
+            # missing attribute yields -1 ("not observable"), never 0.
+            def _count(attr):
+                value = getattr(self, attr, None)
+                try:
+                    return len(value)
+                except TypeError:
+                    return -1
+
+            kv_free = kv_total = -1
+            try:
+                manager = getattr(self, "kv_cache_manager", None)
+                pool = getattr(manager, "block_pool", None) if manager else None
+                if pool is not None:
+                    free = getattr(pool, "free_block_queue", None)
+                    kv_free = getattr(free, "num_free_blocks", -1) if free else -1
+                    kv_total = getattr(pool, "num_gpu_blocks", -1)
+            except Exception:
+                pass
+
+            scheduled_new = len(scheduler_output.scheduled_new_reqs)
+            cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+            scheduled_cached = -1
+            try:
+                scheduled_cached = len(getattr(cached, "req_ids", []) or [])
+            except Exception:
+                pass
+            admitted = {r.req_id for r in scheduler_output.scheduled_new_reqs}
+
+            SCHED_STATES.append(SchedStateInfos(
+                ts=_round6(time.time()),
+                round_index=_SCHED_ROUND,
+                num_waiting=_count("waiting"),
+                num_running=_count("running"),
+                scheduled_new=scheduled_new,
+                scheduled_cached=scheduled_cached,
+                scheduled_tokens=getattr(
+                    scheduler_output, "total_num_scheduled_tokens", -1),
+                token_budget=getattr(
+                    getattr(self, "scheduler_config", None),
+                    "max_num_batched_tokens", -1),
+                kv_free_blocks=kv_free,
+                kv_total_blocks=kv_total,
+                head_wait_s=_round6(head_wait) if head_wait >= 0 else -1.0,
+                head_admitted=bool(head_rid is not None and head_rid in admitted),
+            ))
 
             if scheduler_output.scheduled_new_reqs:
                 prefill_timestamp = time.time()
@@ -615,6 +789,10 @@ class C_SchedulerHook(BaseHook):
                     req_info = REQUEST_INFOS[req_id]
                     if req_info.queue_end == 0:
                         req_info.queue_end = _round6(prefill_timestamp)
+                        if req_info.sched_round_in >= 0:
+                            req_info.sched_rounds_waited = (
+                                _SCHED_ROUND - req_info.sched_round_in
+                            )
                         req_info.input_length = request.num_prompt_tokens
                         req_info.output_length = request.max_tokens
 
