@@ -771,9 +771,10 @@ class C_WorkerHook(BaseHook):
                     batch_info.burst_id = int(
                         _PP_STEP_STATE.pop("burst_id", 0) or 0
                     )
-                    fwd_t0 = _PP_STEP_STATE.pop("fwd_t0", None)
-                    if fwd_t0 is not None:
-                        batch_info.stage0_start_ts = _round6(fwd_t0)
+                    _PP_STEP_STATE.pop("fwd_t0", None)
+                    s0_start = _PP_STEP_STATE.pop("stage0_start_ts", None)
+                    if s0_start is not None:
+                        batch_info.stage0_start_ts = _round6(s0_start)
                 except Exception as e:
                     _warn_once("pp step state", e)
                 # Print the batch info at its recording (finalize) point.
@@ -1050,7 +1051,13 @@ class C_PPWaveHook(BaseHook):
         if original_start_forward is not None:
 
             def wrapped_start_forward(self, rows, *args, **kwargs):
-                _PP_STEP_STATE["fwd_t0"] = time.time()
+                fwd_t0 = time.time()
+                _PP_STEP_STATE["fwd_t0"] = fwd_t0
+                # end_forward pops fwd_t0 to compute stage0_forward_s, so
+                # keep a separate copy for BatchInfos.stage0_start_ts --
+                # reading fwd_t0 at finalize time always found it already
+                # consumed, leaving the field permanently 0.0.
+                _PP_STEP_STATE["stage0_start_ts"] = fwd_t0
                 ret = original_start_forward(self, rows, *args, **kwargs)
                 # _open_burst() runs inside the original call, so by now
                 # `forwards` is this forward's 0-based position in the burst
