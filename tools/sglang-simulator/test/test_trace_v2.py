@@ -124,12 +124,12 @@ def test_context_crosses_rpc_without_changing_native_arguments(recorder):
 def test_native_exception_is_identical_and_never_retried(recorder):
     error = RuntimeError('native exception')
     executor, worker, _ = make_chain(error)
-    output = NS(num_scheduled_tokens={}, total_num_scheduled_tokens=0)
+    output = NS(num_scheduled_tokens={'r': 1}, total_num_scheduled_tokens=1)
     with pytest.raises(RuntimeError) as caught:
         executor.collective_rpc('execute_model', args=(output,))
     assert caught.value is error and len(worker.calls) == 1
     assert trace.ACTIVE.get() is None
-    assert next(r for r in rows(recorder) if r['event'] == 'rpc.execute_model.dispatch')['context'][3] == 'state'
+    assert next(r for r in rows(recorder) if r['event'] == 'rpc.execute_model.dispatch')['context'][3] == 'real'
 
 
 def test_native_profile_is_preserved_and_not_instrumented(recorder):
@@ -262,13 +262,42 @@ def test_disk_quota_is_bounded_and_reported(tmp_path):
 
 def test_recorder_clock_failure_does_not_break_native_call(recorder, monkeypatch):
     executor, worker, _ = make_chain()
-    output = NS(num_scheduled_tokens={}, total_num_scheduled_tokens=0)
+    output = NS(num_scheduled_tokens={'r': 1}, total_num_scheduled_tokens=1)
     def fail():
         raise RuntimeError('observer failure')
     with monkeypatch.context() as patch:
         patch.setattr(trace.time, 'monotonic_ns', fail)
         assert executor.collective_rpc('execute_model', args=(output,)) is output
     assert len(worker.calls) == 1 and recorder.observer_errors > 0
+
+
+def test_empty_polls_do_not_create_events_or_change_real_sampling(recorder, monkeypatch):
+    monkeypatch.setenv('SIM_TRACE_EVERY', '2')
+    executor, worker, _ = make_chain()
+    empty = NS(num_scheduled_tokens={}, total_num_scheduled_tokens=0)
+    real = NS(num_scheduled_tokens={'r': 1}, total_num_scheduled_tokens=1)
+    baseline = recorder.accepted
+    for _ in range(1000):
+        assert executor.collective_rpc('execute_model', args=(empty,)) is empty
+    assert recorder.accepted == baseline and len(worker.calls) == 1000
+    executor.collective_rpc('execute_model', args=(real,))
+    executor.collective_rpc('sample_tokens', args=('grammar',))
+    assert recorder.accepted == baseline
+    executor.collective_rpc('execute_model', args=(empty,))
+    executor.collective_rpc('execute_model', args=(real,))
+    executor.collective_rpc('sample_tokens', args=('grammar',))
+    dispatch = [r for r in rows(recorder) if r['event'] == 'rpc.execute_model.dispatch']
+    assert len(dispatch) == 1 and dispatch[0]['context'][2:] == [1003, 'real']
+    assert trace.ACTIVE.get() is None and len(worker.calls) == 1005
+
+
+def test_state_poll_instrumentation_requires_explicit_opt_in(recorder, monkeypatch):
+    monkeypatch.setenv('SIM_TRACE_INCLUDE_STATE', '1')
+    executor, _, _ = make_chain()
+    empty = NS(num_scheduled_tokens={}, total_num_scheduled_tokens=0)
+    assert executor.collective_rpc('execute_model', args=(empty,)) is empty
+    dispatch = next(r for r in rows(recorder) if r['event'] == 'rpc.execute_model.dispatch')
+    assert dispatch['context'][3] == 'state'
 
 
 def test_fork_reset_does_not_reuse_parent_writer(recorder):

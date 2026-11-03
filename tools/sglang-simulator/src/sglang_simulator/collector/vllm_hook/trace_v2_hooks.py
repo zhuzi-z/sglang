@@ -51,8 +51,10 @@ class V2ExecutorHook(BaseHook):
             collection = os.getenv('SIM_TRACE_COLLECTION_ID', '')
             every = max(int(os.getenv('SIM_TRACE_EVERY', '1')), 1)
             self._sim_v2_step = 0
+            self._sim_v2_real_step = 0
             self._sim_v2_last = None
             self._sim_v2_every = every
+            self._sim_v2_include_state = os.getenv('SIM_TRACE_INCLUDE_STATE', '0') == '1'
             self._sim_v2_session = (collection if 0 < len(collection) <= 128 else uuid.uuid4().hex, uuid.uuid4().hex)
             trace.emit('startup.controller.ready',
                        trace.Scope((*self._sim_v2_session, 0, 'startup')),
@@ -73,8 +75,14 @@ class V2ExecutorHook(BaseHook):
                     if method == 'execute_model':
                         self._sim_v2_step += 1
                         phase = 'real' if getattr(output, 'total_num_scheduled_tokens', 0) > 0 else 'state'
+                        if phase == 'real':
+                            self._sim_v2_real_step += 1
+                            selected_step = self._sim_v2_real_step % self._sim_v2_every == 0
+                        else:
+                            selected_step = (self._sim_v2_include_state
+                                             and self._sim_v2_step % self._sim_v2_every == 0)
                         self._sim_v2_last = ((*self._sim_v2_session, self._sim_v2_step, phase)
-                                             if self._sim_v2_step % self._sim_v2_every == 0 else None)
+                                             if selected_step else None)
                     context = (self._sim_v2_last if method in ('execute_model', 'sample_tokens')
                                else (*self._sim_v2_session, -1, method))
                     if context is not None:
