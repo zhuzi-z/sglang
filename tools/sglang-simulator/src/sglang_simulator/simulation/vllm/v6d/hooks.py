@@ -31,6 +31,10 @@ def register_v6d_hooks(hooks: list) -> None:
     from sglang_simulator.simulation.vllm.v6d.v6d_worker import (
         C_V6dObjectConnectorWorkerHook,
     )
+    from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
+        C_TPURaidenConnectorWorkerHook,
+        C_TPUV6dObjectConnectorWorkerHook,
+    )
 
     # NOTE: C_V6dSwapHandlerHook was removed with v6d_swap.py — the worker
     # hook below replaces _start_async_v6d_init with handler=None, so
@@ -41,6 +45,8 @@ def register_v6d_hooks(hooks: list) -> None:
         C_HybridConnectorHook,
         C_HybridControlPlaneHook,
         C_V6dObjectConnectorWorkerHook,
+        C_TPUV6dObjectConnectorWorkerHook,
+        C_TPURaidenConnectorWorkerHook,
         C_V6dObjectBackendHook,
         C_KVTPBackendHook,
         C_V6dObjectConnectorSchedulerHook,

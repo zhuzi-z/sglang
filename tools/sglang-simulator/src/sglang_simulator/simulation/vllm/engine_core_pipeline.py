@@ -193,14 +193,94 @@ class C_VLLMSchedulerHook(BaseHook):
                 original_has_unfinished(self) or len(ReqDispatcher()) > 0
             )
 
+        original_split = getattr(target, "_mamba_block_aligned_split", None)
+        if original_split is not None:
+            def wrapped_split(self, request, num_new_tokens, *args, **kwargs):
+                scheduler_config = ConfigManager.get_scheduler_config()
+                pcp_size = getattr(scheduler_config, "pcp_size", 1)
+                if pcp_size > 1:
+                    block_size = self.cache_config.block_size
+                    budget = self.scheduler_config.max_num_batched_tokens
+                    # Static PCP granule used by the target PP deployment:
+                    # floor(budget / pcp / block) * pcp * block.
+                    pcp_budget = (budget // pcp_size // block_size) * pcp_size * block_size
+                    if pcp_budget > 0:
+                        num_new_tokens = min(num_new_tokens, pcp_budget)
+                count = original_split(
+                    self, request, num_new_tokens, *args, **kwargs
+                )
+                mtp_prefill_only = os.environ.get(
+                    "TPU_MTP_PREFILL_ONLY", ""
+                ).lower() in ("1", "true", "yes", "on")
+                if mtp_prefill_only and self.cache_config.enable_prefix_caching:
+                    unit = self.hash_block_size
+                    disable_drop = os.environ.get(
+                        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", ""
+                    ).lower() in ("1", "true", "yes", "on")
+                    drop_units = 0 if disable_drop else 1
+                    boundary = max(
+                        0,
+                        ((request.num_prompt_tokens - 1) // unit - drop_units) * unit,
+                    )
+                    local = kwargs.get(
+                        "num_new_local_computed_tokens",
+                        args[0] if len(args) > 0 else 0,
+                    )
+                    external = kwargs.get(
+                        "num_external_computed_tokens",
+                        args[1] if len(args) > 1 else 0,
+                    )
+                    start = request.num_computed_tokens + local + external
+                    if start < boundary < start + count:
+                        count = boundary - start
+                return count
 
-def _ext_computed_tokens(req_id) -> int:
-    """External (cross-node/v6d) computed tokens of a newly scheduled
-    request.  SchedulerOutput does not carry num_external_computed_tokens
-    (it lives on the live Request), so read it through the connector's own
-    scheduler accessor when a KV connector is configured — the only case
-    where an external hit can exist anyway; 0 otherwise.
+            target._mamba_block_aligned_split = wrapped_split
+
+
+def _iter_connector_metadata(metadata):
+    """Yield connector metadata through MultiConnector's nested containers."""
+    if metadata is None:
+        return
+    yield metadata
+    children = getattr(metadata, "metadata", None)
+    if isinstance(children, dict):
+        children = children.values()
+    if isinstance(children, (tuple, list)) or children is not None and hasattr(children, "__iter__"):
+        for child in children or ():
+            yield from _iter_connector_metadata(child)
+
+
+def _tpu_external_hit_tokens(scheduler_output, req_id, total_hit, block_size) -> int | None:
+    """Recover external hits from TPU v6d reqs_to_load, if present.
+
+    TPU Request/NewRequestData do not expose num_external_computed_tokens.
+    A hit is the common prefix across all relevant groups, hence min rather
+    than sum. None means no TPU metadata was found, not a confirmed local hit.
     """
+    metadata = getattr(scheduler_output, "kv_connector_metadata", None)
+    for item in _iter_connector_metadata(metadata):
+        reqs_to_load = getattr(item, "reqs_to_load", None)
+        if not isinstance(reqs_to_load, dict) or req_id not in reqs_to_load:
+            continue
+        groups = reqs_to_load[req_id]
+        if not isinstance(groups, dict):
+            continue
+        counts = []
+        for keys, _block_ids in groups.values():
+            counts.append(len(keys))
+        if counts:
+            return min(min(counts) * block_size, max(total_hit, 0))
+    return None
+
+
+def _ext_computed_tokens(req_id, scheduler_output=None, total_hit=0, block_size=384) -> int:
+    if scheduler_output is not None:
+        external = _tpu_external_hit_tokens(
+            scheduler_output, req_id, total_hit, block_size
+        )
+        if external is not None:
+            return external
     try:
         from vllm.v1.hybrid_connector.engine_proxy import _sched
         req = _sched().requests.get(req_id)
@@ -229,6 +309,31 @@ def _finalize_step_stats(scheduler_output, event_time: float) -> None:
         if st is not None:
             st.gen_token_latencies.append(event_time - st.last_event_time)
             st.last_event_time = event_time
+
+
+def _register_tpu_connector_names():
+    """Register connector names without activating the full TPU platform."""
+    from vllm.distributed.kv_transfer.kv_connector.factory import (
+        KVConnectorFactory,
+    )
+
+    registrations = (
+        (
+            "TPURaidenConnector",
+            "vllm_torchtpu.distributed.kv_transfer.tpu_connector",
+        ),
+        (
+            "TPUMultiConnector",
+            "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
+        ),
+        ("TPUV6dObjectConnector", "kvs_connector.v6d_object_connector"),
+    )
+    for name, module_path in registrations:
+        try:
+            KVConnectorFactory.register_connector(name, module_path, name)
+        except Exception as exc:
+            if "already" not in str(exc).lower():
+                raise
 
 
 class C_VLLMEngineCoreHook(BaseHook):
@@ -280,6 +385,10 @@ class C_VLLMEngineCoreHook(BaseHook):
             request_stats_manager.reset()
             cls.ITERATION_STATS.clear()
 
+            # TpuPlatform normally performs this registration. CPU mode keeps
+            # the platform inactive, so register only the connector names
+            # before EngineCore constructs its Scheduler and connectors.
+            _register_tpu_connector_names()
             original_init(self, vllm_config, *args, **kwargs)
 
             try:
@@ -296,6 +405,25 @@ class C_VLLMEngineCoreHook(BaseHook):
                     model, hw, sched_config
                 )
                 logger.info("AIConfigurator predictor initialized for vLLM.")
+
+                if sched_config.pp_size > 1:
+                    from sglang_simulator.simulation.vllm.pp_pipeline import (
+                        SimulatedPipelineStepper,
+                    )
+
+                    raw_scheduler = ConfigManager._get_raw_config().get("scheduler", {})
+                    occupancy_mode = raw_scheduler.get("pp_occupancy_mode", "span_share")
+                    self._sim_pipeline_stepper = SimulatedPipelineStepper(
+                        self, sched_config.pp_size, occupancy_mode
+                    )
+                    # vLLM 0.29 uses step_fn for both serial and batch-queue paths.
+                    self.step_fn = self._sim_pipeline_stepper.step
+                    logger.info(
+                        "[PP Hijack] logical pipeline enabled: stages=%d, pcp=%d, occupancy=%s",
+                        sched_config.pp_size,
+                        sched_config.pcp_size,
+                        occupancy_mode,
+                    )
             except Exception as e:
                 logger.error("Failed to initialize inference time predictor: %s", e)
                 raise
@@ -387,7 +515,7 @@ class C_VLLMEngineCoreHook(BaseHook):
         # the native API. The hook framework applies only the first hook
         # matching a class, so the profile patch is merged here instead of
         # living in its own hook class on EngineCore.
-        def wrapped_profile(self, is_start: bool = True):
+        def wrapped_profile(self, is_start: bool = True, profile_prefix=None, *args, **kwargs):
             req_stats = request_stats_manager.get_all_req_stats()
             output_dir = Envs.output_dir()
             with open(os.path.join(output_dir, "request.jsonl"), "w") as f:
@@ -406,11 +534,15 @@ class C_VLLMEngineCoreHook(BaseHook):
 
             request_stats_manager.reset()
             cls.ITERATION_STATS.clear()
-            # Global clock / iteration / future-queue state also reset at
-            # round boundaries.  This hook runs in the engine-core process,
-            # the only place the reset is reachable under mp (AsyncLLM).
-            StateManager.reset()
-            ReqDispatcher().reset()
+            # Reset the timeline only when no PP work is in flight. Clearing
+            # finish_at/global_clock while requests are active would strand
+            # them forever after a profile start/stop call.
+            stepper = getattr(self, "_sim_pipeline_stepper", None)
+            if stepper is None or not stepper.in_flight:
+                StateManager.reset()
+                ReqDispatcher().reset()
+                if stepper is not None:
+                    stepper.reset()
 
         target.profile = wrapped_profile
 
@@ -425,7 +557,12 @@ def _connector_has_pending(scheduler) -> bool:
     connector = get_conn() if get_conn is not None else None
     if connector is None:
         return False
-    return bool(connector.has_requests() or getattr(connector, "pending_requests", None))
+    has_pending_push = getattr(connector, "has_pending_push_work", None)
+    return bool(
+        connector.has_requests()
+        or getattr(connector, "pending_requests", None)
+        or (has_pending_push() if has_pending_push is not None else False)
+    )
 
 
 class C_VLLMExecutorHook(BaseHook):
@@ -510,7 +647,18 @@ class C_VLLMExecutorHook(BaseHook):
                     cached = max(
                         getattr(new_req_data, "num_computed_tokens", 0) or 0, 0
                     )
-                    ext = _ext_computed_tokens(req_id)
+                    ext = _ext_computed_tokens(
+                        req_id,
+                        scheduler_output=scheduler_output,
+                        total_hit=cached,
+                        block_size=getattr(
+                            getattr(self, "vllm_config", None),
+                            "cache_config",
+                            None,
+                        ).block_size
+                        if getattr(self, "vllm_config", None) is not None
+                        else 384,
+                    )
                     st.final_device_hit_len = cached
                     st.ext_kv_hit_len = ext
                     st.local_kv_hit_len = cached - ext
@@ -530,7 +678,7 @@ class C_VLLMExecutorHook(BaseHook):
                 # from the first sighting; dropped on finish below.
                 req_info[req_id] = (
                     len(prompt_ids) if prompt_ids is not None else None,
-                    bool(getattr(sp, "logprobs", None)),
+                    getattr(sp, "logprobs", 0) or 0,
                 )
             for fin_id in (getattr(scheduler_output, "finished_req_ids", None)
                            or ()):
@@ -551,26 +699,42 @@ class C_VLLMExecutorHook(BaseHook):
             # prompt).  Annotated onto scheduler_output so the sim worker can
             # build its mock ModelRunnerOutput without an executor reference —
             # the SchedulerOutput already travels executor -> worker natively.
-            simulation_batch = ScheduleBatch(reqs=[])
+            pp_context = getattr(scheduler_output, "_sim_pp_context", {})
+            simulation_batch = ScheduleBatch(
+                reqs=[],
+                pos_in_burst=pp_context.get("pos_in_burst", 0),
+                in_flight=pp_context.get("in_flight", 0),
+                num_waiting=pp_context.get("num_waiting", 0),
+                num_running=pp_context.get("num_running", 0),
+                num_skipped=pp_context.get("num_skipped", 0),
+            )
             token_emitted: dict[str, bool] = {}
             logprobs_tokens = 0
+            logprobs_req_count = 0
+            logprobs_n = 0
             for req_id, num_tokens in num_scheduled_tokens.items():
                 if req_id not in num_computed:
                     continue
                 past_kv_length = num_computed[req_id]
-                prompt_tokens, has_logprobs = req_info.get(req_id, (None, False))
+                prompt_tokens, req_logprobs_n = req_info.get(req_id, (None, 0))
                 token_emitted[req_id] = (
                     prompt_tokens is None
                     or past_kv_length + num_tokens >= prompt_tokens
                 )
-                if has_logprobs:
+                if req_logprobs_n:
+                    logprobs_req_count += 1
                     logprobs_tokens += num_tokens
+                    logprobs_n = max(logprobs_n, req_logprobs_n)
                 simulation_batch.reqs.append(
                     ScheduleRequest(
                         extend_length=num_tokens,
                         past_kv_length=max(0, past_kv_length),
                     )
                 )
+            simulation_batch.logprobs_req_count = logprobs_req_count
+            simulation_batch.logprobs_tokens = logprobs_tokens
+            simulation_batch.logprobs_n = logprobs_n
+            scheduler_output._sim_batch = simulation_batch
             scheduler_output._sim_token_emitted = token_emitted
 
             if simulation_batch.is_empty():
@@ -597,8 +761,9 @@ class C_VLLMExecutorHook(BaseHook):
             # proportional to this step's scheduled tokens of logprobs
             # requests. Sim has no real GPU, so it must be added
             # explicitly. Only active with logprobs_cost_us_per_token > 0.
+            full_span = bool(getattr(predictor, "full_span", False))
             lp_cost = getattr(predictor, "logprobs_cost_s_per_token", 0.0)
-            logprobs_latency = lp_cost * logprobs_tokens
+            logprobs_latency = 0.0 if full_span else lp_cost * logprobs_tokens
 
             # sample_tokens (RPC-2) compensation, kept as a SEPARATE term
             # from predicted_latency: the predictor's label covers only
@@ -614,7 +779,7 @@ class C_VLLMExecutorHook(BaseHook):
             # matching the GPU-side calibration features exactly.
             total_tokens = sum(num_scheduled_tokens.values())
             sample_tokens_latency = 0.0
-            if predictor is not None and hasattr(
+            if not full_span and predictor is not None and hasattr(
                 predictor, "predict_sample_tokens_time"
             ):
                 sample_tokens_latency = float(
@@ -646,6 +811,19 @@ class C_VLLMExecutorHook(BaseHook):
                 "l2_load_latency": 0.0,
                 "l2_backup_latency": 0.0,
             }
+            if pp_context:
+                scheduler_output._sim_iteration_stat.update({
+                    "pos_in_burst": simulation_batch.pos_in_burst,
+                    "in_flight": simulation_batch.in_flight,
+                    "num_waiting": simulation_batch.num_waiting,
+                    "num_running": simulation_batch.num_running,
+                    "num_skipped": simulation_batch.num_skipped,
+                })
+                # The logical PP stepper owns sleep/virtual-clock advancement
+                # and completion. Return the mock output immediately here.
+                scheduler_output._sim_full_step_latency = simulated_gpu_span
+                return original_execute_model(
+                    self, scheduler_output, *args, **kwargs)
 
             if not is_blocking:
                 # OFFLINE: the virtual clock accumulates the full GPU span.

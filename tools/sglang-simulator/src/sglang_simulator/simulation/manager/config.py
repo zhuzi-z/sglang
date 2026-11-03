@@ -103,6 +103,8 @@ class ConfigManager:
             "tp_size",
             "dp_size",
             "ep_size",
+            "pp_size",
+            "pcp_size",
             "backend_name",
             "backend_version",
         ]:
@@ -193,6 +195,7 @@ class ConfigManager:
                 config=sched_config,
                 database_path=predictor_config.get("database_path"),
                 latency_scale=predictor_config.get("latency_scale", 1.0),
+                full_span=predictor_config.get("full_span", False),
                 logprobs_cost_us_per_token=predictor_config.get(
                     "logprobs_cost_us_per_token", 0.0
                 ),
@@ -216,6 +219,16 @@ class ConfigManager:
                 ),
                 sample_tokens_b_ms_per_1g_ext_past=predictor_config.get(
                     "sample_tokens_b_ms_per_1g_ext_past", 0.0
+                ),
+                # Form C (two-branch plateau, F-B): pass plateau/threshold
+                # to select it; base/a/b above then describe the line only.
+                # Mutually exclusive with the hinge keys, NOT with a/b --
+                # plateau_ms != 0 is what selects this form.
+                sample_tokens_plateau_ms=predictor_config.get(
+                    "sample_tokens_plateau_ms", 0.0
+                ),
+                sample_tokens_threshold_tokens=predictor_config.get(
+                    "sample_tokens_threshold_tokens", 0
                 ),
             )
         else:

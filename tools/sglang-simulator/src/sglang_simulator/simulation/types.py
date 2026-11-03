@@ -22,6 +22,9 @@ class SchedulerConfig:
     # framework backend
     backend_name: str = "sglang"
     backend_version: Optional[str] = None
+    # Logical topology used by the predictor. Physical execution may still
+    # be collapsed to one CPU worker.
+    pcp_size: int = 1
 
     @property
     def attn_tp_size(self) -> int:

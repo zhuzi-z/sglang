@@ -91,7 +91,7 @@ def get_refined_cache_size_per_token(
 
     pool_name = host_pool.__class__.__name__
     if hasattr(host_pool, "pool_name"):
-        pool_name += f"[{getattr(host_pool, "pool_name")}]"
+        pool_name += f"[{getattr(host_pool, 'pool_name')}]"
     inter_dtype = host_pool.dtype
     inter_size_per_token = host_pool.get_size_per_token()
 

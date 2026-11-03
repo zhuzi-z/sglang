@@ -73,6 +73,7 @@ def resolve_scheduler_config(vllm_config: "VllmConfig") -> SchedulerConfig:
         tp_size=parallel_config.tensor_parallel_size,
         pp_size=parallel_config.pipeline_parallel_size,
         dp_size=getattr(parallel_config, "data_parallel_size", 1),
+        pcp_size=getattr(parallel_config, "prefill_context_parallel_size", 1),
         backend_name="vllm",
         backend_version=vllm.__version__,
     )

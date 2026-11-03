@@ -11,6 +11,35 @@ import os
 import torch
 
 
+def _sanitize_tpu_environment_for_cpu():
+    """Keep TPU plugins/connectors optional without activating TpuPlatform."""
+    os.environ["VLLM_TARGET_DEVICE"] = "cuda"
+    plugins = []
+    for plugin in os.environ.get("VLLM_PLUGINS", "").split(","):
+        plugin = plugin.strip()
+        if plugin and plugin not in ("torchtpu", "torchtpu_layers"):
+            plugins.append(plugin)
+    if plugins:
+        os.environ["VLLM_PLUGINS"] = ",".join(plugins)
+    else:
+        os.environ.pop("VLLM_PLUGINS", None)
+
+    # Prevent real TPU discovery and multi-node PP construction. TPU connector
+    # names may remain in engine config and are handled by simulation hooks.
+    os.environ.pop("PJRT_DEVICE", None)
+    os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
+    os.environ["TPU_VISIBLE_CHIPS"] = ""
+    os.environ["VLLM_NNODES"] = "1"
+    os.environ["RANK_SIZE"] = "1"
+    # With an explicit block override this bypasses only vLLM's simulated
+    # max_model_len capacity assertion; it does not enable real swapping.
+    os.environ.setdefault("VLLM_USE_SWAP_ENGINE", "1")
+    # CPU lifecycle completions are produced by TPU connector hooks, not by
+    # real worker registration/CREATE RPCs.
+    os.environ["VLLM_V6D_ASYNC_REGISTER"] = "0"
+    os.environ["VLLM_V6D_ASYNC_CREATE"] = "0"
+
+
 def _patch_triton_for_cpu():
     """Ensure triton.language.extra.cuda exists for CPU-only environments.
 
@@ -95,6 +124,8 @@ def init_hook():
     global _HOOKS_INSTALLED
     if _HOOKS_INSTALLED:
         return True
+
+    _sanitize_tpu_environment_for_cpu()
 
     # CPU-only v6d IPC: the SRPC engine natively supports
     # SRPC_STREAM_DISABLE_RDMA=1 (TCP-only mode, skipping libcuda/barex/

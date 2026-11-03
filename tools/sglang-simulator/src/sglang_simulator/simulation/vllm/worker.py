@@ -12,7 +12,9 @@ V6D-aware simulation strategy (merged from feat/vllm-pai + V6D additions):
 """
 
 import asyncio
+import copy
 import dataclasses
+import os
 import threading
 import time
 
@@ -28,6 +30,71 @@ from sglang_simulator.simulation.vllm.utils import (
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
+
+
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
+
+
+def _patch_qwen_mtp_prefill_cache_semantics():
+    """Backport Qwen prefill-only MTP cache groups and tail boundaries."""
+    if not _env_enabled("TPU_MTP_PREFILL_ONLY"):
+        return
+    from vllm.v1.core import kv_cache_utils
+
+    original_groups = kv_cache_utils.get_kv_cache_groups
+    if not getattr(original_groups, "_sim_qwen_mtp_groups", False):
+        def get_groups(vllm_config, kv_cache_spec):
+            groups = original_groups(vllm_config, kv_cache_spec)
+            for group in groups:
+                group.is_eagle_group = any(
+                    name.startswith("mtp.") for name in group.layer_names
+                )
+            return groups
+
+        get_groups._sim_qwen_mtp_groups = True
+        kv_cache_utils.get_kv_cache_groups = get_groups
+
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        MambaManager,
+    )
+
+    def wrap_tail(original_tail):
+        if getattr(original_tail, "_sim_qwen_mtp_tail", False):
+            return original_tail
+
+        def cache_tail(self, request, num_tokens):
+            extra = None
+            unit = self.block_pool.hash_block_size
+            drop_units = int(not _env_enabled("VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP"))
+            boundary = max(
+                0,
+                ((request.num_prompt_tokens - 1) // unit - drop_units) * unit,
+            )
+            if boundary > 0 and (
+                drop_units or request.num_prompt_tokens % unit == 0
+            ):
+                view = copy.copy(request)
+                view.num_prompt_tokens = boundary
+                extra = original_tail(self, view, num_tokens)
+            result = original_tail(self, request, num_tokens)
+            if (
+                isinstance(self, FullAttentionManager)
+                and request.num_prompt_tokens % unit == 0
+            ):
+                view = copy.copy(request)
+                view.num_prompt_tokens = request.num_prompt_tokens - unit
+                original_tail(self, view, num_tokens)
+            return result if result is not None else extra
+
+        cache_tail._sim_qwen_mtp_tail = True
+        return cache_tail
+
+    for manager in (FullAttentionManager, MambaManager):
+        original_tail = getattr(manager, "_cache_partial_tail_block", None)
+        if original_tail is not None:
+            manager._cache_partial_tail_block = wrap_tail(original_tail)
 
 
 class _ModelRunnerStub:
@@ -378,7 +445,17 @@ class C_VLLMWorkerHook(BaseHook):
             logger.info("[vLLM Hijack] Worker.load_model: skipped")
 
         def override_determine_available_memory(self):
-            """Return fake GPU memory to satisfy block calculation."""
+            """Return real configured KV bytes, or fake memory as fallback."""
+            # TPU deployments often bound KV explicitly. Do not replace that
+            # contract with an 80-GiB virtual-GPU estimate.
+            configured = getattr(self.cache_config, "kv_cache_memory_bytes", None)
+            if configured:
+                logger.info(
+                    "[vLLM Hijack] Worker.determine_available_memory: "
+                    "using configured kv_cache_memory_bytes=%d",
+                    int(configured),
+                )
+                return int(configured)
             try:
                 model = resolve_model_info(self.vllm_config.model_config)
                 ConfigManager.set_model_info(model)
@@ -700,6 +777,8 @@ class C_VLLMWorkerHook(BaseHook):
         def override_initialize_kv_transfer(self):
             """No-op in simulation."""
             pass
+
+        _patch_qwen_mtp_prefill_cache_semantics()
 
         target.init_device = override_init_device
         target.load_model = override_load_model

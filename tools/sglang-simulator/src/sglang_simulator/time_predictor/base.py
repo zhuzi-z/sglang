@@ -18,6 +18,16 @@ class ScheduleRequest:
 @dataclass
 class ScheduleBatch:
     reqs: list[ScheduleRequest] = field(default_factory=list)
+    # Optional scheduler/PP state. Legacy models do not read these fields;
+    # PP models populate them from the logical pipeline at dispatch time.
+    pos_in_burst: int = 0
+    in_flight: int = 0
+    num_waiting: int = 0
+    num_running: int = 0
+    num_skipped: int = 0
+    logprobs_req_count: int = 0
+    logprobs_tokens: int = 0
+    logprobs_n: int = 0
 
     def __repr__(self) -> str:
         return f"batch_size={len(self.reqs)},reqs={[(req.extend_length, req.past_kv_length) for req in self.reqs]}"

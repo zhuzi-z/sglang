@@ -7,6 +7,8 @@ The actual parallelism is captured in the simulator's scheduler config
 (from SGLANG_SIMULATOR_CONFIG_PATH) and used by the time predictor.
 """
 
+import os
+
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils import get_logger
 
@@ -32,14 +34,44 @@ class C_VLLMEngineArgsHook(BaseHook):
                 "expert_parallel_size",
                 "prefill_context_parallel_size",
                 "decode_context_parallel_size",
+                # Multi-node PP is represented logically by the simulator;
+                # never spawn real headless followers on CPU.
+                "nnodes",
             ]
             for attr in parallel_attrs:
                 if hasattr(self, attr):
                     setattr(self, attr, 1)
 
+            if hasattr(self, "node_rank"):
+                self.node_rank = 0
+
             # Disable expert parallelism flag
             if hasattr(self, "enable_expert_parallel"):
                 self.enable_expert_parallel = False
+            if hasattr(self, "enable_ep_weight_filter"):
+                self.enable_ep_weight_filter = False
+
+            # Do not instantiate the TPU compiler/attention backend while the
+            # logical PP/PCP configuration is preserved for the predictor.
+            if "CUSTOM" in str(getattr(self, "attention_backend", "")).upper():
+                self.attention_backend = None
+            compilation = getattr(self, "compilation_config", None)
+            if isinstance(compilation, dict) and "vllm_torchtpu" in str(
+                compilation.get("backend", "")
+            ):
+                self.compilation_config = {"cudagraph_mode": "NONE"}
+
+            speculative = getattr(self, "speculative_config", None)
+            method = (
+                speculative.get("method")
+                if isinstance(speculative, dict)
+                else getattr(speculative, "method", None)
+            )
+            if (
+                getattr(self, "disaggregation_mode", None) == "prefill"
+                and method == "mtp"
+            ):
+                os.environ["TPU_MTP_PREFILL_ONLY"] = "1"
 
             # Keep the only worker in this process.  A spawned ``mp`` worker
             # starts a fresh interpreter before the simulator hooks are
