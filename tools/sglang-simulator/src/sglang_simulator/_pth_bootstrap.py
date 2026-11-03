@@ -2,7 +2,13 @@
 import os
 from sglang_simulator.hook import install_class_hooks, install_module_hooks
 
-if os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "on"):
+_enabled = os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "on")
+_mode = os.environ.get("SIM_COLLECTOR_MODE", "legacy")
+
+if _enabled and _mode == "pp_v2":
+    from sglang_simulator.collector.vllm_hook.trace_v2_hooks import HOOKS
+    install_class_hooks(HOOKS)
+elif _enabled and _mode == "legacy":
     from sglang_simulator.collector.vllm_hook.worker_hook import (
         C_VLLMEngineArgsHook,
         C_WorkerHook,
