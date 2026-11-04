@@ -27,7 +27,8 @@ class Scope:
 
 
 class Recorder:
-    def __init__(self, root, capacity=8192, interval=.25, max_bytes=268435456):
+    def __init__(self, root, capacity=8192, interval=.25, max_bytes=268435456,
+                 namespace='trace_v2'):
         if capacity < 1 or interval <= 0 or max_bytes < 1:
             raise ValueError('positive trace limits required')
         self.capacity, self.interval, self.max_bytes = capacity, interval, max_bytes
@@ -36,7 +37,7 @@ class Recorder:
         self.process_id = uuid.uuid4().hex
         self.collection_id = os.getenv('SIM_TRACE_COLLECTION_ID', '')[:128]
         self.build_id = os.getenv('SIM_TRACE_BUILD_ID', '')[:128]
-        self.directory = Path(root) / 'trace_v2' / socket.gethostname() / f'{self.pid}-{self.process_id}'
+        self.directory = Path(root) / namespace / socket.gethostname() / f'{self.pid}-{self.process_id}'
         self._events = deque()
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -133,7 +134,11 @@ def initialize():
     with _INIT_LOCK:
         if _RECORDER is None:
             try:
-                _RECORDER = Recorder(
+                recorder_type = Recorder
+                if os.getenv('SIM_COLLECTOR_MODE') == 'pp_v3':
+                    from .trace_collection import CollectionRecorder
+                    recorder_type = CollectionRecorder
+                _RECORDER = recorder_type(
                     os.getenv('SIM_COLLECTOR_OUTPUT_DIR', os.getcwd()),
                     capacity=int(os.getenv('SIM_TRACE_CAPACITY', '8192')),
                     interval=float(os.getenv('SIM_TRACE_FLUSH_SECONDS', '.25')),
