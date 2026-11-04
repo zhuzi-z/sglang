@@ -468,7 +468,7 @@ def test_cpu_startup_sanitizes_tpu_platform_but_keeps_connector_plugin():
         os.environ["VLLM_NNODES"] = "4"
         os.environ["RANK_SIZE"] = "4"
         _sanitize_tpu_environment_for_cpu()
-        assert os.environ["VLLM_TARGET_DEVICE"] == "cuda"
+        assert "VLLM_TARGET_DEVICE" not in os.environ
         assert os.environ["VLLM_PLUGINS"] == "kvs_connector"
         assert "PJRT_DEVICE" not in os.environ
         assert "VLLM_PP_LAYER_PARTITION" not in os.environ

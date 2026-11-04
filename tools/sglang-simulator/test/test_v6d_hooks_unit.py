@@ -334,34 +334,146 @@ class TestV6dObjectBackendHook:
 # ============================================================
 
 class TestPlatformHookAdditions:
-    """Test the new platform mock methods."""
+    """验证 Platform 的调用签名、可导入返回值和真实 layout 消费链路。"""
 
-    def test_set_device_is_noop(self):
-        """set_device should not raise or do anything."""
-        # We test the _MockCudaPlatform via the hook mechanism
-        import sglang_simulator.hook as sgl_hook
+    @pytest.fixture
+    def cpu_platform(self, monkeypatch):
+        import vllm.platforms
+        from vllm.platforms.interface import Platform
         from sglang_simulator.simulation.vllm.platform import C_VLLMPlatformHook
 
-        # Simulate: create a base class, apply hook
-        class FakePlatform:
-            pass
+        # Hook 会替换全局变量，测试结束时恢复，避免依赖执行顺序。
+        monkeypatch.setattr(
+            vllm.platforms, "current_platform", vllm.platforms.current_platform
+        )
+        C_VLLMPlatformHook.hook(Platform)
+        return vllm.platforms.current_platform
 
-        C_VLLMPlatformHook.hook(FakePlatform)
+    def test_set_device_is_noop(self, cpu_platform):
+        cpu_platform.set_device(torch.device("cpu"))
+        cpu_platform.set_device(torch.device("cuda:0"))
 
-        # After hook, sys.modules should have the mock
-        import vllm.platforms
-        platform = vllm.platforms.current_platform
+    def test_get_device_total_memory(self, cpu_platform):
+        assert cpu_platform.get_device_total_memory() == 80 * (1 << 30)
 
-        # set_device should be a no-op
-        platform.set_device(torch.device("cpu"))
-        platform.set_device(torch.device("cuda:0"))
+    @pytest.mark.parametrize("use_mla", [False, True])
+    @pytest.mark.parametrize("style", [
+        "legacy_positional", "legacy_keyword",
+        "selector_positional", "selector_keyword",
+    ])
+    def test_attention_backend_signature_and_import(self, cpu_platform, style, use_mla):
+        from importlib import import_module
 
-    def test_get_device_total_memory(self):
-        """Should return 80 GiB."""
-        import vllm.platforms
-        platform = vllm.platforms.current_platform
-        mem = platform.get_device_total_memory()
-        assert mem == 80 * (1 << 30)
+        selector = SimpleNamespace(use_mla=use_mla)
+        if style == "legacy_positional":
+            path = cpu_platform.get_attn_backend_cls(
+                None, 128, torch.bfloat16, "fp8", 384, True, use_mla
+            )
+        elif style == "legacy_keyword":
+            path = cpu_platform.get_attn_backend_cls(
+                selected_backend=None, head_size=128, dtype=torch.bfloat16,
+                kv_cache_dtype="fp8", block_size=384, use_v1=True, use_mla=use_mla,
+            )
+        elif style == "selector_positional":
+            path = cpu_platform.get_attn_backend_cls(None, selector, 16)
+        else:
+            path = cpu_platform.get_attn_backend_cls(
+                None, attn_selector_config=selector, num_heads=16
+            )
+
+        assert isinstance(path, str) and path
+        module_name, class_name = path.rsplit(".", 1)
+        backend = getattr(import_module(module_name), class_name)
+        assert not backend.__abstractmethods__
+        assert backend.full_cls_name() == (module_name, class_name)
+        assert backend.is_mla() is use_mla
+        assert backend.is_ssm() is False
+        assert backend.supported_kv_cache_layouts() is None
+        expected_shape = (2, 8, 384, 4, 128) if not use_mla else (8, 384, 128)
+        assert backend.get_kv_cache_shape(8, 384, 4, 128) == expected_shape
+        # 元数据 backend 不能被当成真实计算实现静默使用。
+        with pytest.raises(NotImplementedError, match="no attention kernel"):
+            backend.get_impl_cls()
+        with pytest.raises(NotImplementedError, match="no attention metadata builder"):
+            backend.get_builder_cls()
+
+    def test_attention_backend_path_is_lazy(self, cpu_platform, monkeypatch):
+        import builtins
+
+        original_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name.startswith(("vllm", "flashinfer", "flash_attn")) or "attention_backend" in name:
+                raise AssertionError(f"不应在 Platform 选择阶段导入 {name}")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        path = cpu_platform.get_attn_backend_cls(
+            None, attn_selector_config=SimpleNamespace(use_mla=False), num_heads=16
+        )
+        assert path.endswith(".SimulatedAttentionBackend")
+
+    @pytest.mark.parametrize("use_mla", [False, True])
+    def test_native_v029_worker_layout_contract(self, cpu_platform, monkeypatch, use_mla):
+        """直接走原生 WorkerBase → selector → backend → layout resolver。"""
+        from vllm.v1.worker.worker_base import WorkerBase
+
+        if not hasattr(WorkerBase, "get_supported_kv_cache_layouts"):
+            pytest.skip("此项针对 vLLM 0.29 的 layout 协商接口")
+        from vllm.v1.attention.selector import (
+            AttentionSelectorConfig, _cached_get_attn_backend,
+        )
+        from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+        # 仅提供配置数据，不替换被测 WorkerBase、selector 或 resolver。
+        config = SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context={}),
+            model_config=SimpleNamespace(
+                get_head_size=lambda: 128, dtype=torch.bfloat16, use_mla=use_mla,
+            ),
+            cache_config=SimpleNamespace(
+                user_specified_block_size=True, block_size=384,
+                cache_dtype="fp8", kv_cache_layout=None,
+            ),
+            attention_config=SimpleNamespace(
+                backend=None, backend_per_kind={}, use_non_causal=False,
+            ),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1, decode_context_parallel_size=1,
+            ),
+            kv_transfer_config=None,
+            speculative_config=None,
+        )
+        worker = object.__new__(WorkerBase)
+        worker.vllm_config = config
+
+        def no_cuda(*args, **kwargs):
+            raise AssertionError("layout 协商不应访问 CUDA")
+
+        monkeypatch.setattr(torch.cuda, "_lazy_init", no_cuda)
+        monkeypatch.setattr(torch.cuda, "get_device_properties", no_cuda)
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        _cached_get_attn_backend.cache_clear()
+        try:
+            selector = AttentionSelectorConfig(128, torch.bfloat16, "fp8", 384, use_mla=use_mla)
+            backend = _cached_get_attn_backend(
+                None, attn_selector_config=selector, num_heads=16
+            )
+            assert backend.is_mla() is use_mla
+            layouts = worker.get_supported_kv_cache_layouts()
+            assert layouts and "LBHNC" in layouts
+            layout = resolve_kv_cache_layout(config, [layouts], [])
+            assert layout.name == "LBHNC"
+            worker.set_kv_cache_layout(layout.name)
+            assert config.cache_config.kv_cache_layout == layout.name
+
+            # 不得为了绕过启动错误屏蔽原生布局校验。
+            config.cache_config.kv_cache_layout = None
+            monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "INVALID_HISIM_LAYOUT")
+            with pytest.raises(ValueError):
+                resolve_kv_cache_layout(config, [layouts], [])
+        finally:
+            _cached_get_attn_backend.cache_clear()
 
 
 # ============================================================

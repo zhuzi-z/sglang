@@ -102,10 +102,27 @@ class C_VLLMPlatformHook(BaseHook):
 
             @classmethod
             def get_attn_backend_cls(
-                cls, selected_backend, head_size, dtype,
-                kv_cache_dtype, block_size, use_v1, use_mla=False,
+                cls, selected_backend, *args, attn_selector_config=None, **kwargs,
             ):
-                return None
+                # 新接口传 AttentionSelectorConfig，旧接口传多个标量。
+                # 只读取 MLA 身份，其余内核选择参数不影响仿真元数据。
+                if attn_selector_config is None and args and hasattr(args[0], "use_mla"):
+                    attn_selector_config = args[0]
+                if attn_selector_config is not None:
+                    use_mla = attn_selector_config.use_mla
+                else:
+                    # 旧位置参数顺序：head_size/dtype/kv_cache_dtype/
+                    # block_size/use_v1/use_mla。
+                    use_mla = kwargs.get("use_mla", args[5] if len(args) > 5 else False)
+                backend_name = (
+                    "SimulatedMLAAttentionBackend" if use_mla
+                    else "SimulatedAttentionBackend"
+                )
+                # 此处只返回路径；延迟导入避免打断 Platform 类装配。
+                return (
+                    "sglang_simulator.simulation.vllm.attention_backend."
+                    + backend_name
+                )
 
             @classmethod
             def verify_quantization(cls, quant: str) -> None:

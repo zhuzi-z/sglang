@@ -13,7 +13,9 @@ import torch
 
 def _sanitize_tpu_environment_for_cpu():
     """Keep TPU plugins/connectors optional without activating TpuPlatform."""
-    os.environ["VLLM_TARGET_DEVICE"] = "cuda"
+    # Do not force a device backend. The mock Platform hook installs the
+    # simulated platform before vLLM performs real device detection.
+    os.environ.pop("VLLM_TARGET_DEVICE", None)
     plugins = []
     for plugin in os.environ.get("VLLM_PLUGINS", "").split(","):
         plugin = plugin.strip()
