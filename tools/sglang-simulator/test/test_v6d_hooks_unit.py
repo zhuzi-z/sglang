@@ -264,6 +264,243 @@ class TestBuildKVCacheSpec:
         assert "model.layers.1" in spec
 
 
+class TestTPUPooledKVGeometry:
+    """以混合 spec 实际消费链覆盖页不足，不再传空 specs 绕过校验。"""
+
+    @pytest.fixture
+    def tpu_case(self, monkeypatch):
+        from vllm.model_executor.models import ModelRegistry
+        from sglang_simulator.simulation.manager import ConfigManager
+
+        # 合成 Qwen GDN fixture：PCP8 后的单页大小与参考日志一致；
+        # 这些数值只属于回归输入，不作为实现中的模型常量。
+        hf = SimpleNamespace(
+            num_hidden_layers=4, num_key_value_heads=4, num_attention_heads=32,
+            head_dim=256, hidden_size=8192, linear_num_key_heads=16,
+            linear_num_value_heads=128, linear_key_head_dim=128,
+            linear_value_head_dim=128, mtp_num_hidden_layers=0,
+            layer_types=["linear_attention"] * 3 + ["full_attention"],
+        )
+        model = SimpleNamespace(
+            architecture="Qwen3NextForCausalLM", hf_text_config=hf,
+            dtype=torch.bfloat16, get_total_num_kv_heads=lambda: hf.num_key_value_heads,
+            get_head_size=lambda: hf.head_dim,
+        )
+        cache = SimpleNamespace(
+            block_size=384, mamba_block_size=384, mamba_cache_mode="align",
+            mamba_ssm_cache_dtype="bfloat16", cache_dtype="fp8", attn_pack_size=1,
+            kv_cache_memory_bytes=22548578304, num_gpu_blocks_override=None,
+            kv_cache_layout=None, user_specified_block_size=True,
+            prefix_cache_retention_interval=0,
+        )
+        config = SimpleNamespace(
+            model_config=model, cache_config=cache,
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1, pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+            ),
+            speculative_config=SimpleNamespace(
+                method="mtp", num_speculative_tokens=1, use_eagle=lambda: False,
+            ),
+        )
+        raw = {
+            "platform": {"accelerator": {"name": "tpu7x-32"}},
+            "scheduler": {"tp_size": 1, "pcp_size": 8, "pp_size": 4,
+                          "physical_block_size": 384},
+        }
+
+        class Model:
+            @staticmethod
+            def get_mamba_state_shape_from_config(cfg):
+                taps = 3 + cfg.speculative_config.num_speculative_tokens
+                width = (2 * hf.linear_num_key_heads * hf.linear_key_head_dim
+                         + hf.linear_num_value_heads * hf.linear_value_head_dim)
+                return ((taps, width), (hf.linear_num_value_heads, 128, 128))
+
+            @staticmethod
+            def get_mamba_state_dtype_from_config(cfg):
+                return (torch.float32, getattr(torch, cfg.cache_config.mamba_ssm_cache_dtype))
+
+        monkeypatch.setattr(ModelRegistry, "resolve_model_cls", lambda *a, **kw: (Model, None))
+        monkeypatch.setattr(ConfigManager, "_get_raw_config", lambda: raw)
+        monkeypatch.setattr(ConfigManager, "get_scheduler_config", lambda: None)
+        monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+        return config, raw, Model
+
+    def test_pcp_local_page_fits_native_mamba_invariant(self, tpu_case):
+        from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
+        from sglang_simulator.simulation.vllm.tpu_kv_geometry import derive_tpu_pooled_page
+
+        config, raw, model = tpu_case
+        shapes = model.get_mamba_state_shape_from_config(config)
+        dtypes = model.get_mamba_state_dtype_from_config(config)
+        page = derive_tpu_pooled_page(config, raw, shapes, dtypes)
+        assert page.full_state_bytes > 786432
+        assert page.shapes == ((4, 1, 2560), (16, 128, 128))
+        assert page.dtypes == (torch.bfloat16, torch.bfloat16)
+        assert page.raw_state_bytes == 544768
+        assert page.required_state_bytes == 557056
+        assert page.slot_bytes == 786432
+        specs = _build_kv_cache_spec(config)
+        assert len(specs) == 4
+        mamba, attention = specs["model.layers.0"], specs["model.layers.3"]
+        assert mamba.shapes == page.shapes
+        assert mamba.dtypes == page.dtypes
+        assert mamba.page_size_bytes == attention.page_size_bytes == page.slot_bytes
+        assert config.cache_config.mamba_page_size_padded == page.slot_bytes
+        assert attention.num_head_slots == 1
+        assert attention.state_content_bytes == page.token_bytes
+        # 不改变 384 粒度、真实执行拓扑或为绕过断言扩大总内存预算。
+        assert config.cache_config.block_size == config.cache_config.mamba_block_size == 384
+        assert config.cache_config.kv_cache_memory_bytes == 22548578304
+        assert config.cache_config.num_gpu_blocks_override is None
+        assert config.parallel_config.prefill_context_parallel_size == 1
+        assert config.parallel_config.tensor_parallel_size == 1
+
+    def test_mixed_specs_reach_native_layout_and_budget_validation(self, tpu_case, monkeypatch):
+        from vllm.v1.attention.backends.utils import (
+            get_supported_kv_cache_layouts, resolve_kv_cache_layout,
+        )
+        from vllm.v1.core.kv_cache_utils import (
+            get_kv_cache_groups, get_kv_cache_config_from_groups,
+        )
+        from sglang_simulator.simulation.vllm.attention_backend import SimulatedAttentionBackend
+        from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
+
+        config, _, _ = tpu_case
+        specs = _build_kv_cache_spec(config)
+        names = [layout.name for layout in get_supported_kv_cache_layouts([SimulatedAttentionBackend])]
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        layout = resolve_kv_cache_layout(config, [names], specs.values())
+        assert layout.name == "LBHNC"
+        assert config.cache_config.kv_cache_layout == layout.name
+        # 不用空 specs：新版本 HMA 分组也必须能读取每种页的实际大小。
+        config.cache_config.get_resolved_kv_cache_layout = lambda: layout
+        config.scheduler_config = SimpleNamespace(disable_hybrid_kv_cache_manager=False)
+        groups = get_kv_cache_groups(config, specs)
+        assert groups
+        assert all(group.kv_cache_spec.page_size_bytes == 786432 for group in groups)
+        budget = config.cache_config.kv_cache_memory_bytes
+        allocated = get_kv_cache_config_from_groups(config, groups, budget)
+        smaller = get_kv_cache_config_from_groups(config, groups, budget // 2)
+        assert 0 < smaller.num_blocks <= allocated.num_blocks
+        # 各组别名共享同一 backing allocation，不能按 tensor 个数重复累加。
+        assert all(tensor.size <= budget for tensor in allocated.kv_cache_tensors)
+        assert config.cache_config.kv_cache_memory_bytes == budget
+        assert config.cache_config.num_gpu_blocks_override is None
+        config.cache_config.kv_cache_layout = None
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "INVALID_HISIM_LAYOUT")
+        with pytest.raises(ValueError):
+            resolve_kv_cache_layout(config, [names], specs.values())
+
+    def test_qk_replication_is_not_total_bytes_divided_by_pcp(self, tpu_case):
+        from sglang_simulator.simulation.vllm.tpu_kv_geometry import derive_tpu_pooled_page
+
+        config, raw, model = tpu_case
+        hf = config.model_config.hf_text_config
+        hf.linear_num_key_heads, hf.linear_num_value_heads = 4, 32
+        shapes = model.get_mamba_state_shape_from_config(config)
+        page = derive_tpu_pooled_page(config, raw, shapes, (torch.bfloat16, torch.bfloat16))
+        # PCP8 下 Q/K 保留一个完整 head，V 切为4个。
+        assert page.shapes == ((4, 1, 768), (4, 128, 128))
+        assert page.raw_state_bytes == 137216
+        assert page.raw_state_bytes != page.full_state_bytes // 8
+
+    def test_logical_tp_applied_before_pcp_without_config_mutation(self, tpu_case):
+        from sglang_simulator.simulation.vllm.tpu_kv_geometry import derive_tpu_pooled_page
+
+        config, raw, model = tpu_case
+        raw["scheduler"].update(tp_size=2, pcp_size=4, physical_block_size=768)
+        config.cache_config.block_size = 768
+        page = derive_tpu_pooled_page(
+            config, raw, model.get_mamba_state_shape_from_config(config),
+            model.get_mamba_state_dtype_from_config(config),
+        )
+        assert page.shapes == ((4, 1, 2560), (16, 128, 128))
+        assert page.token_bytes == 1024
+        assert page.slot_bytes == 786432
+        assert config.parallel_config.tensor_parallel_size == 1
+        assert config.parallel_config.prefill_context_parallel_size == 1
+
+    @pytest.mark.parametrize("change", ["pcp1", "ssm_fp32", "small_block"])
+    def test_insufficient_target_slot_fails_with_byte_diagnostics(self, tpu_case, change):
+        from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
+
+        config, raw, _ = tpu_case
+        if change == "pcp1":
+            raw["scheduler"]["pcp_size"] = 1
+        elif change == "ssm_fp32":
+            config.cache_config.mamba_ssm_cache_dtype = "float32"
+        else:
+            raw["scheduler"]["physical_block_size"] = 128
+        with pytest.raises(ValueError, match="raw_state_bytes=.*required_state_bytes=.*slot_bytes="):
+            _build_kv_cache_spec(config)
+
+    @pytest.mark.parametrize("taps", [3, 4, 9])
+    def test_conv_layout_and_speculative_width_are_preserved(self, tpu_case, taps):
+        from sglang_simulator.simulation.vllm.tpu_kv_geometry import derive_tpu_pooled_page
+
+        config, raw, model = tpu_case
+        config.speculative_config.num_speculative_tokens = taps - 3
+        shapes = model.get_mamba_state_shape_from_config(config)
+        dtypes = model.get_mamba_state_dtype_from_config(config)
+        sd = derive_tpu_pooled_page(config, raw, shapes, dtypes)
+        ds = derive_tpu_pooled_page(config, raw, (shapes[0][::-1], shapes[1]), dtypes)
+        assert sd == ds
+        assert sd.shapes[0] == (taps, 1, 2560)
+
+    @pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3", "fp8_e5m2", "auto"])
+    def test_kv_dtype_does_not_quantize_mamba_ssm(self, tpu_case, cache_dtype):
+        from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
+
+        config, _, _ = tpu_case
+        config.cache_config.cache_dtype = cache_dtype
+        specs = _build_kv_cache_spec(config)
+        assert specs["model.layers.0"].dtypes == (torch.bfloat16, torch.bfloat16)
+        expected = 1572864 if cache_dtype == "auto" else 786432
+        assert all(spec.page_size_bytes == expected for spec in specs.values())
+
+    @pytest.mark.parametrize("field,value", [("pcp_size", 3), ("tp_size", 0), ("pcp_size", True)])
+    def test_invalid_topology_is_rejected(self, tpu_case, field, value):
+        from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
+
+        config, raw, _ = tpu_case
+        raw["scheduler"][field] = value
+        with pytest.raises(ValueError):
+            _build_kv_cache_spec(config)
+
+    def test_missing_model_shapes_does_not_fall_back_to_placeholder(self, tpu_case, monkeypatch):
+        from vllm.model_executor.models import ModelRegistry
+        from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
+
+        def unavailable(*args, **kwargs):
+            raise RuntimeError("model API unavailable")
+
+        monkeypatch.setattr(ModelRegistry, "resolve_model_cls", unavailable)
+        with pytest.raises(ValueError, match="without real Mamba shapes/dtypes"):
+            _build_kv_cache_spec(tpu_case[0])
+
+    def test_non_unified_target_is_not_silently_treated_as_unified(self, tpu_case, monkeypatch):
+        from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
+
+        monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "0")
+        with pytest.raises(ValueError, match="non-unified"):
+            _build_kv_cache_spec(tpu_case[0])
+
+    def test_legacy_gpu_pack_rule_is_preserved(self, tpu_case):
+        from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
+
+        config, raw, _ = tpu_case
+        raw["platform"]["accelerator"]["name"] = "a100_sxm"
+        config.cache_config.attn_pack_size = 8
+        specs = _build_kv_cache_spec(config)
+        attention, mamba = specs["model.layers.3"], specs["model.layers.0"]
+        assert attention.page_size_bytes == 786432
+        assert mamba.page_size_padded == attention.page_size_bytes * 8
+        assert mamba.dtypes == (torch.float32, torch.bfloat16)
+        assert mamba.shapes == ((4, 20480), (128, 128, 128))
+
+
 # ============================================================
 # Test 7: V6dObjectConnectorWorker hook mechanics
 # ============================================================

@@ -147,6 +147,19 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     cache_config = vllm_config.cache_config
     hf_config = model_config.hf_text_config
 
+    from sglang_simulator.simulation.vllm.tpu_kv_geometry import (
+        derive_tpu_pooled_page, is_tpu_target, normalize_tpu_pooled_specs,
+    )
+
+    try:
+        raw_config = ConfigManager._get_raw_config()
+    except Exception:
+        raw_config = {}
+    raw_scheduler = raw_config.get("scheduler", {})
+    tpu_hybrid = is_tpu_target(raw_config) and "linear_attention" in (
+        getattr(hf_config, "layer_types", None) or ()
+    )
+
     # Real num_kv_heads (divided by TP for per-shard spec)
     scheduler_config = None
     try:
@@ -155,6 +168,11 @@ def _build_kv_cache_spec(vllm_config) -> dict:
         pass
 
     tp_size = scheduler_config.tp_size if scheduler_config else 1
+    if tpu_hybrid:
+        # Worker 初始化早于 set_scheduler_config，必须从原始目标配置取 TP。
+        tp_size = raw_scheduler.get("tp_size", 1)
+        if isinstance(tp_size, bool) or not isinstance(tp_size, int) or tp_size < 1:
+            raise ValueError("scheduler.tp_size must be a positive integer")
     # Support both real ModelConfig (has method) and SimpleNamespace mocks
     if hasattr(model_config, "get_total_num_kv_heads"):
         total_num_kv_heads = model_config.get_total_num_kv_heads()
@@ -179,14 +197,7 @@ def _build_kv_cache_spec(vllm_config) -> dict:
     # runs later in determine_available_memory, so read the raw config here.
     # cache_config is updated in-place so downstream consumers (scheduler
     # block-aligned split, mamba_block_size) stay consistent with the spec.
-    try:
-        _injected_block_size = (
-            ConfigManager._get_raw_config()
-            .get("scheduler", {})
-            .get("physical_block_size")
-        )
-    except Exception:
-        _injected_block_size = None
+    _injected_block_size = raw_scheduler.get("physical_block_size")
     if _injected_block_size:
         block_size = int(_injected_block_size)
         cache_config.block_size = block_size
@@ -218,6 +229,7 @@ def _build_kv_cache_spec(vllm_config) -> dict:
 
     full_attn_spec = FullAttentionSpec(**_fa_kwargs)
     attn_page_size = full_attn_spec.page_size_bytes
+    mamba_page_padded = attn_page_size * attn_pack_size
 
     if layer_types is None:
         # Pure MHA model - use layer name format matching vLLM convention
@@ -251,7 +263,12 @@ def _build_kv_cache_spec(vllm_config) -> dict:
             mamba_dtypes = model_cls.get_mamba_state_dtype_from_config(
                 vllm_config
             )
-        except Exception:
+        except Exception as exc:
+            if tpu_hybrid:
+                # TPU 分片依赖真实 head/tap 元数据，禁止以小占位状态掩盖失败。
+                raise ValueError(
+                    "Cannot build TPU pooled KV geometry without real Mamba shapes/dtypes"
+                ) from exc
             logger.warning(
                 "[V6D Hijack] failed to resolve real mamba state spec, "
                 "falling back to placeholder shapes/dtypes",
@@ -264,7 +281,7 @@ def _build_kv_cache_spec(vllm_config) -> dict:
             block_size=mamba_block_size,
             shapes=mamba_shapes,
             dtypes=mamba_dtypes,
-            page_size_padded=attn_page_size * attn_pack_size,
+            page_size_padded=None if tpu_hybrid else mamba_page_padded,
             mamba_cache_mode=getattr(cache_config, "mamba_cache_mode", "none"),
         )
         # Forward num_speculative_blocks (MTP/EAGLE) so light-mode runtime
@@ -302,6 +319,33 @@ def _build_kv_cache_spec(vllm_config) -> dict:
                 mamba_kwargs["mamba_type"] = _mamba_gdn_type
 
         mamba_spec = MambaSpec(**mamba_kwargs)
+        if tpu_hybrid:
+            page = derive_tpu_pooled_page(
+                vllm_config, raw_config, mamba_shapes, mamba_dtypes
+            )
+            full_attn_spec, mamba_spec = normalize_tpu_pooled_specs(
+                full_attn_spec, mamba_spec, page
+            )
+            attn_page_size = page.slot_bytes
+            mamba_page_padded = page.slot_bytes
+            cache_config.mamba_page_size_padded = page.slot_bytes
+            logger.info(
+                "[TPU KV geometry] target_tp=%d target_pcp=%d physical_block_size=%d "
+                "full_state_bytes=%d local_shapes=%s local_dtypes=%s "
+                "local_raw_state_bytes=%d required_state_bytes=%d slot_bytes=%d",
+                page.tp_size, page.pcp_size, block_size, page.full_state_bytes,
+                page.shapes, page.dtypes, page.raw_state_bytes,
+                page.required_state_bytes, page.slot_bytes,
+            )
+            if raw_scheduler.get("pp_size", 1) > 1 or page.pcp_size > 1:
+                logger.warning(
+                    "[TPU KV geometry] Per-rank page normalization only; "
+                    "PP capacity aggregation and PCP logical block accounting "
+                    "still require baseline validation. Keeping configured "
+                    "kv_cache_memory_bytes=%s and num_gpu_blocks_override=%s unchanged.",
+                    getattr(cache_config, "kv_cache_memory_bytes", None),
+                    getattr(cache_config, "num_gpu_blocks_override", None),
+                )
 
         kv_cache_spec = {}
         for i, layer_type in enumerate(layer_types):
@@ -338,7 +382,7 @@ def _build_kv_cache_spec(vllm_config) -> dict:
         "page_size=%d bytes, mamba_page_padded=%d bytes, attn_pack_size=%d",
         len(kv_cache_spec), num_mtp_layers, num_kv_heads, total_num_kv_heads,
         tp_size, head_size, block_size, attn_page_size,
-        attn_page_size * attn_pack_size, attn_pack_size,
+        mamba_page_padded, attn_pack_size,
     )
     return kv_cache_spec
 
