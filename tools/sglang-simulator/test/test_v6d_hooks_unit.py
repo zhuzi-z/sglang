@@ -286,22 +286,32 @@ class TestTPUPooledKVGeometry:
             dtype=torch.bfloat16, get_total_num_kv_heads=lambda: hf.num_key_value_heads,
             get_head_size=lambda: hf.head_dim,
         )
-        cache = SimpleNamespace(
+        class Cache(SimpleNamespace):
+            def get_resolved_kv_cache_layout(self):
+                from vllm.v1.kv_cache_interface import KVCacheLayout
+                return KVCacheLayout[self.kv_cache_layout]
+
+        cache = Cache(
             block_size=384, mamba_block_size=384, mamba_cache_mode="align",
             mamba_ssm_cache_dtype="bfloat16", cache_dtype="fp8", attn_pack_size=1,
             kv_cache_memory_bytes=22548578304, num_gpu_blocks_override=None,
             kv_cache_layout=None, user_specified_block_size=True,
-            prefix_cache_retention_interval=0,
+            prefix_cache_retention_interval=0, prefix_match_unit=None,
+            enable_prefix_caching=True,
         )
+        model.max_model_len = model.original_max_model_len = 1048576
         config = SimpleNamespace(
             model_config=model, cache_config=cache,
             parallel_config=SimpleNamespace(
                 tensor_parallel_size=1, pipeline_parallel_size=1,
-                prefill_context_parallel_size=1,
+                prefill_context_parallel_size=1, decode_context_parallel_size=1,
             ),
             speculative_config=SimpleNamespace(
                 method="mtp", num_speculative_tokens=1, use_eagle=lambda: False,
+                use_multi_module_mtp=lambda: False,
             ),
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+            kv_transfer_config=None,
         )
         raw = {
             "platform": {"accelerator": {"name": "tpu7x-32"}},
@@ -325,6 +335,8 @@ class TestTPUPooledKVGeometry:
         monkeypatch.setattr(ConfigManager, "_get_raw_config", lambda: raw)
         monkeypatch.setattr(ConfigManager, "get_scheduler_config", lambda: None)
         monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+        monkeypatch.delenv("SGLANG_SIMULATOR_PP_LAYER_PARTITION", raising=False)
+        monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
         return config, raw, Model
 
     def test_pcp_local_page_fits_native_mamba_invariant(self, tpu_case):
@@ -499,6 +511,165 @@ class TestTPUPooledKVGeometry:
         assert mamba.page_size_padded == attention.page_size_bytes * 8
         assert mamba.dtypes == (torch.float32, torch.bfloat16)
         assert mamba.shapes == ((4, 20480), (128, 128, 128))
+
+
+class TestTPUVirtualKVCapacity(TestTPUPooledKVGeometry):
+    """复用真实 spec fixture，执行原生容量规划而非仅核验自编公式。"""
+
+    @pytest.fixture
+    def pipeline_case(self, tpu_case):
+        from sglang_simulator.simulation.vllm.worker import _build_kv_cache_spec
+
+        config, raw, _ = tpu_case
+        hf = config.model_config.hf_text_config
+        hf.num_hidden_layers = 92
+        hf.layer_types = (["linear_attention"] * 3 + ["full_attention"]) * 23
+        raw["scheduler"]["pp_layer_partition"] = [24, 24, 24, 20]
+        return config, raw, _build_kv_cache_spec(config)
+
+    def test_native_virtual_stages_and_cpu_capacity_agree(self, pipeline_case):
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+        from sglang_simulator.simulation.vllm.tpu_kv_capacity import (
+            apply_tpu_kv_capacity, plan_tpu_kv_capacity,
+        )
+
+        config, raw, specs = pipeline_case
+        original_budget = config.cache_config.kv_cache_memory_bytes
+        plan = plan_tpu_kv_capacity(config, raw, specs)
+        assert plan.stage_layers == (24, 24, 24, 20)
+        assert plan.stage_block_limits[:3] == (4778, 4778, 4778)
+        assert plan.stage_block_limits[3] > 4778
+        assert plan.num_blocks == 4778
+        assert plan.logical_block_size == plan.hash_block_size == 3072
+        assert plan.virtual_memory_bytes == 4778 * 23 * 786432
+        assert config.cache_config.block_size == 384  # 规划未修改原对象
+        apply_tpu_kv_capacity(config, plan)
+        assert config.cache_config.block_size == config.cache_config.mamba_block_size == 3072
+        assert config.cache_config.prefix_match_unit == 3072
+        assert config.parallel_config.pipeline_parallel_size == 1
+        assert config.parallel_config.prefill_context_parallel_size == 1
+        assert config.cache_config.kv_cache_memory_bytes == original_budget
+        assert config.cache_config.num_gpu_blocks_override is None
+        assert config.model_config.max_model_len == 1048576
+        actual = get_kv_cache_configs(config, [plan.specs], [plan.virtual_memory_bytes])[0]
+        assert actual.num_blocks == plan.num_blocks
+        assert all(s.page_size_bytes == 786432 for s in plan.specs.values())
+        assert specs["model.layers.3"].block_size == 384
+        assert plan.specs["model.layers.3"].tokens_per_state == 8
+        assert plan.specs["model.layers.0"].shapes == specs["model.layers.0"].shapes
+
+    def test_smallest_stage_budget_limits_whole_pipeline(self, pipeline_case):
+        from sglang_simulator.simulation.vllm.tpu_kv_capacity import plan_tpu_kv_capacity
+
+        config, raw, specs = pipeline_case
+        budget = config.cache_config.kv_cache_memory_bytes
+        raw["scheduler"]["pp_stage_kv_cache_memory_bytes"] = [budget] * 3 + [budget // 2]
+        plan = plan_tpu_kv_capacity(config, raw, specs)
+        assert plan.num_blocks == min(plan.stage_block_limits)
+        assert plan.num_blocks == plan.stage_block_limits[3] < plan.stage_block_limits[0]
+
+    @pytest.mark.parametrize("budgets", [[100] * 4, [22548578304] * 3 + [100]])
+    def test_insufficient_virtual_stage_still_raises(self, pipeline_case, budgets):
+        from sglang_simulator.simulation.vllm.tpu_kv_capacity import plan_tpu_kv_capacity
+
+        config, raw, specs = pipeline_case
+        raw["scheduler"]["pp_stage_kv_cache_memory_bytes"] = budgets
+        with pytest.raises(ValueError):
+            plan_tpu_kv_capacity(config, raw, specs)
+        assert config.cache_config.block_size == 384
+        assert config.model_config.max_model_len == 1048576
+
+    @pytest.mark.parametrize("override", [1, 100000])
+    def test_override_cannot_bypass_request_or_physical_capacity(self, pipeline_case, override):
+        from sglang_simulator.simulation.vllm.tpu_kv_capacity import plan_tpu_kv_capacity
+
+        config, raw, specs = pipeline_case
+        config.cache_config.num_gpu_blocks_override = override
+        with pytest.raises(ValueError):
+            plan_tpu_kv_capacity(config, raw, specs)
+
+    def test_valid_override_can_reduce_capacity(self, pipeline_case):
+        from sglang_simulator.simulation.vllm.tpu_kv_capacity import plan_tpu_kv_capacity
+
+        config, raw, specs = pipeline_case
+        config.cache_config.num_gpu_blocks_override = 4000
+        assert plan_tpu_kv_capacity(config, raw, specs).num_blocks == 4000
+
+    def test_explicit_fine_hash_unit_is_preserved(self, pipeline_case):
+        from sglang_simulator.simulation.vllm.tpu_kv_capacity import plan_tpu_kv_capacity
+
+        config, raw, specs = pipeline_case
+        config.cache_config.prefix_match_unit = 384
+        assert plan_tpu_kv_capacity(config, raw, specs).hash_block_size == 384
+        config.cache_config.prefix_match_unit = 100
+        with pytest.raises(ValueError):
+            plan_tpu_kv_capacity(config, raw, specs)
+
+    def test_missing_partition_requires_explicit_target_input(self, pipeline_case, monkeypatch):
+        from sglang_simulator.simulation.vllm.tpu_kv_capacity import plan_tpu_kv_capacity
+
+        config, raw, specs = pipeline_case
+        del raw["scheduler"]["pp_layer_partition"]
+        with pytest.raises(ValueError, match="PP capacity planning requires"):
+            plan_tpu_kv_capacity(config, raw, specs)
+        monkeypatch.setenv("SGLANG_SIMULATOR_PP_LAYER_PARTITION", "24,24,24,20")
+        assert plan_tpu_kv_capacity(config, raw, specs).stage_layers == (24, 24, 24, 20)
+
+    @pytest.mark.parametrize("partition", [[24, 24, 24, 24], [24, 24], [0, 24, 24, 44]])
+    def test_invalid_stage_partition_rejected(self, pipeline_case, partition):
+        from sglang_simulator.simulation.vllm.tpu_kv_capacity import plan_tpu_kv_capacity
+
+        config, raw, specs = pipeline_case
+        raw["scheduler"]["pp_layer_partition"] = partition
+        with pytest.raises(ValueError, match="PP stage layers|Invalid pp_layer_partition"):
+            plan_tpu_kv_capacity(config, raw, specs)
+
+    def test_mtp_ownership_is_last_stage(self, pipeline_case):
+        from sglang_simulator.simulation.vllm.tpu_kv_capacity import _project_layers
+
+        _, _, specs = pipeline_case
+        specs = dict(specs, **{"model.mtp.layers.92": specs["model.layers.3"]})
+        projected = _project_layers(specs, (24, 24, 24, 20))
+        assert [len(s) for s in projected] == [24, 24, 24, 21]
+        assert "model.mtp.layers.92" in projected[-1]
+        assert all("model.mtp.layers.92" not in s for s in projected[:-1])
+
+    def test_block_table_and_hash_units_use_single_pcp_factor(self, pipeline_case):
+        from vllm.v1.core.kv_cache_utils import (
+            BlockHashListWithBlockSize, get_kv_cache_configs, resolve_kv_cache_block_sizes,
+        )
+        from sglang_simulator.simulation.vllm.tpu_kv_capacity import (
+            apply_tpu_kv_capacity, plan_tpu_kv_capacity,
+        )
+
+        config, raw, specs = pipeline_case
+        plan = plan_tpu_kv_capacity(config, raw, specs)
+        apply_tpu_kv_capacity(config, plan)
+        native = get_kv_cache_configs(config, [plan.specs], [plan.virtual_memory_bytes])[0]
+        assert resolve_kv_cache_block_sizes(native, config) == (3072, 3072)
+        assert plan.specs["model.layers.3"].max_num_blocks_per_req(config, 6144) == 2
+        hashes = list(range(16))  # 16 个384-token hash，对应两个3072-token块
+        assert list(BlockHashListWithBlockSize(hashes, 384, 3072)) == [7, 15]
+
+    @pytest.mark.parametrize("budget,expected", [(8192, 6144), (32768, 30720)])
+    def test_scheduler_alignment_does_not_multiply_pcp_twice(self, tpu_case, budget, expected):
+        from sglang_simulator.simulation.vllm.engine_core_pipeline import _pcp_budget_granule
+
+        _, raw, _ = tpu_case
+        granule = _pcp_budget_granule(3072, 8)
+        assert granule == 3072
+        assert budget // granule * granule == expected
+        assert _pcp_budget_granule(384, 8) == 3072
+        raw["platform"]["accelerator"]["name"] = "a100_sxm"
+        assert _pcp_budget_granule(384, 8) == 3072
+
+    def test_tensor_layer_names_support_native_and_legacy_configs(self):
+        from sglang_simulator.simulation.vllm.worker import _kv_tensor_layer_names
+
+        assert _kv_tensor_layer_names(SimpleNamespace(layers=["a"])) == ["a"]
+        assert _kv_tensor_layer_names(SimpleNamespace(shared_by=["b"])) == ["b"]
+        with pytest.raises(ValueError, match="layers/shared_by"):
+            _kv_tensor_layer_names(SimpleNamespace(size=4096))
 
 
 # ============================================================

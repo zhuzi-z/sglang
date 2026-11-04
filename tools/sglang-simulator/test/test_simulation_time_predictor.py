@@ -456,10 +456,11 @@ def test_cpu_startup_sanitizes_tpu_platform_but_keeps_connector_plugin():
     keys = (
         "VLLM_TARGET_DEVICE", "VLLM_PLUGINS", "PJRT_DEVICE",
         "VLLM_PP_LAYER_PARTITION", "TPU_VISIBLE_CHIPS",
-        "VLLM_NNODES", "RANK_SIZE",
+        "VLLM_NNODES", "RANK_SIZE", "SGLANG_SIMULATOR_PP_LAYER_PARTITION",
     )
     old = {key: os.environ.get(key) for key in keys}
     try:
+        os.environ.pop("SGLANG_SIMULATOR_PP_LAYER_PARTITION", None)
         os.environ["VLLM_TARGET_DEVICE"] = "tpu"
         os.environ["VLLM_PLUGINS"] = "torchtpu,torchtpu_layers,kvs_connector"
         os.environ["PJRT_DEVICE"] = "TPU"
@@ -472,6 +473,7 @@ def test_cpu_startup_sanitizes_tpu_platform_but_keeps_connector_plugin():
         assert os.environ["VLLM_PLUGINS"] == "kvs_connector"
         assert "PJRT_DEVICE" not in os.environ
         assert "VLLM_PP_LAYER_PARTITION" not in os.environ
+        assert os.environ["SGLANG_SIMULATOR_PP_LAYER_PARTITION"] == "24,24,24,20"
         assert os.environ["TPU_VISIBLE_CHIPS"] == ""
         assert os.environ["VLLM_NNODES"] == "1"
         assert os.environ["RANK_SIZE"] == "1"

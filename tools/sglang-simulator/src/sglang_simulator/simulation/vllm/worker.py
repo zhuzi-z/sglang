@@ -119,6 +119,16 @@ def _noop(*args, **kwargs):
     return None
 
 
+def _kv_tensor_layer_names(kv_tensor):
+    # vLLM 0.29 的原生容量规划输出 layers，旧 fork 输出 shared_by。
+    names = getattr(kv_tensor, "shared_by", None)
+    if names is None:
+        names = getattr(kv_tensor, "layers", None)
+    if names is None:
+        raise ValueError("KV cache tensor does not expose layers/shared_by")
+    return names
+
+
 def _build_kv_cache_spec(vllm_config) -> dict:
     """Build KV cache spec from HF model config with the real head_dim.
 
@@ -337,15 +347,6 @@ def _build_kv_cache_spec(vllm_config) -> dict:
                 page.shapes, page.dtypes, page.raw_state_bytes,
                 page.required_state_bytes, page.slot_bytes,
             )
-            if raw_scheduler.get("pp_size", 1) > 1 or page.pcp_size > 1:
-                logger.warning(
-                    "[TPU KV geometry] Per-rank page normalization only; "
-                    "PP capacity aggregation and PCP logical block accounting "
-                    "still require baseline validation. Keeping configured "
-                    "kv_cache_memory_bytes=%s and num_gpu_blocks_override=%s unchanged.",
-                    getattr(cache_config, "kv_cache_memory_bytes", None),
-                    getattr(cache_config, "num_gpu_blocks_override", None),
-                )
 
         kv_cache_spec = {}
         for i, layer_type in enumerate(layer_types):
@@ -477,6 +478,19 @@ class C_VLLMWorkerHook(BaseHook):
 
             # Stub model_runner
             kv_spec = _build_kv_cache_spec(self.vllm_config)
+            self._sim_tpu_capacity = None
+            from sglang_simulator.simulation.vllm.tpu_kv_geometry import is_tpu_target
+            raw_config = ConfigManager._get_raw_config()
+            if is_tpu_target(raw_config) and "linear_attention" in (
+                getattr(self.model_config.hf_text_config, "layer_types", None) or ()
+            ):
+                from sglang_simulator.simulation.vllm.tpu_kv_capacity import (
+                    apply_tpu_kv_capacity, plan_tpu_kv_capacity,
+                )
+                plan = plan_tpu_kv_capacity(self.vllm_config, raw_config, kv_spec)
+                apply_tpu_kv_capacity(self.vllm_config, plan)
+                kv_spec = plan.specs
+                self._sim_tpu_capacity = plan
             self.model_runner = _ModelRunnerStub(kv_spec=kv_spec)
 
             self.init_snapshot = None
@@ -490,6 +504,15 @@ class C_VLLMWorkerHook(BaseHook):
 
         def override_determine_available_memory(self):
             """Return real configured KV bytes, or fake memory as fallback."""
+            plan = getattr(self, "_sim_tpu_capacity", None)
+            if plan is not None:
+                logger.info(
+                    "[TPU KV capacity] Worker returning equivalent metadata budget=%d "
+                    "for common_num_blocks=%d; configured per-device bytes=%s",
+                    plan.virtual_memory_bytes, plan.num_blocks,
+                    self.cache_config.kv_cache_memory_bytes,
+                )
+                return plan.virtual_memory_bytes
             # TPU deployments often bound KV explicitly. Do not replace that
             # contract with an 80-GiB virtual-GPU estimate.
             configured = getattr(self.cache_config, "kv_cache_memory_bytes", None)
@@ -596,7 +619,7 @@ class C_VLLMWorkerHook(BaseHook):
                     tensor = torch.zeros(
                         minimal_size, dtype=torch.int8, device="cpu"
                     )
-                    for layer_name in kv_tensor.shared_by:
+                    for layer_name in _kv_tensor_layer_names(kv_tensor):
                         kv_caches[layer_name] = tensor
                 logger.info(
                     "[vLLM Hijack] Allocated %d MINIMAL CPU KV cache tensors "

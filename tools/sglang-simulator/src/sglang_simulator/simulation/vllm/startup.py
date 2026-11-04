@@ -29,7 +29,10 @@ def _sanitize_tpu_environment_for_cpu():
     # Prevent real TPU discovery and multi-node PP construction. TPU connector
     # names may remain in engine config and are handled by simulation hooks.
     os.environ.pop("PJRT_DEVICE", None)
-    os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
+    partition = os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
+    if partition:
+        # 保留逻辑层归属供容量规划使用，物理执行仍不激活多节点 PP。
+        os.environ.setdefault("SGLANG_SIMULATOR_PP_LAYER_PARTITION", partition)
     os.environ["TPU_VISIBLE_CHIPS"] = ""
     os.environ["VLLM_NNODES"] = "1"
     os.environ["RANK_SIZE"] = "1"

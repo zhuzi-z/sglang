@@ -167,6 +167,21 @@ class ReqDispatcher:
             self.original_core_add_request(core, request, request_wave)
 
 
+def _pcp_budget_granule(cache_block_size, pcp_size):
+    """CPU 缓存已折叠为 PCP 逻辑块时，避免再次乘 PCP。"""
+    from sglang_simulator.simulation.vllm.tpu_kv_geometry import is_tpu_target
+
+    try:
+        raw = ConfigManager._get_raw_config()
+    except (OSError, TypeError):
+        # 旧路径的独立调用可能只注入 SchedulerConfig，没有配置文件。
+        raw = {}
+    physical = raw.get("scheduler", {}).get("physical_block_size")
+    if is_tpu_target(raw) and physical and cache_block_size == physical * pcp_size:
+        return cache_block_size
+    return cache_block_size * pcp_size
+
+
 class C_VLLMSchedulerHook(BaseHook):
     """Patch ONLY the scheduler's unfinished-count accessors.
 
@@ -203,7 +218,8 @@ class C_VLLMSchedulerHook(BaseHook):
                     budget = self.scheduler_config.max_num_batched_tokens
                     # Static PCP granule used by the target PP deployment:
                     # floor(budget / pcp / block) * pcp * block.
-                    pcp_budget = (budget // pcp_size // block_size) * pcp_size * block_size
+                    granule = _pcp_budget_granule(block_size, pcp_size)
+                    pcp_budget = (budget // granule) * granule
                     if pcp_budget > 0:
                         num_new_tokens = min(num_new_tokens, pcp_budget)
                 count = original_split(
