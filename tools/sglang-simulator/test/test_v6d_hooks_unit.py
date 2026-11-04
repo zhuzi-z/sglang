@@ -545,7 +545,7 @@ class TestTPUVirtualKVCapacity(TestTPUPooledKVGeometry):
         assert config.cache_config.block_size == 384  # 规划未修改原对象
         apply_tpu_kv_capacity(config, plan)
         assert config.cache_config.block_size == config.cache_config.mamba_block_size == 3072
-        assert config.cache_config.prefix_match_unit == 3072
+        assert config.cache_config.prefix_match_unit is None
         assert config.parallel_config.pipeline_parallel_size == 1
         assert config.parallel_config.prefill_context_parallel_size == 1
         assert config.cache_config.kv_cache_memory_bytes == original_budget
@@ -605,6 +605,30 @@ class TestTPUVirtualKVCapacity(TestTPUPooledKVGeometry):
         with pytest.raises(ValueError):
             plan_tpu_kv_capacity(config, raw, specs)
 
+    @pytest.mark.parametrize("requested", [None, 384, 3072])
+    def test_apply_does_not_overwrite_user_prefix_match_unit(self, requested):
+        from sglang_simulator.simulation.vllm.tpu_kv_capacity import apply_tpu_kv_capacity
+
+        config = SimpleNamespace(cache_config=SimpleNamespace(prefix_match_unit=requested))
+        plan = SimpleNamespace(logical_block_size=3072, hash_block_size=3072, layout_name="LBNHC")
+        apply_tpu_kv_capacity(config, plan)
+        assert config.cache_config.prefix_match_unit == requested
+
+    def test_apply_accepts_unset_read_only_v6d_prefix_override(self):
+        from sglang_simulator.simulation.vllm.tpu_kv_capacity import apply_tpu_kv_capacity
+
+        # 只检查 V6D 的 None 契约，不启动真实 connector/外部连接。
+        class Cache:
+            @property
+            def prefix_match_unit(self):
+                return None
+
+        config = SimpleNamespace(cache_config=Cache())
+        plan = SimpleNamespace(logical_block_size=3072, hash_block_size=3072, layout_name="LBNHC")
+        apply_tpu_kv_capacity(config, plan)
+        assert config.cache_config.prefix_match_unit is None
+        assert config.cache_config.block_size == 3072
+
     def test_missing_partition_requires_explicit_target_input(self, pipeline_case, monkeypatch):
         from sglang_simulator.simulation.vllm.tpu_kv_capacity import plan_tpu_kv_capacity
 
@@ -645,8 +669,11 @@ class TestTPUVirtualKVCapacity(TestTPUPooledKVGeometry):
         config, raw, specs = pipeline_case
         plan = plan_tpu_kv_capacity(config, raw, specs)
         apply_tpu_kv_capacity(config, plan)
+        # 保持 V6D 要求的 None，仍由原生 resolver 从逻辑块推导3072。
+        assert config.cache_config.prefix_match_unit is None
         native = get_kv_cache_configs(config, [plan.specs], [plan.virtual_memory_bytes])[0]
         assert resolve_kv_cache_block_sizes(native, config) == (3072, 3072)
+        assert config.cache_config.prefix_match_unit is None
         assert plan.specs["model.layers.3"].max_num_blocks_per_req(config, 6144) == 2
         hashes = list(range(16))  # 16 个384-token hash，对应两个3072-token块
         assert list(BlockHashListWithBlockSize(hashes, 384, 3072)) == [7, 15]

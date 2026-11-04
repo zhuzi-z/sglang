@@ -205,6 +205,8 @@ def apply_tpu_kv_capacity(vllm_config, plan):
     cache.block_size = plan.logical_block_size
     cache.mamba_block_size = plan.logical_block_size
     cache.kv_cache_layout = plan.layout_name
-    cache.prefix_match_unit = plan.hash_block_size
+    # prefix_match_unit 是用户覆盖项，不是 resolver 的计算结果。
+    # V6D 要求它保持 None；各组已使用逻辑块，原生 resolver 会自动算出
+    # 相同的 hash_block_size。其他路线的显式覆盖也应保留，不能擅自清空。
     # kv_cache_memory_bytes 保留每设备的配置值；Worker 返回的是 plan 的
     # cpu_metadata_budget_bytes。不能把一次折叠的结果当成下一次的物理输入。
