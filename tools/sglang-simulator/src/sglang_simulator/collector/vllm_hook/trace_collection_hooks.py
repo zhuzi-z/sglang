@@ -6,6 +6,7 @@ profiler start. Time fields always describe host observations.
 from contextlib import contextmanager
 from functools import wraps
 import time
+import os
 import uuid
 
 from sglang_simulator.hook import BaseHook
@@ -251,6 +252,10 @@ class CollectionRunnerTimingHook(V2RunnerTimingHook):
     @classmethod
     def hook(cls, target):
         native = target.stage
+        probe_annotation = None
+        if os.getenv('SIM_TPU_DEVICE_PROBE') == '1':
+            from .device_probe import annotation
+            probe_annotation = annotation
         @contextmanager
         @wraps(native)
         def stage(self, *args, **kwargs):
@@ -262,7 +267,11 @@ class CollectionRunnerTimingHook(V2RunnerTimingHook):
                 trace.emit('runner.' + name + '.enter', scope, chunk)
             try:
                 with native(self, *args, **kwargs) as value:
-                    yield value
+                    if probe_annotation is None:
+                        yield value
+                    else:
+                        with probe_annotation(name, scope):
+                            yield value
                 ok = True
             finally:
                 if scope is not None:
@@ -468,6 +477,8 @@ class CombinedWorkerHook(CollectionWorkerHook):
     def hook(cls, target):
         V2WorkerHook.hook(target)
         CollectionWorkerHook.hook(target)
+        from .device_probe import install
+        install(target)
 
 
 # The class installer applies ONLY the first matching hook. Compose additions
