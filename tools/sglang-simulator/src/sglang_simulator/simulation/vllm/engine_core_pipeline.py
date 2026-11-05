@@ -30,6 +30,7 @@ import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
+from functools import wraps
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager
@@ -350,6 +351,33 @@ def _register_tpu_connector_names():
         except Exception as exc:
             if "already" not in str(exc).lower():
                 raise
+
+
+class C_VLLMLLMEngineHook(BaseHook):
+    """在前端进程初始化前注册名称，供跨进程 KV 统计反序列化使用。"""
+
+    HOOK_CLASS_NAME = "LLMEngine"
+    HOOK_MODULE_NAME = "vllm.v1.engine.llm_engine"
+
+    @classmethod
+    def hook(cls, target):
+        if target.__dict__.get("_sim_frontend_connector_registration", False):
+            return
+        original_init = target.__init__
+
+        @wraps(original_init)
+        def wrapped_init(self, *args, **kwargs):
+            # 注册表是进程本地状态，不能依赖 EngineCore 子进程的注册。
+            # 延迟到构造入口，避免 hook 装配时提前导入 vLLM/真实 TPU 后端。
+            _register_tpu_connector_names()
+            logger.info(
+                "[vLLM Hijack] LLMEngine frontend connector registry ready (pid=%d)",
+                os.getpid(),
+            )
+            original_init(self, *args, **kwargs)
+
+        target.__init__ = wrapped_init
+        target._sim_frontend_connector_registration = True
 
 
 class C_VLLMEngineCoreHook(BaseHook):

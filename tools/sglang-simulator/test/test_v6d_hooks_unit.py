@@ -264,6 +264,150 @@ class TestBuildKVCacheSpec:
         assert "model.layers.1" in spec
 
 
+class TestTPUFrontendConnectorRegistry:
+    """模拟独立进程注册表，覆盖前端初始化和原生统计重建路径。"""
+
+    @pytest.fixture
+    def empty_registry(self, monkeypatch):
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+        monkeypatch.setattr(KVConnectorFactory, "_registry", {})
+        return KVConnectorFactory
+
+    @pytest.mark.parametrize("multiprocess", [False, True])
+    def test_registration_precedes_init_without_loading_tpu_modules(self, empty_registry, monkeypatch, multiprocess):
+        from vllm.distributed.kv_transfer.kv_connector import factory as factory_module
+        from sglang_simulator.simulation.vllm.engine_core_pipeline import C_VLLMLLMEngineHook
+
+        factory = empty_registry
+        existing = lambda: None
+        factory._registry["ExistingConnector"] = existing
+        import_module = MagicMock(side_effect=AssertionError("eager backend import"))
+        monkeypatch.setattr(factory_module, "importlib", SimpleNamespace(import_module=import_module))
+        calls = []
+
+        class Frontend:
+            def __init__(self, config, executor, *, log_stats, multiprocess_mode):
+                assert {"TPURaidenConnector", "TPUMultiConnector", "TPUV6dObjectConnector"} <= factory._registry.keys()
+                calls.append((config, executor, log_stats, multiprocess_mode))
+
+        C_VLLMLLMEngineHook.hook(Frontend)
+        installed_init = Frontend.__init__
+        C_VLLMLLMEngineHook.hook(Frontend)
+        assert Frontend.__init__ is installed_init
+        assert set(factory._registry) == {"ExistingConnector"}
+        config = {"pp_size": 4, "pcp_size": 8, "full_span": True}
+        executor = object()
+        for _ in range(2):
+            Frontend(config, executor, log_stats=True, multiprocess_mode=multiprocess)
+        assert calls == [(config, executor, True, multiprocess)] * 2
+        assert calls[0][0] is config and calls[0][1] is executor
+        assert config == {"pp_size": 4, "pcp_size": 8, "full_span": True}
+        assert factory._registry["ExistingConnector"] is existing
+        import_module.assert_not_called()
+
+    def test_serialized_stats_reconstructed_in_fresh_frontend_registry(self, empty_registry, monkeypatch):
+        import json
+        from types import ModuleType
+        from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+        from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+        from sglang_simulator.simulation.vllm.engine_core_pipeline import (
+            C_VLLMLLMEngineHook, _register_tpu_connector_names,
+        )
+
+        class Stats(KVConnectorStats):
+            def aggregate(self, other):
+                for key, value in other.data.items():
+                    self.data[key] = self.data.get(key, 0) + value
+                return self
+
+            def reset(self):
+                self.data.clear()
+
+            def reduce(self):
+                return dict(self.data)
+
+            def is_empty(self):
+                return not self.data
+
+        class V6dConnector:
+            @classmethod
+            def build_kv_connector_stats(cls, data=None):
+                return Stats(data=dict(data or {}))
+
+        module = ModuleType("kvs_connector.v6d_object_connector")
+        module.TPUV6dObjectConnector = V6dConnector
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        factory = empty_registry
+        _register_tpu_connector_names()
+        core_registry = factory._registry
+        # 子进程注册过并不意味着前端有这些名称，换成独立空表复现故障。
+        monkeypatch.setattr(factory, "_registry", {})
+        payload = json.loads(json.dumps({
+            "TPUV6dObjectConnector": {"data": {"num_loads": 2, "loaded_bytes": 4096}},
+        }))
+
+        class Frontend:
+            def __init__(self, stats):
+                self.stats = MultiConnector.build_kv_connector_stats(stats)
+
+        with pytest.raises(ValueError, match="TPUV6dObjectConnector.*not registered"):
+            Frontend(payload)
+        C_VLLMLLMEngineHook.hook(Frontend)
+        frontend = Frontend(payload)
+        assert frontend.stats.reduce() == {
+            "TPUV6dObjectConnector": {"num_loads": 2, "loaded_bytes": 4096},
+        }
+        assert factory._registry is not core_registry
+        assert factory._registry.keys() == core_registry.keys()
+        # 已反序列化对象继续走原生快路径，不丢统计、不改变对象身份。
+        existing = frontend.stats.data["TPUV6dObjectConnector"]
+        assert Frontend({"TPUV6dObjectConnector": existing}).stats.data["TPUV6dObjectConnector"] is existing
+        assert payload["TPUV6dObjectConnector"]["data"]["loaded_bytes"] == 4096
+        with pytest.raises(ValueError, match="UnknownConnector.*not registered"):
+            Frontend({"UnknownConnector": {"data": {}}})
+        with pytest.raises(AssertionError):
+            Frontend({"TPUV6dObjectConnector": {"missing_data": {}}})
+
+    def test_registration_failure_is_not_silently_ignored(self, empty_registry, monkeypatch):
+        from sglang_simulator.simulation.vllm.engine_core_pipeline import C_VLLMLLMEngineHook
+
+        monkeypatch.setattr(
+            empty_registry, "register_connector",
+            MagicMock(side_effect=RuntimeError("registry unavailable")),
+        )
+        initialized = []
+
+        class Frontend:
+            def __init__(self):
+                initialized.append(True)
+
+        C_VLLMLLMEngineHook.hook(Frontend)
+        with pytest.raises(RuntimeError, match="registry unavailable"):
+            Frontend()
+        assert not initialized
+
+    def test_startup_installs_frontend_and_core_hooks(self, monkeypatch):
+        import sglang_simulator.hook as hook_entry
+        from sglang_simulator.simulation.vllm import startup, engine_core_pipeline
+        from sglang_simulator.simulation.vllm.dashllm import kv_transfer_hook
+
+        captured = []
+        monkeypatch.setattr(startup, "_HOOKS_INSTALLED", False)
+        monkeypatch.setenv("PYTHONHASHSEED", "42")
+        monkeypatch.setenv("SRPC_STREAM_DISABLE_RDMA", "1")
+        for name in ("_sanitize_tpu_environment_for_cpu", "_patch_triton_for_cpu", "_patch_torch_cuda_for_cpu"):
+            monkeypatch.setattr(startup, name, lambda: None)
+        monkeypatch.setattr(hook_entry, "install_class_hooks", captured.extend)
+        monkeypatch.setattr(kv_transfer_hook, "_install_dashllm_kv_transfer_hook", lambda: None)
+        assert startup.init_hook()
+        assert captured.count(engine_core_pipeline.C_VLLMLLMEngineHook) == 1
+        assert captured.count(engine_core_pipeline.C_VLLMEngineCoreHook) == 1
+        hook = engine_core_pipeline.C_VLLMLLMEngineHook
+        assert hook.HOOK_CLASS_NAME == "LLMEngine"
+        assert hook.HOOK_MODULE_NAME == "vllm.v1.engine.llm_engine"
+
+
 class TestTPURaidenLocalCompletion:
     """覆盖四组断言、原生 MultiConnector 聚合和 Scheduler 延迟释放。"""
 
