@@ -20,6 +20,8 @@ OUTPUT_WAVE = ContextVar('sim_native_boundary_output_wave', default=None)
 
 
 def _emit(kind, item=None, **data):
+    if item is None and kind not in ('boundary_installed', 'boundary_unavailable'):
+        return None
     try:
         stamp = time.monotonic_ns()
         scope = trace.Scope(item['context']) if item is not None else None

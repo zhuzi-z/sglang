@@ -187,6 +187,13 @@ def test_install_once_and_unscoped_sync_unchanged(rig):
     assert len(rig.events)==before
 
 
+def test_untracked_warmup_does_not_emit_per_handoff_events(rig):
+    wave=rig.wave(0);before=len(rig.events)
+    wave.start_forward(17);wave.end_forward((object(),),17)
+    assert not any(e[0].startswith('native.') for e in rig.events[before:])
+    assert len(rig.calls)==4
+
+
 def test_unknown_drain_source_fails_closed_for_observer_only(rig):
     module=NS(PPWave=rig.wave,_drain_slice=lambda:None)
     original=rig.sync.synchronize
