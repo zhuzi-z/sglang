@@ -98,6 +98,9 @@ class CollectionRecorder(Recorder):
 
     def _tables(self, window):
         """Streaming export; no full-run accumulation in serving memory."""
+        if self.focus_pp0:
+            from .pp0_steps import export_tables
+            return export_tables(window)
         names = ('requests', 'step_inputs', 'chunk_inputs', 'layouts',
                  'schedule_batch', 'engine_steps', 'step_timings', 'native_boundaries', 'stage_completion_windows')
         streams = {name: (window / (name + '.jsonl')).open('w') for name in names}

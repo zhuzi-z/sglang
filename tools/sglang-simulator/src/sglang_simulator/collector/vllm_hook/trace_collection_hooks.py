@@ -213,7 +213,7 @@ class CollectionRunnerHook(BaseHook):
         def prepare(self, output, start_index, *args, **kwargs):
             scope = trace.ACTIVE.get()
             rec = trace._RECORDER
-            selected = scope is not None and rec is not None and rec.identity[4] == 0
+            selected = scope is not None and rec is not None and rec.identity[4] == 0 and (not rec.focus_pp0 or rec.identity[3] == 0)
             def snapshot():
                 batch = self.input_batch
                 # Capture before native mutable staging buffers can be reused.
@@ -302,7 +302,7 @@ class CollectionPcpLayoutHook(BaseHook):
         def evaluate(self, *args, **kwargs):
             result = original(self, *args, **kwargs)
             scope = trace.ACTIVE.get()
-            if scope is not None:
+            if scope is not None and not getattr(trace._RECORDER, 'focus_pp0', False):
                 def record():
                     def ints(name):
                         values = getattr(result, name, None)
@@ -443,10 +443,17 @@ class CollectionLazyStepperHook(BaseHook):
             def install(method, original):
                 @wraps(original)
                 def call(self, *args, **kwargs):
+                    focus = getattr(trace._RECORDER, 'focus_pp0', False)
+                    if focus and method != '_dispatch':
+                        return original(self, *args, **kwargs)
                     dispatched_result = None
                     if method == '_dispatch':
                         dispatched_result = original(self, *args, **kwargs)
                         if not dispatched_result:
+                            return dispatched_result
+                        if focus:
+                            from .pp0_steps import observe_result
+                            observe(lambda: observe_result(self))
                             return dispatched_result
                     def snapshot():
                         slot = (args[0] if method == '_sampled' else

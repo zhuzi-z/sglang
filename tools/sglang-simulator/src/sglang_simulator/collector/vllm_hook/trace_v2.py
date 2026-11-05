@@ -32,6 +32,7 @@ class Recorder:
         if capacity < 1 or interval <= 0 or max_bytes < 1:
             raise ValueError('positive trace limits required')
         self.capacity, self.interval, self.max_bytes = capacity, interval, max_bytes
+        self.focus_pp0 = os.getenv("SIM_TRACE_FOCUS") == "pp0_step"
         self.pid = os.getpid()
         self.identity = (-1,) * len(RANK_FIELDS)
         self.process_id = uuid.uuid4().hex
@@ -55,6 +56,10 @@ class Recorder:
         if self.failure is not None or self._stop.is_set():
             self.rejected += 1
             return False
+        if self.focus_pp0:
+            from .pp0_steps import keep_event
+            if not keep_event(kind, self.identity):
+                return False
         stamp = time.monotonic_ns()
         if not self._lock.acquire(False):
             self.dropped_busy += 1
@@ -77,7 +82,7 @@ class Recorder:
     def _metadata(self):
         return {'schema': 2, 'measurement_kind': 'host_observation',
                 'pid': os.getpid(), 'process_id': self.process_id,
-                'collection_id': self.collection_id, 'build_id': self.build_id,
+                'collection_id': self.collection_id, 'build_id': self.build_id, 'trace_focus': 'pp0_step' if self.focus_pp0 else 'full',
                 'clock_domain': socket.gethostname(),
                 'wall_anchor_ns': self.wall_anchor_ns, 'mono_anchor_ns': self.mono_anchor_ns,
                 'rank_fields': RANK_FIELDS, **self.status()}
