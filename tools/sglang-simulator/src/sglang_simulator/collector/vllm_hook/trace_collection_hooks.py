@@ -11,7 +11,7 @@ import uuid
 
 from sglang_simulator.hook import BaseHook
 from . import trace_v2 as trace
-from .trace_v2_hooks import HOOKS as TIMELINE_HOOKS, V2ExecutorHook, V2WorkerHook, V2RunnerTimingHook
+from .trace_v2_hooks import HOOKS as TIMELINE_HOOKS, V2ExecutorHook, V2WorkerHook, V2RunnerTimingHook, V2PPWaveHook
 
 EXPORT_KEY = '_sim_collection_export_id'
 
@@ -155,7 +155,13 @@ class CollectionWorkerHook(BaseHook):
             return
         @wraps(sample)
         def wrapped_sample(self, *args, **kwargs):
-            result = sample(self, *args, **kwargs)
+            from .native_boundaries import OUTPUT_WAVE
+            wave = getattr(getattr(self, 'model_runner', None), '_pp_wave', None)
+            token = OUTPUT_WAVE.set(wave)
+            try:
+                result = sample(self, *args, **kwargs)
+            finally:
+                OUTPUT_WAVE.reset(token)
             pending = getattr(self, '_sim_collection_pending', None)
             self._sim_collection_pending = None
             if pending is None:
@@ -167,6 +173,9 @@ class CollectionWorkerHook(BaseHook):
                 if recorded:
                     return
                 recorded = True
+                if kind == 'ready_observed':
+                    from .native_boundaries import output_ready
+                    observe(lambda: output_ready(getattr(self.model_runner, '_pp_wave', None), context))
                 ended = time.monotonic_ns()
                 trace.emit('step.output_' + kind, trace.Scope(context), data={
                     'start_mono_ns': started, 'end_mono_ns': ended,
@@ -263,6 +272,9 @@ class CollectionRunnerTimingHook(V2RunnerTimingHook):
             scope = trace.ACTIVE.get() if isinstance(name, str) else None
             chunk = scope.chunk if scope is not None and name == 'main_forward' else -1
             ok = False
+            if name == 'main_forward' and scope is not None:
+                from .native_boundaries import forward_enter
+                observe(lambda: forward_enter(scope))
             if scope is not None:
                 trace.emit('runner.' + name + '.enter', scope, chunk)
             try:
@@ -472,6 +484,24 @@ class CombinedExecutorHook(CollectionExecutorHook):
         CollectionExecutorHook.hook(target)
 
 
+class CollectionOutputBoundaryHook(BaseHook):
+    HOOK_MODULE_NAME = 'vllm_torchtpu.runner.tpu_runner_async_output'
+    HOOK_CLASS_NAME = 'AsyncTPUModelRunnerOutput'
+
+    @classmethod
+    def hook(cls, target):
+        from .native_boundaries import install_output_class
+        install_output_class(target)
+
+
+class CombinedPPWaveHook(V2PPWaveHook):
+    @classmethod
+    def hook(cls, target):
+        V2PPWaveHook.hook(target)
+        from .native_boundaries import install_for_class
+        install_for_class(target)
+
+
 class CombinedWorkerHook(CollectionWorkerHook):
     @classmethod
     def hook(cls, target):
@@ -485,7 +515,8 @@ class CombinedWorkerHook(CollectionWorkerHook):
 # for existing targets, rather than registering a second unreachable hook.
 HOOKS = [CombinedExecutorHook if hook is V2ExecutorHook else
          CombinedWorkerHook if hook is V2WorkerHook else
-         CollectionRunnerTimingHook if hook is V2RunnerTimingHook else hook
+         CollectionRunnerTimingHook if hook is V2RunnerTimingHook else
+         CombinedPPWaveHook if hook is V2PPWaveHook else hook
          for hook in TIMELINE_HOOKS]
 HOOKS += [CollectionRunnerHook, CollectionPcpLayoutHook, CollectionSchedulerHook,
-          CollectionTpuSchedulerHook, CollectionLazyStepperHook]
+          CollectionTpuSchedulerHook, CollectionLazyStepperHook, CollectionOutputBoundaryHook]

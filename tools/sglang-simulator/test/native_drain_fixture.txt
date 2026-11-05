@@ -1,0 +1,10 @@
+def _drain_slice() -> None:
+    """Waits for this device to go idle, then for every worker of the slice
+    to reach the same point, so no stage program is running anywhere when
+    the hand-off is launched."""
+    import torch.distributed as dist
+    from torch_tpu._internal.sync import sync
+    from vllm.distributed.parallel_state import get_world_group
+
+    sync.synchronize(None, wait=True)
+    dist.barrier(group=get_world_group().cpu_group)

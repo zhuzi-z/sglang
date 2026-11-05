@@ -99,7 +99,7 @@ class CollectionRecorder(Recorder):
     def _tables(self, window):
         """Streaming export; no full-run accumulation in serving memory."""
         names = ('requests', 'step_inputs', 'chunk_inputs', 'layouts',
-                 'schedule_batch', 'engine_steps', 'step_timings')
+                 'schedule_batch', 'engine_steps', 'step_timings', 'native_boundaries', 'stage_completion_windows')
         streams = {name: (window / (name + '.jsonl')).open('w') for name in names}
         counts = dict.fromkeys(names, 0)
         def write(name, row):
@@ -112,7 +112,20 @@ class CollectionRecorder(Recorder):
                         row = json.loads(line)
                         kind = row['event']
                         base = {k: row[k] for k in ('context', 'chunk', 'rank', 'seq', 'mono_ns')}
-                        if kind.startswith('request.'):
+                        if kind.startswith('native.'):
+                            data = row.get('data') or {}
+                            write('native_boundaries', {**base, 'kind': kind, **data})
+                            if kind in ('native.local_drain.ready', 'native.output_ready_observed') and row['context'] is not None:
+                                start = data.get('start_mono_ns')
+                                end = data.get('observed_mono_ns')
+                                write('stage_completion_windows', {**base, **data, 'kind': kind,
+                                    'start_mono_ns': start, 'end_mono_ns': end,
+                                    'observed_latency_ms': (end-start)/1e6 if start is not None and end is not None else None,
+                                    'time_kind': 'host_dispatch_to_native_completion_observed',
+                                    'device_queue_ns': None, 'device_elapsed_ns': None,
+                                    'valid_observation_window': start is not None and end is not None and end >= start,
+                                    'valid_pure_device_timing': False})
+                        elif kind.startswith('request.'):
                             write('requests', {**base, 'kind': kind, **row['data']})
                         elif kind == 'step.inputs':
                             write('step_inputs', {**base, **row['data']})
