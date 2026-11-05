@@ -202,6 +202,33 @@ def test_unknown_drain_source_fails_closed_for_observer_only(rig):
     assert rig.events[-1][0]=='native.boundary_unavailable'
 
 
+def test_real_build_class_installer_before_module_name_binding(rig,monkeypatch):
+    from sglang_simulator.hook import class_hook_entry as entry
+    from sglang_simulator.collector.vllm_hook.trace_collection_hooks import CombinedPPWaveHook
+    monkeypatch.setenv('SIM_TPU_NATIVE_BOUNDARIES','1')
+    # Re-execute the native module through the ACTUAL __build_class__ hook.
+    # Its PPWave attribute must not exist when install_for_class is called.
+    path=Path(rig.module.__file__)
+    source=path.read_text()
+    module=ModuleType(CombinedPPWaveHook.HOOK_MODULE_NAME)
+    module.__file__=str(path)
+    monkeypatch.setitem(sys.modules,module.__name__,module)
+    original_hooks=list(entry.CLASS_HOOKS)
+    original_builder=__import__('builtins').__build_class__
+    entry.CLASS_HOOKS[:]=[]
+    try:
+        entry.install_class_hooks([CombinedPPWaveHook])
+        exec(compile(source,str(path),'exec'),module.__dict__)
+        assert module._sim_native_boundaries is True
+        module.ACTIVE=trace.ACTIVE
+        wave=module.PPWave(0);s=active()
+        forward(wave,s)
+        assert any(e[0]=='native.local_drain.ready' and e[1]==s.context for e in rig.events)
+    finally:
+        entry.CLASS_HOOKS[:]=original_hooks
+        __import__('builtins').__build_class__=original_builder
+
+
 def test_internal_sync_get_output_captures_last_stage_without_extra_wait(rig, monkeypatch):
     monkeypatch.setenv('SIM_TPU_NATIVE_BOUNDARIES','1')
     class Output:

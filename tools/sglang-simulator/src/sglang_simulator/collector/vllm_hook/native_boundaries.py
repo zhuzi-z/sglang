@@ -64,7 +64,7 @@ def output_ready(wave, context):
     wave._sim_native_unfinished = None
 
 
-def install(module, sync_module, expected_digest=DRAIN_SHA256):
+def install(module, sync_module, expected_digest=DRAIN_SHA256, target=None):
     """Install once. Unknown native drain source disables this feature only."""
     if getattr(module, '_sim_native_boundaries', False):
         return True
@@ -76,7 +76,8 @@ def install(module, sync_module, expected_digest=DRAIN_SHA256):
         if digest != expected_digest:
             _emit('boundary_unavailable', reason='native_drain_source_mismatch', source_sha256=digest)
             return False
-    target = module.PPWave
+    # __build_class__ hooks run BEFORE the module binds its PPWave name.
+    target = target if target is not None else module.PPWave
     for name in ('start_forward', 'end_forward', '_launch_blocking', '_launch_async'):
         if not callable(getattr(target, name, None)):
             _emit('boundary_unavailable', reason='native_method_missing', method=name)
@@ -260,7 +261,7 @@ def install_for_class(target):
         return
     try:
         from torch_tpu._internal.sync import sync
-        install(sys.modules[target.__module__], sync)
+        install(sys.modules[target.__module__], sync, target=target)
     except Exception:
         _emit('boundary_unavailable', reason='observer_install_failed')
 
