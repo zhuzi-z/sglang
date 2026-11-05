@@ -264,6 +264,216 @@ class TestBuildKVCacheSpec:
         assert "model.layers.1" in spec
 
 
+class TestTPUV6dCompletionGuard:
+    """真实 Scheduler/MultiConnector 消费链，不把 chunk 作业确认当请求结束。"""
+
+    @pytest.fixture
+    def case(self):
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+        from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
+            C_TPUV6dObjectConnectorWorkerHook, install_tpu_v6d_completion_guard,
+        )
+
+        class Request:
+            request_id = "r"
+            client_index = 0
+            finished = False
+
+            def is_finished(self):
+                return self.finished
+
+        req = Request()
+        acked = []
+        v6d_type = type("TPUV6dObjectConnector", (), {
+            "__module__": "kvs_connector.v6d_object_connector",
+        })
+        raiden_type = type("TPURaidenConnector", (), {
+            "__module__": "vllm_torchtpu.distributed.kv_transfer.tpu_connector",
+        })
+        v6d = v6d_type()
+        v6d.delay = True
+        v6d.suppress = False
+        v6d.fail = False
+        v6d.request_finished_all_groups = lambda request, groups: (v6d.delay, None)
+
+        def native_update(output):
+            if v6d.fail:
+                raise RuntimeError("native V6D acknowledgement failed")
+            acked.append(set(output.finished_sending or ()))
+            if v6d.suppress:
+                output.finished_sending = None
+
+        v6d.update_connector_output = native_update
+        raiden = raiden_type()
+        raiden._sim_local_raiden = True
+        raiden.request_finished_all_groups = lambda *args: (False, None)
+        raiden.update_connector_output = lambda output: None
+        multi = object.__new__(MultiConnector)
+        multi._connectors = [raiden, v6d]
+        multi._all_support_hma = True
+        multi._requests_to_connector = {req.request_id: 1}
+        multi._extra_async_saves = {}
+        scheduler = object.__new__(Scheduler)
+        scheduler.connector = multi
+        scheduler.requests = {req.request_id: req}
+        scheduler._inflight_prefills = {req}
+        scheduler._connector_finished = lambda request: multi.request_finished_all_groups(request, ([1],) * 4)
+        scheduler.encoder_cache_manager = SimpleNamespace(free=MagicMock())
+        scheduler.ec_connector = None
+        scheduler.finished_req_ids = set()
+        scheduler.finished_req_ids_dict = None
+        scheduler.defer_block_free = False
+        scheduler.kv_cache_manager = SimpleNamespace(free=MagicMock())
+        scheduler.finished_recving_kv_req_ids = set()
+
+        class Worker:
+            def start_store_kv(self, meta):
+                raise AssertionError("real data-plane called")
+
+            def get_finished(self, finished_req_ids=None):
+                raise AssertionError("real data-plane called")
+
+        C_TPUV6dObjectConnectorWorkerHook.hook(Worker)
+        worker = Worker()
+
+        def output(sending=(), recving=()):
+            return SimpleNamespace(
+                finished_sending=set(sending), finished_recving=set(recving),
+                kv_connector_worker_meta=None,
+            )
+
+        def store_chunk():
+            worker.start_store_kv(SimpleNamespace(reqs_to_store={"r": {
+                group: (["key"], [group], [1]) for group in range(4)
+            }}))
+            sending, recving = worker.get_finished(set())
+            return output(sending, recving)
+
+        return SimpleNamespace(
+            scheduler=scheduler, req=req, connector=multi, v6d=v6d,
+            raiden=raiden, acked=acked, output=output, store=store_chunk,
+            install=lambda: install_tpu_v6d_completion_guard(scheduler),
+        )
+
+    def test_original_chunk_ack_crashes_but_guard_keeps_native_ack(self, case):
+        with pytest.raises(AssertionError):
+            case.scheduler._update_from_kv_xfer_finished(case.store())
+        assert "r" in case.scheduler.requests
+        case.acked.clear()
+        case.install()
+        # 多个中间 chunk 均可确认作业，但绝不能释放仍在 RUNNING 的请求。
+        for _ in range(15):
+            out = case.store()
+            case.scheduler._update_from_kv_xfer_finished(out)
+            assert not out.finished_sending
+            assert case.scheduler.requests["r"] is case.req
+        assert case.acked == [{"r"}] * 15
+        case.scheduler.kv_cache_manager.free.assert_not_called()
+
+    @pytest.mark.parametrize("finish_kind", ["length", "stop", "abort"])
+    def test_delayed_final_ack_releases_once_across_empty_steps(self, case, finish_kind):
+        case.install()
+        # PP 已投递输出，稍后结算；必须使用结算时的请求状态。
+        delayed_output = case.store()
+        case.req.finished = True
+        case.req.finish_kind = finish_kind
+        case.scheduler._free_request(case.req)
+        assert case.scheduler.finished_req_ids == {"r"}
+        case.scheduler.finished_req_ids.clear()  # finished_req_ids 仅为增量
+        for _ in range(3):
+            case.scheduler._update_from_kv_xfer_finished(case.output())
+        case.scheduler.kv_cache_manager.free.assert_not_called()
+        # 不要求再发一个 final store；此前的在途作业确认即可完成延迟释放。
+        case.scheduler._update_from_kv_xfer_finished(delayed_output)
+        case.scheduler.kv_cache_manager.free.assert_called_once_with(case.req)
+        assert not case.scheduler.requests
+        case.scheduler._update_from_kv_xfer_finished(case.output({"r"}))
+        assert not case.acked[-1]  # 重复回报不再进入原生发布/清理
+        case.scheduler.kv_cache_manager.free.assert_called_once()
+        assert not case.connector._extra_async_saves
+
+    def test_no_delay_does_not_invent_sending_obligation(self, case):
+        case.install()
+        case.scheduler._update_from_kv_xfer_finished(case.store())
+        case.v6d.delay = False
+        case.req.finished = True
+        case.scheduler._free_request(case.req)
+        case.scheduler.kv_cache_manager.free.assert_called_once_with(case.req)
+        case.scheduler._update_from_kv_xfer_finished(case.output({"r"}))
+        case.scheduler.kv_cache_manager.free.assert_called_once()
+
+    def test_terminal_status_alone_is_not_delay_free_permission(self, case):
+        case.install()
+        case.req.finished = True
+        # 例如请求仅因接收端收尾而保留；没有 V6D 发送侧 delay_free。
+        out = case.store()
+        case.scheduler._update_from_kv_xfer_finished(out)
+        assert case.acked == [{"r"}]
+        assert not out.finished_sending
+        case.scheduler.kv_cache_manager.free.assert_not_called()
+
+    def test_preempted_and_resumed_request_is_still_active(self, case):
+        case.install()
+        for status in ("PREEMPTED", "WAITING", "RUNNING"):
+            case.req.status = status
+            case.scheduler._update_from_kv_xfer_finished(case.store())
+        case.scheduler.kv_cache_manager.free.assert_not_called()
+        assert "r" in case.scheduler.requests
+
+    def test_native_suppression_and_receive_path_are_preserved(self, case):
+        from vllm.v1.request import RequestStatus
+
+        case.install()
+        case.req.finished = True
+        case.scheduler._free_request(case.req)
+        case.v6d.suppress = True
+        case.scheduler._update_from_kv_xfer_finished(case.store())
+        case.scheduler.kv_cache_manager.free.assert_not_called()
+        case.v6d.suppress = False
+        case.req.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        marker = object()
+        out = case.output(recving={"r"})
+        out.kv_connector_stats = marker
+        case.scheduler._update_from_kv_xfer_finished(out)
+        assert case.scheduler.finished_recving_kv_req_ids == {"r"}
+        assert out.kv_connector_stats is marker
+        case.req.status = RequestStatus.FINISHED_ABORTED
+        case.scheduler._update_from_kv_xfer_finished(case.store())
+        case.scheduler.kv_cache_manager.free.assert_called_once_with(case.req)
+
+    def test_native_failure_is_not_hidden_or_consumed(self, case):
+        case.install()
+        case.req.finished = True
+        case.scheduler._free_request(case.req)
+        case.v6d.fail = True
+        out = case.store()
+        with pytest.raises(RuntimeError, match="native V6D"):
+            case.scheduler._update_from_kv_xfer_finished(out)
+        assert out.finished_sending == {"r"}
+        case.v6d.fail = False
+        case.scheduler._update_from_kv_xfer_finished(out)
+        case.scheduler.kv_cache_manager.free.assert_called_once_with(case.req)
+
+    def test_unknown_or_multiple_sending_connectors_unchanged(self, case):
+        original = case.connector.update_connector_output
+        case.raiden._sim_local_raiden = False
+        case.install()
+        assert case.connector.update_connector_output is original
+        case.raiden._sim_local_raiden = True
+        case.connector._connectors.append(object())
+        case.install()
+        assert case.connector.update_connector_output is original
+
+    def test_guard_is_idempotent(self, case):
+        case.install()
+        installed = case.connector.update_connector_output
+        case.install()
+        assert case.connector.update_connector_output is installed
+        case.scheduler._update_from_kv_xfer_finished(case.store())
+        assert case.acked == [{"r"}]
+
+
 class TestTPUFrontendConnectorRegistry:
     """模拟独立进程注册表，覆盖前端初始化和原生统计重建路径。"""
 

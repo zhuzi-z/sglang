@@ -434,6 +434,10 @@ class C_VLLMEngineCoreHook(BaseHook):
             # before EngineCore constructs its Scheduler and connectors.
             _register_tpu_connector_names()
             original_init(self, vllm_config, *args, **kwargs)
+            from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
+                install_tpu_v6d_completion_guard,
+            )
+            install_tpu_v6d_completion_guard(self.scheduler)
 
             try:
                 model_config = vllm_config.model_config

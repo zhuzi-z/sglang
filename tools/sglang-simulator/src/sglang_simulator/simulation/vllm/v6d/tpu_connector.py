@@ -133,6 +133,81 @@ class C_TPURaidenConnectorHook(BaseHook):
         target._sim_local_raiden_hook = True
 
 
+def install_tpu_v6d_completion_guard(scheduler):
+    """在已结算的 scheduler 回调中区分保存作业确认和请求级释放许可。"""
+    if getattr(scheduler, "_sim_v6d_completion_guard", False):
+        return
+    connector = getattr(scheduler, "connector", None)
+    if connector is None:
+        return
+    children = getattr(connector, "_connectors", (connector,))
+    v6d_count = 0
+    for child in children:
+        child_type = type(child)
+        if (
+            child_type.__module__ == "kvs_connector.v6d_object_connector"
+            and child_type.__name__ == "TPUV6dObjectConnector"
+        ):
+            v6d_count += 1
+        elif (
+            child_type.__module__ == "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+            and child_type.__name__ == "TPURaidenConnector"
+            and getattr(child, "_sim_local_raiden", False)
+        ):
+            continue
+        else:
+            # 其他发送者有独立的 MultiConnector 完成计数，不能混用本适配。
+            return
+    if v6d_count != 1:
+        return
+
+    original_finished = scheduler._connector_finished
+    original_update = connector.update_connector_output
+    pending_release = set()
+
+    def request_finished(request):
+        # 以原生返回值为准；仅请求终结且确实延迟释放才形成发送义务。
+        result = original_finished(request)
+        if result[0]:
+            pending_release.add(request.request_id)
+        else:
+            pending_release.discard(request.request_id)
+        return result
+
+    def update_connector_output(output):
+        incoming = set(output.finished_sending or ())
+        live = incoming.intersection(scheduler.requests)
+        # 已经释放的请求不能再次进入原生发布/清理，也不能再次释放。
+        pending_release.difference_update(incoming - live)
+        output.finished_sending = live or None
+        try:
+            # 先确认作业：中间 chunk 的缓存发布、内部状态清理仍归原生 V6D。
+            original_update(output)
+        except Exception:
+            output.finished_sending = incoming or None
+            raise
+        # 此时已执行 update_from_output 的 token/终态更新，PP 早投递不会
+        # 把 dispatch 时的状态误当成结算状态。不能用当步 finished_req_ids
+        # 代替此处跨步保存的发送义务（它只是增量集合）。
+        completed = {
+            rid for rid in (output.finished_sending or ())
+            if rid in pending_release
+            and rid in scheduler.requests
+            and scheduler.requests[rid].is_finished()
+        }
+        pending_release.difference_update(completed)
+        output.finished_sending = completed or None
+        # 不改变 finished_recving、worker metadata 或统计，不自行 free blocks。
+
+    scheduler._connector_finished = request_finished
+    connector.update_connector_output = update_connector_output
+    scheduler._sim_v6d_completion_guard = True
+    logger.info(
+        "[V6D CPU] scheduler completion guard enabled: intermediate store acknowledgements "
+        "do not release requests; final releases follow native delay_free"
+    )
+
+
 class _TPUConnectorWorkerCPUHook(BaseHook):
     """Shared lifecycle implementation for TPU v6d and Raiden workers."""
 
