@@ -264,6 +264,227 @@ class TestBuildKVCacheSpec:
         assert "model.layers.1" in spec
 
 
+class TestTPURaidenLocalCompletion:
+    """覆盖四组断言、原生 MultiConnector 聚合和 Scheduler 延迟释放。"""
+
+    @pytest.fixture
+    def raiden_case(self, monkeypatch):
+        from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
+            C_TPURaidenConnectorHook,
+        )
+
+        class Metadata:
+            def __init__(self):
+                self.reqs_to_send = {}
+                self.reqs_to_load = {}
+
+        module = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+        monkeypatch.setitem(sys.modules, module, SimpleNamespace(TPUConnectorMetadata=Metadata))
+
+        class NativeConnector:
+            def __init__(self, config, role, cache):
+                self.calls = []
+                self.connector_scheduler = SimpleNamespace(reqs_to_send={}, reqs_to_load={})
+
+            def on_new_request(self, req):
+                self.calls.append("admit")
+                req.prompt_token_ids.pop()  # 模拟 stage3 的末 token 截断
+
+            def get_num_new_matched_tokens(self, req, computed):
+                self.calls.append("match")
+                return 8, True
+
+            def update_state_after_alloc(self, req, blocks, external):
+                self.calls.append("alloc")
+                self.connector_scheduler.reqs_to_load[req.request_id] = blocks
+
+            def build_connector_meta(self, output):
+                self.calls.append("meta")
+                return "native-meta"
+
+            def request_finished(self, req, blocks):
+                self.calls.append("finish")
+                self.connector_scheduler.reqs_to_send[req.request_id] = blocks
+                return True, {"remote_block_ids": blocks}
+
+            def request_finished_all_groups(self, req, blocks):
+                assert len(blocks) == 1, "Non-HMA TPUConnector expects a single kv-cache group"
+                return self.request_finished(req, blocks[0])
+
+        class Raiden(NativeConnector):
+            pass
+
+        C_TPURaidenConnectorHook.hook(Raiden)
+        C_TPURaidenConnectorHook.hook(Raiden)  # 重复安装不能二次包裹
+        config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1, pipeline_parallel_size=1,
+                prefill_context_parallel_size=1, decode_context_parallel_size=1,
+                data_parallel_size=1, nnodes=1,
+            ),
+        )
+        cache = SimpleNamespace(kv_cache_groups=[object() for _ in range(4)])
+
+        class Request:
+            request_id = "r"
+            client_index = 0
+            kv_transfer_params = None
+            num_computed_tokens = 62
+            status = "FINISHED_LENGTH_CAPPED"
+
+            def __init__(self):
+                self.prompt_token_ids = list(range(62))
+
+            def is_finished(self):
+                return True
+
+        return Raiden, NativeConnector, config, cache, Request()
+
+    @pytest.mark.parametrize("transport", ["zmq", "raiden"])
+    @pytest.mark.parametrize("tokens", [62, 3072, 6144])
+    def test_multigroup_finish_never_publishes_real_handoff(self, raiden_case, monkeypatch, transport, tokens):
+        Raiden, Native, config, cache, req = raiden_case
+        monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", transport)
+        req.num_computed_tokens = tokens
+        groups = ([11], [], [22], [33, 34])
+        native = Native(config, None, cache)
+        with pytest.raises(AssertionError, match="Non-HMA"):
+            native.request_finished_all_groups(req, groups)
+        connector = Raiden(config, None, cache)
+        prompt = req.prompt_token_ids.copy()
+        connector.on_new_request(req)
+        assert req.prompt_token_ids == prompt
+        assert connector.get_num_new_matched_tokens(req, 0) == (0, False)
+        connector.update_state_after_alloc(req, groups, 0)
+        for status in ("FINISHED_LENGTH_CAPPED", "FINISHED_STOPPED", "FINISHED_ABORTED"):
+            req.status = status
+            for _ in range(2):
+                assert connector.request_finished_all_groups(req, groups) == (False, None)
+        assert connector.request_finished(req, groups[0]) == (False, None)
+        for _ in range(2):
+            metadata = connector.build_connector_meta(None)
+            assert metadata.reqs_to_send == metadata.reqs_to_load == {}
+        assert connector.connector_scheduler.reqs_to_send == {}
+        assert connector.connector_scheduler.reqs_to_load == {}
+        assert connector.calls == []
+        assert groups == ([11], [], [22], [33, 34])
+
+    @pytest.mark.parametrize("role,group_count", [("kv_consumer", 4), ("kv_both", 4), ("kv_producer", 1)])
+    def test_other_routes_keep_native_contract(self, raiden_case, role, group_count):
+        Raiden, _, config, cache, req = raiden_case
+        config.kv_transfer_config.kv_role = role
+        cache.kv_cache_groups = cache.kv_cache_groups[:group_count]
+        connector = Raiden(config, None, cache)
+        connector.on_new_request(req)
+        assert len(req.prompt_token_ids) == 61
+        assert connector.get_num_new_matched_tokens(req, 0) == (8, True)
+        connector.update_state_after_alloc(req, ([1],), 8)
+        assert connector.build_connector_meta(None) == "native-meta"
+        assert connector.request_finished_all_groups(req, ([1],)) == (True, {"remote_block_ids": [1]})
+        assert connector.calls == ["admit", "match", "alloc", "meta", "finish"]
+
+    @pytest.mark.parametrize("params", [
+        {"do_remote_decode": True}, {"do_remote_prefill": True},
+        {"src_controller_address": "test-controller"}, {"uuid": 1}, "invalid",
+    ])
+    def test_explicit_remote_requests_fail_closed(self, raiden_case, params):
+        Raiden, _, config, cache, req = raiden_case
+        connector = Raiden(config, None, cache)
+        req.kv_transfer_params = params
+        with pytest.raises(ValueError, match="Local Raiden simulation"):
+            connector.on_new_request(req)
+        assert connector.calls == []
+
+    def test_bad_group_count_or_remote_allocation_is_not_hidden(self, raiden_case):
+        Raiden, _, config, cache, req = raiden_case
+        connector = Raiden(config, None, cache)
+        with pytest.raises(ValueError, match="KV group count mismatch"):
+            connector.request_finished_all_groups(req, ([1],))
+        with pytest.raises(ValueError, match="cannot load remote"):
+            connector.update_state_after_alloc(req, ([1],) * 4, 1)
+
+    @pytest.mark.parametrize("dimension", ["tensor_parallel_size", "pipeline_parallel_size", "prefill_context_parallel_size", "nnodes"])
+    def test_physical_distributed_execution_is_not_silently_stubbed(self, raiden_case, dimension):
+        Raiden, _, config, cache, _ = raiden_case
+        setattr(config.parallel_config, dimension, 2)
+        with pytest.raises(ValueError, match="single-worker topology"):
+            Raiden(config, None, cache)
+
+    @pytest.mark.parametrize("v6d_delays", [False, True])
+    def test_native_aggregation_preserves_v6d_and_scheduler_free(self, raiden_case, v6d_delays):
+        from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        Raiden, _, config, cache, req = raiden_case
+        connector = Raiden(config, None, cache)
+        groups = ([11], [], [22], [33, 34])
+        sibling = SimpleNamespace(
+            request_finished_all_groups=MagicMock(return_value=(v6d_delays, {"v6d": "kept"})),
+        )
+        multi = object.__new__(MultiConnector)
+        multi._connectors = [connector, sibling]
+        multi._all_support_hma = True
+        multi._requests_to_connector = {req.request_id: 1}
+        multi._extra_async_saves = {}
+        scheduler = object.__new__(Scheduler)
+        scheduler._inflight_prefills = set()
+        scheduler._connector_finished = lambda request: multi.request_finished_all_groups(request, groups)
+        scheduler.ec_connector = None
+        scheduler.encoder_cache_manager = SimpleNamespace(free=MagicMock())
+        scheduler.finished_req_ids = set()
+        scheduler.finished_req_ids_dict = None
+        scheduler._free_blocks = MagicMock()
+
+        assert scheduler._free_request(req) == ({"v6d": "kept"}, None)
+        sibling.request_finished_all_groups.assert_called_once_with(req, groups)
+        assert sibling.request_finished_all_groups.call_args.args[1] is groups
+        assert multi._requests_to_connector == multi._extra_async_saves == {}
+        assert scheduler.finished_req_ids == {req.request_id}
+        if v6d_delays:
+            scheduler._free_blocks.assert_not_called()
+        else:
+            scheduler._free_blocks.assert_called_once_with(req)
+        assert connector.connector_scheduler.reqs_to_send == {}
+
+    def test_native_multi_still_selects_v6d_for_remote_cache_hits(self, raiden_case):
+        from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+
+        Raiden, _, config, cache, req = raiden_case
+        connector = Raiden(config, None, cache)
+        v6d_meta = SimpleNamespace(reqs_to_load={req.request_id: {3: (["key"], [33])}})
+        sibling = SimpleNamespace(
+            on_new_request=MagicMock(),
+            get_num_new_matched_tokens=MagicMock(return_value=(3072, True)),
+            update_state_after_alloc=MagicMock(),
+            build_connector_meta=MagicMock(return_value=v6d_meta),
+        )
+        multi = object.__new__(MultiConnector)
+        multi._connectors = [connector, sibling]
+        multi._requests_to_connector = {}
+        multi._extra_async_saves = {}
+        multi.on_new_request(req)
+        assert multi.get_num_new_matched_tokens(req, 0) == (3072, True)
+        assert multi._requests_to_connector == {req.request_id: 1}
+        blocks = object()
+        multi.update_state_after_alloc(req, blocks, 3072)
+        sibling.update_state_after_alloc.assert_called_once_with(req, blocks, 3072)
+        meta = multi.build_connector_meta(None)
+        assert meta.metadata[0].reqs_to_send == meta.metadata[0].reqs_to_load == {}
+        assert meta.metadata[1] is v6d_meta
+        assert connector.calls == []
+
+    def test_scheduler_hook_is_registered(self):
+        from sglang_simulator.simulation.vllm.v6d.hooks import register_v6d_hooks
+        from sglang_simulator.simulation.vllm.v6d.tpu_connector import C_TPURaidenConnectorHook
+
+        hooks = []
+        register_v6d_hooks(hooks)
+        assert hooks.count(C_TPURaidenConnectorHook) == 1
+        assert C_TPURaidenConnectorHook.HOOK_CLASS_NAME == "TPURaidenConnector"
+        assert C_TPURaidenConnectorHook.HOOK_MODULE_NAME == "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+
+
 class TestTPUPooledKVGeometry:
     """以混合 spec 实际消费链覆盖页不足，不再传空 specs 绕过校验。"""
 
