@@ -264,6 +264,255 @@ class TestBuildKVCacheSpec:
         assert "model.layers.1" in spec
 
 
+class TestTPUV6dJobProtocol:
+    """依赖目标 kvs_connector；复用其原生 metadata、完成判据及发布逻辑。"""
+
+    @pytest.fixture
+    def native_jobs(self):
+        from collections import defaultdict
+        from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
+            C_TPUV6dObjectConnectorWorkerHook,
+        )
+
+        native = pytest.importorskip("kvs_connector.v6d_object_connector")
+        if "store_job_ids" not in native.V6dObjectConnectorMetadata.__dataclass_fields__:
+            pytest.skip("需要提供 store_job_ids/store_waits 的目标 kvs_connector 版本")
+
+        class Worker(native.V6dObjectConnectorWorker):
+            pass
+
+        C_TPUV6dObjectConnectorWorkerHook.hook(Worker)
+        installed = Worker.get_finished
+        C_TPUV6dObjectConnectorWorkerHook.hook(Worker)
+        assert Worker.get_finished is installed
+
+        def make_worker(rank=0):
+            worker = object.__new__(Worker)
+            worker._num_groups = 4
+            worker._worker_rank = rank
+            worker._node_id = 0
+            worker._load_handler = worker._store_handler = None
+            worker._worker_meta = native.V6dWorkerMetadata()
+            worker._pending_jobs = {}
+            worker._saving_req_jobs = defaultdict(set)
+            worker._loading_req_jobs = defaultdict(set)
+            worker._finished_reqs_waiting_for_store = set()
+            return worker
+
+        def metadata(job=0, request="r", mask=1, empty=False):
+            return native.V6dObjectConnectorMetadata(
+                num_groups=4,
+                reqs_to_store={request: {} if empty else {
+                    group: ([f"key-{group}"], [group + 1], [mask]) for group in range(4)
+                }},
+                store_job_ids={request: job},
+            )
+
+        def make_scheduler(ranks=(0,), jobs=(0,)):
+            scheduler = object.__new__(native.V6dObjectConnectorScheduler)
+            scheduler._store_ranks = set(ranks)
+            scheduler._store_jobs = {
+                job: native._V6dStoreJob("r", {0: [f"hash-{job}"]}, [f"pin-{job}"])
+                for job in jobs
+            }
+            scheduler._request_states = {"r": native.V6dRequestState(
+                request=object(), pending_store_jobs=set(jobs),
+            )}
+            scheduler._store_waits = set()
+            scheduler._publications = {}
+            scheduler._publication_executor = None
+            scheduler._block_pool = SimpleNamespace(free_blocks=MagicMock())
+            scheduler._stats = MagicMock()
+            scheduler.managers = {0: SimpleNamespace(
+                seal=MagicMock(return_value=True), discard_pending=MagicMock(),
+                _pending_objs={}, _publishing_hashes=set(),
+            )}
+            return scheduler
+
+        def output(meta, sending=()):
+            return SimpleNamespace(kv_connector_worker_meta=meta,
+                                   finished_sending=set(sending), finished_recving=set())
+
+        return SimpleNamespace(module=native, worker=make_worker, metadata=metadata,
+                               scheduler=make_scheduler, output=output)
+
+    @pytest.mark.parametrize("empty,mask", [(False, 1), (False, 0), (True, 0)])
+    def test_intermediate_jobs_publish_without_request_terminal(self, native_jobs, empty, mask):
+        case = native_jobs
+        worker = case.worker()
+        scheduler = case.scheduler(jobs=range(15))
+        for job in range(15):
+            meta = case.metadata(job=job, empty=empty, mask=mask)
+            worker.start_load_kv(meta)
+            worker.start_store_kv(meta)
+            # 即便核心 finished_req_ids 含此 ID，也不能代替 store_waits 的许可。
+            assert worker.get_finished({"r"}) == (set(), set())
+            assert worker.has_pending_push_work()
+            result = worker.build_connector_worker_meta()
+            assert result.store_results == {job: {0: None}}
+            scheduler.update_connector_output(case.output(result))
+            assert not worker.has_pending_push_work()
+            assert worker.build_connector_worker_meta() is None
+        assert not scheduler._store_jobs
+        assert not scheduler._request_states["r"].pending_store_jobs
+        assert scheduler.managers[0].seal.call_count == 15
+        assert scheduler._block_pool.free_blocks.call_count == 15
+
+    def test_all_ranks_and_duplicate_reports_use_native_publication_gate(self, native_jobs):
+        case = native_jobs
+        scheduler = case.scheduler(ranks=(0, 1))
+        results = []
+        for rank in (0, 1):
+            worker = case.worker(rank)
+            worker.start_store_kv(case.metadata(mask=0))
+            results.append(worker.build_connector_worker_meta())
+        scheduler.update_connector_output(case.output(results[0]))
+        scheduler.update_connector_output(case.output(results[0]))
+        assert len(scheduler._store_jobs) == 1
+        scheduler.managers[0].seal.assert_not_called()
+        combined = results[0].aggregate(results[1])
+        scheduler.update_connector_output(case.output(combined))
+        scheduler.update_connector_output(case.output(combined))
+        scheduler.managers[0].seal.assert_called_once_with(["hash-0"], request_id="r")
+        scheduler._block_pool.free_blocks.assert_called_once_with(["pin-0"])
+        assert not scheduler._store_jobs
+
+    def test_wait_only_step_follows_native_delay_free_and_drains_once(self, native_jobs):
+        case = native_jobs
+        worker = case.worker()
+        scheduler = case.scheduler(jobs=(0, 1))
+        snapshots = []
+        for job in (0, 1):
+            worker.start_store_kv(case.metadata(job))
+            assert worker.get_finished(set()) == (set(), set())
+            snapshots.append(worker.build_connector_worker_meta())
+        # 两个已投递的 PP 输出必须独立，下一步换对象不破坏前一步的确认。
+        assert snapshots[0] is not snapshots[1]
+        assert snapshots[0].store_results == {0: {0: None}}
+        assert snapshots[1].store_results == {1: {0: None}}
+        assert scheduler.request_finished_all_groups(SimpleNamespace(request_id="r"), ()) == (True, None)
+        wait_meta = case.module.V6dObjectConnectorMetadata(num_groups=4, store_waits=scheduler._store_waits)
+        scheduler._store_waits = set()
+        worker.start_load_kv(wait_meta)
+        worker.start_store_kv(wait_meta)  # 没有新 store，仍须处理最终等待
+        for result in snapshots:
+            scheduler.update_connector_output(case.output(result))
+        assert worker.get_finished(set()) == ({"r"}, set())
+        assert worker.get_finished(set()) == (set(), set())
+        assert not scheduler._store_jobs
+        assert not scheduler._request_states
+        assert not worker.has_pending_push_work()
+
+    def test_preemption_does_not_drop_job_ack_or_create_terminal(self, native_jobs):
+        case = native_jobs
+        worker = case.worker()
+        worker.start_store_kv(case.metadata())
+        worker.handle_preemptions(case.module.V6dObjectConnectorMetadata(
+            num_groups=4, preempted_req_ids={"r"},
+        ))
+        worker.start_store_kv(case.metadata(1))
+        assert worker.get_finished(set()) == (set(), set())
+        assert worker.build_connector_worker_meta().store_results == {0: {0: None}, 1: {0: None}}
+
+    def test_receive_completion_remains_independent(self, native_jobs):
+        case = native_jobs
+        worker = case.worker()
+        meta = case.metadata()
+        meta.reqs_to_load = {"load": {0: (["hit"], [2])}, "empty": {0: ([], [])}}
+        worker.start_load_kv(meta)
+        worker.start_store_kv(meta)
+        assert worker.get_finished(set()) == (set(), {"load"})
+        assert worker.get_finished(set()) == (set(), set())
+        assert worker.build_connector_worker_meta().store_results == {0: {0: None}}
+
+    def test_async_publication_keeps_objects_until_actual_seal(self, native_jobs):
+        from concurrent.futures import Future
+
+        case = native_jobs
+        scheduler = case.scheduler()
+        scheduled = []
+
+        class Executor:
+            def submit(self, fn, *args):
+                future = Future()
+                scheduled.append((future, fn, args))
+                return future
+
+        obj = SimpleNamespace(seal=MagicMock(), discard=MagicMock())
+        scheduler.managers[0]._pending_objs = {"hash-0": obj}
+        scheduler._publication_executor = Executor()
+        scheduler._shutdown = False
+        scheduler._max_pending_publications = 8
+        worker = case.worker()
+        worker.start_store_kv(case.metadata())
+        scheduler.update_connector_output(case.output(worker.build_connector_worker_meta()))
+        assert not scheduler._store_jobs
+        assert len(scheduler._publications) == 1
+        obj.seal.assert_not_called()
+        future, fn, args = scheduled[0]
+        future.set_result(fn(*args))
+        scheduler._drain_publications()
+        obj.seal.assert_called_once_with(request_id="r")
+        assert not scheduler._publications
+        assert not scheduler.managers[0]._publishing_hashes
+
+    def test_multi_connector_guard_preserves_job_metadata_before_final_free(self, native_jobs):
+        from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+            MultiConnector, MultiKVConnectorWorkerMetadata,
+        )
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from sglang_simulator.simulation.vllm.v6d.tpu_connector import install_tpu_v6d_completion_guard
+
+        case = native_jobs
+        worker = case.worker()
+        native_scheduler = case.scheduler()
+        child = object.__new__(case.module.TPUV6dObjectConnector)
+        child._role = case.module.KVConnectorRole.SCHEDULER
+        child.scheduler = native_scheduler
+        multi = object.__new__(MultiConnector)
+        multi._connectors = [child]
+        multi._all_support_hma = True
+        multi._requests_to_connector = {}
+        multi._extra_async_saves = {}
+        req = SimpleNamespace(request_id="r", is_finished=lambda: True)
+        core_scheduler = object.__new__(Scheduler)
+        core_scheduler.connector = multi
+        core_scheduler.requests = {"r": req}
+        core_scheduler._connector_finished = lambda request: multi.request_finished_all_groups(request, ())
+        core_scheduler._free_blocks = MagicMock()
+        install_tpu_v6d_completion_guard(core_scheduler)
+        worker.start_store_kv(case.metadata())
+        result = worker.build_connector_worker_meta()
+        assert core_scheduler._connector_finished(req) == (True, None)
+        worker.start_load_kv(case.module.V6dObjectConnectorMetadata(
+            num_groups=4, store_waits={"r"},
+        ))
+        sent, received = worker.get_finished(set())
+        packet = MultiKVConnectorWorkerMetadata(metadata=(result,))
+        out = case.output(packet, sent)
+        out.finished_recving = received
+        core_scheduler._update_from_kv_xfer_finished(out)
+        assert out.kv_connector_worker_meta is packet
+        native_scheduler.managers[0].seal.assert_called_once_with(["hash-0"], request_id="r")
+        assert not native_scheduler._store_jobs
+        core_scheduler._free_blocks.assert_called_once_with(req)
+
+    @pytest.mark.parametrize("bad", ["missing_job", "group_count", "length", "nan"])
+    def test_malformed_metadata_does_not_ack_success(self, native_jobs, bad):
+        case = native_jobs
+        worker = case.worker()
+        meta = case.metadata()
+        if bad == "missing_job":
+            meta.store_job_ids.clear()
+        elif bad == "group_count":
+            meta.num_groups = 1
+        elif bad == "length":
+            meta.reqs_to_store["r"][0] = (["key"], [], [1])
+        with pytest.raises(ValueError):
+            worker.start_store_kv(meta, nan_check=object() if bad == "nan" else None)
+        assert worker.build_connector_worker_meta() is None
+
+
 class TestTPUV6dCompletionGuard:
     """真实 Scheduler/MultiConnector 消费链，不把 chunk 作业确认当请求结束。"""
 

@@ -311,6 +311,89 @@ class C_TPUV6dObjectConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
     HOOK_MODULE_NAME = "kvs_connector.v6d_object_connector"
     HOOK_CLASS_NAME = "V6dObjectConnectorWorker"
 
+    @classmethod
+    def hook(cls, target):
+        if target.__dict__.get("_sim_v6d_job_protocol", False):
+            return
+        original_get_finished = target.get_finished
+        original_build_meta = getattr(target, "build_connector_worker_meta", None)
+        super().hook(target)
+        if original_build_meta is None:
+            # 旧的请求级协议继续使用既有 adapter，不给 Raiden 改协议。
+            return
+        cpu_load = target.start_load_kv
+
+        def validate(self, metadata):
+            if not hasattr(metadata, "store_job_ids") or not hasattr(metadata, "store_waits"):
+                raise ValueError("TPU V6D job protocol requires store_job_ids and store_waits")
+            if metadata.num_groups != self._num_groups:
+                raise ValueError("TPU V6D metadata/worker KV group count mismatch")
+            if self._load_handler is not None or self._store_handler is not None:
+                raise RuntimeError("TPU V6D CPU job adapter requires disabled DMA handlers")
+            if self._pending_jobs or self._saving_req_jobs or self._loading_req_jobs:
+                raise RuntimeError("TPU V6D CPU job adapter found unexpected native DMA jobs")
+
+        def start_load(self, metadata):
+            validate(self, metadata)
+            cpu_load(self, metadata)
+            # 这是原生 scheduler 明确承诺 delay_free 的增量集合，可能只有
+            # wait 而没有新 store/load；不能拿 finished_req_ids 代替它。
+            self._finished_reqs_waiting_for_store.update(metadata.store_waits)
+
+        def start_store(self, metadata, nan_check=None):
+            validate(self, metadata)
+            if nan_check is not None:
+                raise ValueError("TPU V6D CPU simulation cannot validate real NaN snapshots")
+            stores = metadata.reqs_to_store
+            if set(stores) != set(metadata.store_job_ids):
+                raise ValueError("TPU V6D store_job_ids must match reqs_to_store")
+            results = {}
+            for req_id, groups in stores.items():
+                job_id = metadata.store_job_ids[req_id]
+                if not isinstance(job_id, int) or isinstance(job_id, bool) or job_id < 0:
+                    raise ValueError("TPU V6D store job ID must be a non-negative integer")
+                for keys, blocks, masks in groups.values():
+                    if not len(keys) == len(blocks) == len(masks):
+                        raise ValueError("TPU V6D store keys/blocks/node masks length mismatch")
+                # 仅模拟 DMA 成功；每个物理 rank 都要确认，即使本节点没有
+                # mask 选中的数据。保留 scheduler 的 job ID，不按 req_id 合并。
+                ranks = self._worker_meta.store_results.get(job_id, {})
+                if self._worker_rank in ranks and ranks[self._worker_rank] is not None:
+                    raise ValueError("Conflicting TPU V6D store result")
+                results[job_id] = {**ranks, self._worker_rank: None}
+            self._worker_meta.store_results.update(results)
+            # 不 seal，不清 scheduler._store_jobs，也不发请求级 finished_sending。
+            # 原生 scheduler 收齐 store_results 后发布对象并释放作业保护块。
+
+        def get_finished(self, finished_req_ids=None):
+            cls._ensure_state(self)
+            # 原生实现仅在 store_waits 已登记且没有未完成 DMA 时返回发送终态。
+            # handler 为 None，不会访问 TPU；builder 稍后独立导出作业确认。
+            sent, received = original_get_finished(self, finished_req_ids or set())
+            received = set(received or ()) | self._sim_tpu_load_done
+            self._sim_tpu_load_done.clear()
+            return sent, received
+
+        def has_pending_push_work(self):
+            cls._ensure_state(self)
+            return bool(
+                self._sim_tpu_load_done or self._finished_reqs_waiting_for_store
+                or self._worker_meta.store_results or self._worker_meta.failed_loads
+            )
+
+        target.start_load_kv = start_load
+        target.start_store_kv = start_store
+        target.get_finished = get_finished
+        target.has_pending_push_work = has_pending_push_work
+        # 不重写原生 builder：保持 V6dWorkerMetadata 类型、聚合和换对象语义，
+        # 已投递的 PP 输出不能被下一步清空。
+        target.build_connector_worker_meta = original_build_meta
+        target._sim_v6d_job_protocol = True
+        logger.info(
+            "[V6D CPU] job-result protocol enabled: store_results by job/rank; "
+            "request terminals follow store_waits"
+        )
+
 
 class C_TPURaidenConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
     HOOK_MODULE_NAME = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
