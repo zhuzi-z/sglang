@@ -36,7 +36,9 @@ class CollectionRecorder(Recorder):
                 'hardware_profiler': False, 'exported_windows': self.exported,
                 'byte_limit_scope': 'per_segment',
                 'host_clock': self.host_clock,
-                'device_time_available': False}
+                'device_time_available': False,
+                'stage_collection_contract': 1 if self.focus_stage else None,
+                'service_label_available': False}
 
     def export_cut(self, export_id=None, is_start=True, timeout=30):
         """Cut by process sequence; start is asynchronous, stop waits for disk.
@@ -98,6 +100,9 @@ class CollectionRecorder(Recorder):
 
     def _tables(self, window):
         """Streaming export; no full-run accumulation in serving memory."""
+        if self.focus_stage:
+            from .stage_collection import export_tables
+            return export_tables(window)
         if self.focus_pp0:
             from .pp0_steps import export_tables
             return export_tables(window)

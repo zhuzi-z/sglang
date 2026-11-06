@@ -19,10 +19,38 @@ _WAVE = ContextVar('sim_native_boundary_wave', default=None)
 OUTPUT_WAVE = ContextVar('sim_native_boundary_output_wave', default=None)
 
 
+def payload_metadata(carried):
+    widths = {'torch.bfloat16':2, 'torch.float16':2, 'torch.float32':4,
+              'torch.float64':8, 'torch.int8':1, 'torch.uint8':1, 'torch.bool':1,
+              'torch.int16':2, 'torch.int32':4, 'torch.int64':8,
+              'torch.float8_e4m3fn':1, 'torch.float8_e5m2':1}
+    tensors, total = [], 0
+    for tensor in carried:
+        shape, dtype = getattr(tensor, 'shape', None), getattr(tensor, 'dtype', None)
+        if shape is None or dtype is None:
+            return {'available':False, 'payload_bytes':None, 'tensors':[]}
+        shape, dtype = tuple(int(v) for v in shape), str(dtype)
+        count = 1
+        for v in shape: count *= v
+        size = widths.get(dtype)
+        tensors.append({'shape':shape, 'dtype':dtype, 'bytes':count*size if size else None})
+        if size is None: total = None
+        elif total is not None: total += count*size
+    return {'available':bool(tensors) and total is not None,
+            'payload_bytes':total if tensors else None, 'tensors':tensors}
+
+
 def _emit(kind, item=None, **data):
-    if item is None and kind not in ('boundary_installed', 'boundary_unavailable'):
-        return None
     recorder = trace._RECORDER
+    stage_focus = getattr(recorder, 'focus_stage', False)
+    if item is None and kind not in ('boundary_installed', 'boundary_unavailable'):
+        from .stage_collection import PROTOCOL_KINDS
+        if not stage_focus or kind not in PROTOCOL_KINDS or data.get('launch_id') is None or not data.get('protocol_active'):
+            return None
+    if stage_focus:
+        from .stage_collection import keep_event
+        if not keep_event('native.' + kind, recorder.identity):
+            return None
     if getattr(recorder, "focus_pp0", False):
         from .pp0_steps import keep_event
         if not keep_event("native." + kind, recorder.identity):
@@ -193,6 +221,25 @@ def install(module, sync_module, expected_digest=DRAIN_SHA256, target=None):
         self._sim_native_launch_id = getattr(self, '_sim_native_launch_id', 0) + 1
         task = {'launch_id': self._sim_native_launch_id,
                 'drain_enabled': bool(self.drain_before_handoff)}
+        if getattr(trace._RECORDER, 'focus_stage', False) and getattr(self, '_sim_stage_protocol_active', False):
+            try:
+                task.update(protocol_active=True, protocol_session=getattr(self, '_sim_protocol_session', None))
+                burst = getattr(self, 'bursts', None)
+                if getattr(self, '_sim_protocol_burst', object()) != burst:
+                    self._sim_protocol_burst, self._sim_protocol_ordinal = burst, 0
+                ordinal = self._sim_protocol_ordinal
+                self._sim_protocol_ordinal += 1
+                task.update(burst_id=burst, launch_ordinal=ordinal,
+                            carried_real_context=item is not None)
+                payload = payload_metadata(carried)
+                task['payload_bytes'] = payload['payload_bytes']
+                signature = tuple((tuple(t['shape']), t['dtype']) for t in payload['tensors'])
+                if payload['available'] and signature != getattr(self, '_sim_payload_signature', None):
+                    self._sim_payload_signature = signature
+                    _emit('payload_metadata', item, **task, payload_tensors=payload['tensors'])
+            except Exception:
+                if trace._RECORDER is not None:
+                    trace._RECORDER.observer_errors += 1
         token = _SYNC.set(('handoff', item, task))
         try:
             result = native_launch(self, carried)
@@ -228,6 +275,13 @@ def install(module, sync_module, expected_digest=DRAIN_SHA256, target=None):
     def start_forward(self, *args, **kwargs):
         # Existing V2 wrapper increments chunk inside this call. Any drain in
         # the native start still consumes _unfinished from the PREVIOUS chunk.
+        if getattr(trace._RECORDER, 'focus_stage', False):
+            scope = trace.ACTIVE.get()
+            if scope is not None and scope.context[3] == 'real':
+                # Initial compiler/warmup handoffs stay silent. A real step's
+                # prologue and subsequent zero pushes remain observable.
+                self._sim_stage_protocol_active = True
+                self._sim_protocol_session = scope.context[:2]
         value = start(self, *args, **kwargs)
         item = _item(trace.ACTIVE.get())
         self._sim_native_current = item

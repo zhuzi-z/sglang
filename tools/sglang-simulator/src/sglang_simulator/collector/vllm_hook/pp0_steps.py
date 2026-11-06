@@ -22,7 +22,7 @@ def keep_event(kind, identity):
     return False
 
 
-def observe_result(stepper):
+def observe_result(stepper, event_kind='pp0.result_ready'):
     """Attach AFTER native dispatch; inspect only a future that is already done.
 
     _sampled fires for set_exception too, so its callback alone cannot prove a
@@ -42,7 +42,7 @@ def observe_result(stepper):
                 return
             failure = future.exception()
             success = failure is None and future.result() is not None
-            trace.emit('pp0.result_ready', trace.Scope(context), data={
+            trace.emit(event_kind, trace.Scope(context), data={
                 'observed_mono_ns': stamp, 'success': success,
                 'error_type': type(failure).__name__ if failure else None,
                 'time_kind': 'host_successful_sample_future_observed'})

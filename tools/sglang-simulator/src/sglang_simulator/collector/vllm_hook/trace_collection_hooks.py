@@ -141,6 +141,30 @@ class CollectionWorkerHook(BaseHook):
         @wraps(execute)
         def wrapped_execute(self, *args, **kwargs):
             scope = trace.ACTIVE.get()
+            rec = trace._RECORDER
+            if (getattr(rec, 'focus_stage', False) and rec.identity[4] == 0
+                    and not getattr(self, '_sim_stage_config_recorded', False)):
+                def config_snapshot():
+                    cfg = getattr(self, 'vllm_config', None)
+                    model = getattr(cfg, 'model_config', None)
+                    parallel = getattr(cfg, 'parallel_config', None)
+                    runner = getattr(self, 'model_runner', None)
+                    trace.emit('stage.config', scope, data={
+                        'model': str(getattr(model, 'model', 'unknown')),
+                        'dtype': str(getattr(model, 'dtype', 'unknown')),
+                        'quantization': getattr(model, 'quantization', None),
+                        'pp_size': getattr(parallel, 'pipeline_parallel_size', None),
+                        'pcp_size': getattr(parallel, 'prefill_context_parallel_size', None),
+                        'tp_size': getattr(parallel, 'tensor_parallel_size', None),
+                        'layer_partition': os.getenv('VLLM_PP_LAYER_PARTITION'),
+                        'async_handoff': os.getenv('TPU_PP_ASYNC_HANDOFF'),
+                        'lazy_push': os.getenv('TPU_PP_LAZY_PUSH'),
+                        'max_num_tokens': cpu_int(getattr(runner, 'max_num_tokens', None)),
+                        'max_num_reqs': cpu_int(getattr(runner, 'max_num_reqs', None)),
+                        'token_buckets': tuple(int(v) for v in getattr(runner, 'num_tokens_paddings', ())),
+                        'source': 'worker_cpu_config', 'contract': 1})
+                    self._sim_stage_config_recorded = True
+                observe(config_snapshot)
             if scope is not None:
                 self._sim_collection_pending = (scope.context, time.monotonic_ns())
             try:
@@ -231,7 +255,9 @@ class CollectionRunnerHook(BaseHook):
                         'input_length': cpu_int(batch.num_prompt_tokens[j]),
                         'num_output_tokens': len(emitted) if emitted is not None else None,
                         'max_output_tokens': cpu_int(getattr(params, 'max_tokens', None)),
-                        'logprobs': cpu_int(getattr(params, 'logprobs', None))})
+                        'logprobs': cpu_int(getattr(params, 'logprobs', None)),
+                        'phase_by_lengths': 'prefill' if int(batch.num_computed_tokens_cpu[j]) < int(batch.num_prompt_tokens[j]) else 'decode',
+                        'prompt_completed_by_lengths': int(batch.num_computed_tokens_cpu[j]) + int(output.num_scheduled_tokens[rid]) >= int(batch.num_prompt_tokens[j])})
                 return requests
             captured = observe(snapshot) if selected else None
             result = original(self, output, start_index, *args, **kwargs)
@@ -302,7 +328,9 @@ class CollectionPcpLayoutHook(BaseHook):
         def evaluate(self, *args, **kwargs):
             result = original(self, *args, **kwargs)
             scope = trace.ACTIVE.get()
-            if scope is not None and not getattr(trace._RECORDER, 'focus_pp0', False):
+            rec = trace._RECORDER
+            if scope is not None and not getattr(rec, 'focus_pp0', False) and (
+                    not getattr(rec, 'focus_stage', False) or rec.identity[4] == 0):
                 def record():
                     def ints(name):
                         values = getattr(result, name, None)
@@ -444,7 +472,8 @@ class CollectionLazyStepperHook(BaseHook):
                 @wraps(original)
                 def call(self, *args, **kwargs):
                     focus = getattr(trace._RECORDER, 'focus_pp0', False)
-                    if focus and method != '_dispatch':
+                    stage_focus = getattr(trace._RECORDER, 'focus_stage', False)
+                    if (focus or stage_focus) and method != '_dispatch':
                         return original(self, *args, **kwargs)
                     dispatched_result = None
                     if method == '_dispatch':
@@ -455,6 +484,9 @@ class CollectionLazyStepperHook(BaseHook):
                             from .pp0_steps import observe_result
                             observe(lambda: observe_result(self))
                             return dispatched_result
+                        if stage_focus:
+                            from .pp0_steps import observe_result
+                            observe(lambda: observe_result(self, 'pipeline.result_ready'))
                     def snapshot():
                         slot = (args[0] if method == '_sampled' else
                                 getattr(args[0], 'slot', None)) if args else None
