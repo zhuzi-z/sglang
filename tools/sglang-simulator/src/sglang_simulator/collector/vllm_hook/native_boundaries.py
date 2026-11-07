@@ -376,6 +376,8 @@ def install_output_class(target):
     def get_output(self, *args, **kwargs):
         wave = getattr(self, '_sim_native_wave', None)
         item = getattr(wave, '_sim_native_unfinished', None)
+        if item is not None and item['context'] != getattr(self, '_sim_native_context', None):
+            item = None
         measured = host.snapshot() if item is not None else None
         value = get(self, *args, **kwargs)
         accounting = host.elapsed(measured)

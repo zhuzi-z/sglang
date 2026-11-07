@@ -60,3 +60,21 @@ def test_host_points_are_opt_in_and_exported(tmp_path, monkeypatch):
     row = dict(event='pp.before_step.enter', data={}, context=None)
     (tmp_path/'events.000.jsonl').write_text(json.dumps(row)+'\n')
     assert stage.export_tables(tmp_path)['stage_points'] == 1
+
+
+def test_deferred_output_never_borrows_later_step_identity(rig, monkeypatch):
+    monkeypatch.setattr(host, 'ENABLED', True)
+    monkeypatch.setenv('SIM_TPU_NATIVE_BOUNDARIES', '1')
+    class Output:
+        def __init__(self): self.copy_state = object()
+        def get_output(self): return 'original'
+    boundary.install_output_class(Output)
+    wave=rig.wave(3)
+    s=active(10);forward(wave,s)
+    token=boundary.OUTPUT_WAVE.set(wave)
+    try: output=Output()
+    finally: boundary.OUTPUT_WAVE.reset(token)
+    # Later forward can be visible when an earlier async getter completes.
+    forward(wave,active(11));rig.events.clear()
+    assert output.get_output()=='original'
+    assert not any(e[0] in ('native.output_get.return','native.output_ready_observed') for e in rig.events)
