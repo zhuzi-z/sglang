@@ -10,8 +10,10 @@ import inspect
 import os
 import sys
 import time
+import threading
 
 from . import trace_v2 as trace
+from . import host_breakdown as host
 
 DRAIN_SHA256 = '6e57dc548358406c3000430287b04accb63b9973fa4eb324957f46c35991a07a'
 _SYNC = ContextVar('sim_native_boundary_sync', default=None)
@@ -127,17 +129,19 @@ def install(module, sync_module, expected_digest=DRAIN_SHA256, target=None):
             phase, item, task = state
             wait = kwargs.get('wait', args[1] if len(args) > 1 else None)
             _emit(phase + '.enter', item, wait=wait, **task)
+            measured = host.snapshot() if item is not None else None
             try:
                 result = synchronize(*args, **kwargs)
             except BaseException:
-                _emit(phase + '.error', item, wait=wait, native_ok=False, **task)
+                _emit(phase + '.error', item, wait=wait, native_ok=False, **host.elapsed(measured), **task)
                 raise
+            accounting = host.elapsed(measured)
             # This occurs BEFORE _drain_slice executes the world barrier.
             _emit(phase + '.ready' if wait is True else phase + '.submitted', item,
                   wait=wait, native_ok=True,
                   start_mono_ns=item.get('start_mono_ns') if item else None,
                   completion_scope='local_outstanding_work_at_native_drain' if phase == 'local_drain' else 'native_sync_call',
-                  isolated_chunk_execution=False, **task)
+                  isolated_chunk_execution=False, **accounting, **task)
             return result
         sync._sim_native_observer = True
         sync_module.synchronize = sync
@@ -151,9 +155,10 @@ def install(module, sync_module, expected_digest=DRAIN_SHA256, target=None):
             return drain(*args, **kwargs)
         _, item, task = state
         token = _SYNC.set(('local_drain', item, task))
+        measured = host.snapshot() if item is not None else None
         try:
             value = drain(*args, **kwargs)
-            _emit('handoff_barrier_done', item, **task)
+            _emit('handoff_barrier_done', item, drain_call_accounting=host.elapsed(measured), **task)
             return value
         finally:
             _SYNC.reset(token)
@@ -202,9 +207,14 @@ def install(module, sync_module, expected_digest=DRAIN_SHA256, target=None):
         self._sim_native_helper_item = item
         self._sim_native_helper_carried = carried
         token = _SYNC.set(('producer_flush', item, {'async_helper': True}))
+        measured = host.snapshot() if item is not None else None
+        if host.ENABLED:
+            _emit('helper_request.enter', item)
         try:
             return native_async(self, carried)
         finally:
+            if host.ENABLED:
+                _emit('helper_request.return', item, **host.elapsed(measured), completion_scope='request_call_return_not_enqueue')
             _SYNC.reset(token)
     target._launch_async = launch_async
 
@@ -220,6 +230,7 @@ def install(module, sync_module, expected_digest=DRAIN_SHA256, target=None):
             item = getattr(self, '_sim_native_helper_item', item)
         self._sim_native_launch_id = getattr(self, '_sim_native_launch_id', 0) + 1
         task = {'launch_id': self._sim_native_launch_id,
+                'execution_thread': 'async_handoff_helper' if threading.current_thread() is getattr(self, '_async_thread', None) else 'caller',
                 'drain_enabled': bool(self.drain_before_handoff)}
         if getattr(trace._RECORDER, 'focus_stage', False) and getattr(self, '_sim_stage_protocol_active', False):
             try:
@@ -241,17 +252,39 @@ def install(module, sync_module, expected_digest=DRAIN_SHA256, target=None):
                 if trace._RECORDER is not None:
                     trace._RECORDER.observer_errors += 1
         token = _SYNC.set(('handoff', item, task))
+        measured = host.snapshot() if item is not None else None
+        if host.ENABLED:
+            _emit('launch_call.enter', item, **task)
         try:
             result = native_launch(self, carried)
             if self.drain_before_handoff and getattr(self, '_sim_native_unfinished', None) is item:
                 self._sim_native_unfinished = None
             return result
         finally:
+            if host.ENABLED:
+                _emit('launch_call.return', item, **host.elapsed(measured), **task)
             _SYNC.reset(token)
             if helper and getattr(self, '_sim_native_helper_carried', None) is carried:
                 self._sim_native_helper_carried = None
                 self._sim_native_helper_item = None
     target._launch_blocking = launch
+
+    if host.ENABLED and callable(getattr(target, '_async_wait', None)):
+        native_fence = target._async_wait
+
+        @wraps(native_fence)
+        def async_fence(self, *args, **kwargs):
+            item = _item(trace.ACTIVE.get())
+            waited = getattr(self, '_sim_native_helper_item', None)
+            measured = host.snapshot() if item is not None else None
+            _emit('helper_fence.enter', item,
+                  waited_context=waited['context'] if waited else None)
+            try:
+                return native_fence(self, *args, **kwargs)
+            finally:
+                _emit('helper_fence.return', item, **host.elapsed(measured),
+                      completion_scope='host_helper_condition_wait_not_device_wait')
+        target._async_wait = async_fence
 
     wait = module._wait
 
@@ -259,10 +292,11 @@ def install(module, sync_module, expected_digest=DRAIN_SHA256, target=None):
     def dependency_wait(*args, **kwargs):
         item = _item(trace.ACTIVE.get())
         _emit('handoff_dependency_wait.enter', item)
+        measured = host.snapshot() if item is not None else None
         try:
             value = wait(*args, **kwargs)
             _emit('handoff_dependency_wait.ready', item,
-                  completion_scope='previous_handoff_dependency_not_current_receive')
+                  completion_scope='previous_handoff_dependency_not_current_receive', **host.elapsed(measured))
             return value
         except BaseException:
             _emit('handoff_dependency_wait.error', item, native_ok=False)
@@ -340,7 +374,13 @@ def install_output_class(target):
 
     @wraps(get)
     def get_output(self, *args, **kwargs):
+        wave = getattr(self, '_sim_native_wave', None)
+        item = getattr(wave, '_sim_native_unfinished', None)
+        measured = host.snapshot() if item is not None else None
         value = get(self, *args, **kwargs)
+        accounting = host.elapsed(measured)
+        if host.ENABLED:
+            _emit('output_get.return', item, **accounting, completion_scope='output_get_including_existing_copy_wait')
         # Native get_output has waited for the token copy's ready event.
         # No copy_state means no corresponding completion guarantee.
         if getattr(self, 'copy_state', None) is not None:

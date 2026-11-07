@@ -4,6 +4,7 @@ No tensor data reads, new device waits, hardware profiling or hot-path file I/O.
 Observation validity is distinct from suitability as a service-time label.
 """
 import json
+from . import host_breakdown as host
 
 PROTOCOL_KINDS = frozenset({
     'handoff_submit_enter', 'handoff_submitted', 'handoff_barrier_done',
@@ -29,9 +30,18 @@ def keep_event(kind, identity):
         if kind in ('worker.execute_model.enter', 'worker.execute_model.exit',
                     'worker.sample_tokens.enter', 'worker.sample_tokens.exit'):
             return True
+        if host.ENABLED:
+            if kind.startswith(('pp.', 'runner.', 'wrapper.execute_model.')):
+                return pcp == 0
+            if kind in ('worker.pp_push.enter', 'worker.pp_push.exit', 'worker.pp_settle.enter', 'worker.pp_settle.exit'):
+                return pcp == 0
+            if kind in ('native.helper_request.enter', 'native.helper_request.return', 'native.launch_call.enter', 'native.launch_call.return', 'native.helper_fence.enter', 'native.helper_fence.return', 'native.output_get.return'):
+                return True
         return kind.startswith('native.') and (
             kind[7:] in NATIVE_KINDS or kind.endswith('.error'))
     if pp == -1:
+        if host.ENABLED and kind in ('rpc.execute_model.dispatch', 'rpc.sample_tokens.dispatch'):
+            return True
         return kind in ('step.inputs', 'request.add', 'request.scheduled',
                         'pipeline.result_ready', 'engine.dispatch.observed',
                         'rpc.pp_push.dispatch', 'rpc.pp_settle.dispatch')
@@ -59,7 +69,7 @@ def export_tables(window):
                                'chunk.layout':'layouts'}[kind], row)
                     elif kind == 'stage.config':
                         write('stage_configs', row)
-                    elif kind.startswith('native.') or kind.startswith('worker.'):
+                    elif kind.startswith(('native.', 'worker.', 'pp.', 'runner.', 'wrapper.')):
                         write('stage_points', row)
                         if data.get('launch_id') is not None:
                             write('protocol_points', row)

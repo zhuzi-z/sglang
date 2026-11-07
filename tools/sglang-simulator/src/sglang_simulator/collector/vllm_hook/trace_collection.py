@@ -33,7 +33,9 @@ class CollectionRecorder(Recorder):
 
     def _metadata(self):
         return {**super()._metadata(), 'collection_contract': 3,
-                'hardware_profiler': False, 'exported_windows': self.exported,
+                'hardware_profiler': False,
+                'host_breakdown_enabled': os.getenv('SIM_TPU_HOST_BREAKDOWN') == '1',
+                'host_breakdown_contract': 1, 'exported_windows': self.exported,
                 'byte_limit_scope': 'per_segment',
                 'host_clock': self.host_clock,
                 'device_time_available': False,
