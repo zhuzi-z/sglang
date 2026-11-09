@@ -7,8 +7,10 @@ import json
 import os
 from . import host_breakdown as host
 
-# training：只落盘训练与端到端验收实际读取的事件；默认 full 保持原诊断全集
-TRAINING = os.getenv('SIM_TRACE_DETAIL') == 'training'
+# training：只落盘训练与端到端验收实际读取的事件；tick：在training基础上补pcp0的节拍分解事件；默认 full 保持原诊断全集
+DETAIL = os.getenv('SIM_TRACE_DETAIL')
+TRAINING = DETAIL in ('training', 'tick')
+TICK = DETAIL == 'tick'
 TRAINING_WORKER_KINDS = frozenset({
     'native.local_drain.ready', 'native.output_get.return',
     'native.output_ready_observed', 'native.completion_unresolved',
@@ -17,6 +19,18 @@ TRAINING_CONTROLLER_KINDS = frozenset({
     'step.inputs', 'request.add', 'request.scheduled', 'pipeline.result_ready',
     'rpc.execute_model.dispatch', 'rpc.pp_push.dispatch', 'rpc.pp_settle.dispatch',
 })
+# 跨机barrier对齐时钟与节拍分解所需；barrier为world集合操作，pcp0即可代表本stage
+TICK_WORKER_KINDS = frozenset({
+    'native.handoff_submit_enter', 'native.handoff_submitted', 'native.handoff_barrier_done',
+    'native.receive_reference_returned', 'native.forward_dispatch_enter', 'native.forward_dispatch_return',
+})
+TICK_HOST_KINDS = frozenset({
+    'worker.execute_model.enter', 'worker.execute_model.exit',
+    'worker.sample_tokens.enter', 'worker.sample_tokens.exit',
+    'worker.pp_push.enter', 'worker.pp_push.exit', 'worker.pp_settle.enter', 'worker.pp_settle.exit',
+    'native.launch_call.enter', 'native.launch_call.return',
+})
+TICK_CONTROLLER_KINDS = frozenset({'engine.dispatch.observed', 'rpc.sample_tokens.dispatch'})
 
 PROTOCOL_KINDS = frozenset({
     'handoff_submit_enter', 'handoff_submitted', 'handoff_barrier_done',
@@ -40,8 +54,13 @@ def keep_event(kind, identity):
         if pp in range(4):
             if kind in ('chunk.inputs', 'chunk.layout', 'stage.config'):
                 return pcp == 0
-            return kind in TRAINING_WORKER_KINDS or (kind.startswith('native.') and kind.endswith('.error'))
-        return pp == -1 and kind in TRAINING_CONTROLLER_KINDS
+            if kind in TRAINING_WORKER_KINDS or (kind.startswith('native.') and kind.endswith('.error')):
+                return True
+            if TICK and pcp == 0:
+                return kind in TICK_WORKER_KINDS or (host.ENABLED and (
+                    kind in TICK_HOST_KINDS or kind.startswith(('pp.', 'runner.', 'wrapper.execute_model.'))))
+            return False
+        return pp == -1 and (kind in TRAINING_CONTROLLER_KINDS or (TICK and kind in TICK_CONTROLLER_KINDS))
     if pp in range(4):
         if kind in ('chunk.inputs', 'chunk.layout', 'stage.config'):
             return pcp == 0

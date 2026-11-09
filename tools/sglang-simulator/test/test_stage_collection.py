@@ -217,3 +217,39 @@ def test_training_detail_native_labels_survive(rig,monkeypatch):
     assert row[1]==s.context and row[3]["call_start_mono_ns"]<=row[3]["call_end_mono_ns"]
     assert row[3]["start_mono_ns"] is not None and "burst_id" in row[3]
     assert len(rig.calls)>calls_before and recorder.observer_errors==0
+
+
+def test_tick_detail_adds_pcp0_tick_events_only(monkeypatch):
+    from sglang_simulator.collector.vllm_hook import stage_collection as sc
+    from sglang_simulator.collector.vllm_hook import host_breakdown as host
+    monkeypatch.setattr(sc, 'TRAINING', True)
+    monkeypatch.setattr(sc, 'TICK', True)
+    monkeypatch.setattr(host, 'ENABLED', True)
+    extra = (*sc.TICK_WORKER_KINDS, *sc.TICK_HOST_KINDS, 'runner.main_forward.enter', 'pp.push',
+             'wrapper.execute_model.enter')
+    for pp in range(4):
+        for pcp in range(8):
+            ident = (pp, pp*8+pcp, pcp, pp, pcp, 0, 0)
+            for kind in ('native.local_drain.ready', 'native.output_get.return', 'native.local_drain.error'):
+                assert sc.keep_event(kind, ident)
+            for kind in extra:
+                assert sc.keep_event(kind, ident) == (pcp == 0)
+            for kind in ('native.handoff_flush.submitted', 'native.handoff_flush.enter', 'native.local_drain.enter',
+                         'native.payload_metadata', 'native.helper_fence.return', 'native.helper_request.enter'):
+                assert not sc.keep_event(kind, ident)
+    ctrl = (-1,)*7
+    for kind in (*sc.TRAINING_CONTROLLER_KINDS, *sc.TICK_CONTROLLER_KINDS):
+        assert sc.keep_event(kind, ctrl)
+    assert not sc.keep_event('native.handoff_barrier_done', ctrl)
+
+
+def test_tick_detail_without_host_breakdown_keeps_native_tick_only(monkeypatch):
+    from sglang_simulator.collector.vllm_hook import stage_collection as sc
+    from sglang_simulator.collector.vllm_hook import host_breakdown as host
+    monkeypatch.setattr(sc, 'TRAINING', True)
+    monkeypatch.setattr(sc, 'TICK', True)
+    monkeypatch.setattr(host, 'ENABLED', False)
+    ident = (0, 0, 0, 0, 0, 0, 0)
+    assert sc.keep_event('native.handoff_barrier_done', ident)
+    assert not sc.keep_event('runner.main_forward.enter', ident)
+    assert not sc.keep_event('worker.pp_push.enter', ident)
