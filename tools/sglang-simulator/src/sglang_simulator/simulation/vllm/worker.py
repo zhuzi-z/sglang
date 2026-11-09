@@ -291,7 +291,8 @@ def _build_kv_cache_spec(vllm_config) -> dict:
             block_size=mamba_block_size,
             shapes=mamba_shapes,
             dtypes=mamba_dtypes,
-            page_size_padded=None if tpu_hybrid else mamba_page_padded,
+            # Resolve the real state size before applying any physical padding.
+            page_size_padded=None,
             mamba_cache_mode=getattr(cache_config, "mamba_cache_mode", "none"),
         )
         # Forward num_speculative_blocks (MTP/EAGLE) so light-mode runtime
@@ -329,6 +330,12 @@ def _build_kv_cache_spec(vllm_config) -> dict:
                 mamba_kwargs["mamba_type"] = _mamba_gdn_type
 
         mamba_spec = MambaSpec(**mamba_kwargs)
+        if not tpu_hybrid:
+            # Stock vLLM can build hybrid specs before the platform has enlarged
+            # attention pages. Never pad a real recurrent state to a smaller
+            # attention page; let native page unification reconcile the groups.
+            mamba_page_padded = max(mamba_page_padded, mamba_spec.page_size_bytes)
+            mamba_spec = dataclasses.replace(mamba_spec, page_size_padded=mamba_page_padded)
         if tpu_hybrid:
             page = derive_tpu_pooled_page(
                 vllm_config, raw_config, mamba_shapes, mamba_dtypes

@@ -15,6 +15,9 @@ class RequestStatsManager:
 
     def __init__(self):
         self.stats: dict[str, RequestStats] = {}
+        # Native admission observations survive async connector metadata,
+        # without extending the slotted public RequestStats serialization.
+        self.external_prefix_tokens: dict[str, int] = {}
 
     def get_req_stats(self, rid: str) -> RequestStats:
         if rid not in self.stats:
@@ -26,6 +29,7 @@ class RequestStatsManager:
 
     def reset(self):
         self.stats.clear()
+        self.external_prefix_tokens.clear()
 
 
 request_stats_manager = RequestStatsManager()

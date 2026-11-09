@@ -186,6 +186,14 @@ class ConfigManager:
                 workload_distribution=workload_distribution,
                 enable_oom_check=enable_oom_check,
             )
+        elif predictor_config.get("name") == "linear":
+            from sglang_simulator.time_predictor.linear import LinearTimePredictor
+
+            return LinearTimePredictor(
+                model, hw, sched_config,
+                base_ms=predictor_config.get("base_ms", 0.0),
+                per_token_ms=predictor_config.get("per_token_ms", 0.0),
+            )
         elif predictor_config.get("name") == "ml":
             from sglang_simulator.time_predictor.ml import MLTimePredictor
 
@@ -234,5 +242,5 @@ class ConfigManager:
         else:
             raise ValueError(
                 f"Unknown predictor name: {predictor_config.get('name')}. "
-                "Supported: aiconfigurator, ml"
+                "Supported: aiconfigurator, linear, ml"
             )

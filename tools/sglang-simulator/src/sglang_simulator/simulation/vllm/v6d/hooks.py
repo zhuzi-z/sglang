@@ -24,6 +24,7 @@ def register_v6d_hooks(hooks: list) -> None:
     )
     from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
         C_V6dMmapManagerHook,
+        C_TPUV6dObjectFetchHelperHook,
         C_V6dObjectConnectorSchedulerHook,
         C_V6dObjectFetchHelperHook,
         C_V6dObjectManagerHook,
@@ -32,6 +33,7 @@ def register_v6d_hooks(hooks: list) -> None:
         C_V6dObjectConnectorWorkerHook,
     )
     from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
+        C_TPUV6dConnectorAdmissionHook,
         C_TPURaidenConnectorHook,
         C_TPURaidenConnectorWorkerHook,
         C_TPUV6dObjectConnectorWorkerHook,
@@ -47,12 +49,14 @@ def register_v6d_hooks(hooks: list) -> None:
         C_HybridControlPlaneHook,
         C_V6dObjectConnectorWorkerHook,
         C_TPUV6dObjectConnectorWorkerHook,
+        C_TPUV6dConnectorAdmissionHook,
         C_TPURaidenConnectorHook,
         C_TPURaidenConnectorWorkerHook,
         C_V6dObjectBackendHook,
         C_KVTPBackendHook,
         C_V6dObjectConnectorSchedulerHook,
         C_V6dObjectFetchHelperHook,
+        C_TPUV6dObjectFetchHelperHook,
         C_V6dObjectManagerHook,
         C_V6dMmapManagerHook,
     ]

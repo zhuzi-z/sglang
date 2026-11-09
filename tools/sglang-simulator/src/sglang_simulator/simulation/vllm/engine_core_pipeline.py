@@ -292,6 +292,11 @@ def _tpu_external_hit_tokens(scheduler_output, req_id, total_hit, block_size) ->
 
 
 def _ext_computed_tokens(req_id, scheduler_output=None, total_hit=0, block_size=384) -> int:
+    admitted = request_stats_manager.external_prefix_tokens.get(req_id)
+    if admitted is not None:
+        # Native TPU allocation is authoritative even if its asynchronous
+        # load metadata was already consumed on an earlier idle engine step.
+        return min(max(admitted, 0), max(total_hit, 0))
     if scheduler_output is not None:
         external = _tpu_external_hit_tokens(
             scheduler_output, req_id, total_hit, block_size

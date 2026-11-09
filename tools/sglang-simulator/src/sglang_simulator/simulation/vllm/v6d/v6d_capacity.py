@@ -31,12 +31,12 @@ Only ``--peer=tiered_vineyard`` daemon mode is supported.
 from __future__ import annotations
 
 import contextvars
-import logging
 import os
 
 from sglang_simulator.hook import BaseHook, install_class_hooks
+from sglang_simulator.utils import get_logger
 
-logger = logging.getLogger("sglang_simulator")
+logger = get_logger()
 
 # TCP-only SRPC engine: skips barex/RDMA and its libcuda/ibverbs deps.
 os.environ.setdefault("SRPC_STREAM_DISABLE_RDMA", "1")
@@ -356,14 +356,15 @@ class C_TieredVineyardPeerHook(BaseHook):
 
         # Eviction batches carry the objects being dropped — the death side
         # of the lineage.  Batched (~15 keys/call, ~30 calls/min/pod).
+        # Extra args (e.g. the async evictor's ``is_emergency``) pass through.
         original_evict_batch = target._evict_batch_from_vineyard
 
-        async def wrapped_evict_batch(self, object_keys):
+        async def wrapped_evict_batch(self, object_keys, *args, **kwargs):
             if not _keysource_enabled():
-                return await original_evict_batch(self, object_keys)
+                return await original_evict_batch(self, object_keys, *args, **kwargs)
             keys = _fmt_keys(object_keys)
             try:
-                return await original_evict_batch(self, object_keys)
+                return await original_evict_batch(self, object_keys, *args, **kwargs)
             finally:
                 if keys:
                     logger.info(
@@ -441,12 +442,26 @@ class C_HitRateStatsHook(BaseHook):
 # Public API
 # ---------------------------------------------------------------------------
 
+_RUNTIME_HOOKS_INSTALLED = False
+
+
 def install_v6d_runtime_hooks():
-    """Apply all v6d-side simulation hooks; call once before v6d.cli main
-    (class hooks must precede the imports that define the target classes).
+    """Apply all v6d-side simulation hooks before v6d.cli main (class hooks
+    must precede the imports that define the target classes).
+
+    Idempotent: the .pth bootstrap and the daemon entrypoint may both call it.
     """
+    global _RUNTIME_HOOKS_INSTALLED
+    if _RUNTIME_HOOKS_INSTALLED:
+        return
+    from sglang_simulator.simulation.vllm.v6d.tair_kvcm import (
+        C_TairKVCMTransferRuntimeHook,
+    )
+
     install_class_hooks([
         C_VineyardPeerHook,
+        C_TairKVCMTransferRuntimeHook,
         C_TieredVineyardPeerHook,
         C_HitRateStatsHook,
     ])
+    _RUNTIME_HOOKS_INSTALLED = True

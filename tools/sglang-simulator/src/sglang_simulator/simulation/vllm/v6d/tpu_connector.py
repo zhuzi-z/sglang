@@ -22,6 +22,36 @@ def _metadata_with(args, kwargs, field):
     return None
 
 
+class C_TPUV6dConnectorAdmissionHook(BaseHook):
+    """Observe the native accepted external prefix before async metadata expires.
+
+    New TPU connectors can finish the load on an idle engine step. The later
+    first forward then has no reqs_to_load metadata, so metadata-only inference
+    would mislabel the V6D prefix as an L1 hit. No cache decisions are changed.
+    """
+
+    HOOK_MODULE_NAME = "kvs_connector.v6d_object_connector"
+    HOOK_CLASS_NAME = "TPUV6dObjectConnector"
+
+    @classmethod
+    def hook(cls, target):
+        original = target.update_state_after_alloc
+
+        def allocated(self, request, blocks, num_external_tokens):
+            first_admission = (request.num_computed_tokens == 0
+                               and getattr(request, "num_preemptions", 0) == 0)
+            result = original(self, request, blocks, num_external_tokens)
+            if first_admission:
+                from sglang_simulator.simulation.req_stats_manager import request_stats_manager
+                if request.request_id in request_stats_manager.stats:
+                    request_stats_manager.external_prefix_tokens.setdefault(
+                        request.request_id, max(num_external_tokens, 0)
+                    )
+            return result
+
+        target.update_state_after_alloc = allocated
+
+
 class C_TPURaidenConnectorHook(BaseHook):
     """单 CPU 多组 producer 的本地完成契约，不模拟真实 P→D 交接。"""
 

@@ -159,6 +159,17 @@ class C_V6dObjectFetchHelperHook(BaseHook):
         )
 
 
+class C_TPUV6dObjectFetchHelperHook(C_V6dObjectFetchHelperHook):
+    """The out-of-tree TPU connector uses the same lease/seal fetch protocol.
+
+    Keep its native shared-client manager and asynchronous match logic intact;
+    only BlockReceiver's payload movement is replaced.
+    """
+
+    HOOK_MODULE_NAME = "kvs_connector.v6d_object_connector"
+    HOOK_CLASS_NAME = "V6dObjectFetchHelper"
+
+
 class C_V6dMmapManagerHook(BaseHook):
     """Skip the client-side bulkstore mmap (which populates the arena).
 
