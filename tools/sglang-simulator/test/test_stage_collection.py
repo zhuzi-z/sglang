@@ -173,3 +173,47 @@ def test_stage_focus_initial_warmup_silent(rig,monkeypatch):
     wave.start_forward(17);wave.end_forward((object(),),17)
     assert not any(e[0].startswith('native.') for e in rig.events[before:])
     assert len(rig.calls)==4 and recorder.observer_errors==0
+
+
+def test_training_detail_keeps_only_consumed_events(monkeypatch):
+    from sglang_simulator.collector.vllm_hook import stage_collection as sc
+    monkeypatch.setattr(sc, 'TRAINING', True)
+    for pp in range(4):
+        for pcp in range(8):
+            ident = (pp, pp*8+pcp, pcp, pp, pcp, 0, 0)
+            for kind in ('native.local_drain.ready', 'native.output_get.return',
+                         'native.output_ready_observed', 'native.completion_unresolved',
+                         'native.local_drain.error', 'startup.ready', 'native.boundary_installed'):
+                assert sc.keep_event(kind, ident)
+            for kind in ('chunk.inputs', 'chunk.layout', 'stage.config'):
+                assert sc.keep_event(kind, ident) == (pcp == 0)
+            for kind in ('native.handoff_flush.submitted', 'native.handoff_flush.enter',
+                         'native.helper_fence.return', 'native.handoff_barrier_done',
+                         'native.launch_call.return', 'native.local_drain.enter',
+                         'native.handoff_submitted', 'native.receive_reference_returned',
+                         'native.forward_dispatch_enter', 'native.payload_metadata',
+                         'worker.execute_model.enter', 'runner.main_forward.enter', 'pp.push'):
+                assert not sc.keep_event(kind, ident)
+    ctrl = (-1,)*7
+    for kind in sc.TRAINING_CONTROLLER_KINDS:
+        assert sc.keep_event(kind, ctrl)
+    for kind in ('engine.dispatch.observed', 'rpc.sample_tokens.dispatch'):
+        assert not sc.keep_event(kind, ctrl)
+
+
+def test_training_detail_native_labels_survive(rig,monkeypatch):
+    from sglang_simulator.collector.vllm_hook import stage_collection as sc
+    from sglang_simulator.collector.vllm_hook import host_breakdown as host
+    monkeypatch.setattr(sc,"TRAINING",True)
+    monkeypatch.setattr(host,"ENABLED",True)
+    recorder=NS(focus_stage=True,focus_pp0=False,identity=(0,0,0,0,0,0,0),observer_errors=0)
+    monkeypatch.setattr(trace,"_RECORDER",recorder)
+    wave=rig.wave(0);wave.async_handoff=True;s=active()
+    calls_before=len(rig.calls)
+    forward(wave,s);wave.thread.join(2)
+    kinds={e[0] for e in rig.events if e[0].startswith("native.")}-{"native.boundary_installed"}
+    assert kinds=={"native.local_drain.ready"}
+    row=[e for e in rig.events if e[0]=="native.local_drain.ready"][0]
+    assert row[1]==s.context and row[3]["call_start_mono_ns"]<=row[3]["call_end_mono_ns"]
+    assert row[3]["start_mono_ns"] is not None and "burst_id" in row[3]
+    assert len(rig.calls)>calls_before and recorder.observer_errors==0

@@ -4,7 +4,19 @@ No tensor data reads, new device waits, hardware profiling or hot-path file I/O.
 Observation validity is distinct from suitability as a service-time label.
 """
 import json
+import os
 from . import host_breakdown as host
+
+# training：只落盘训练与端到端验收实际读取的事件；默认 full 保持原诊断全集
+TRAINING = os.getenv('SIM_TRACE_DETAIL') == 'training'
+TRAINING_WORKER_KINDS = frozenset({
+    'native.local_drain.ready', 'native.output_get.return',
+    'native.output_ready_observed', 'native.completion_unresolved',
+})
+TRAINING_CONTROLLER_KINDS = frozenset({
+    'step.inputs', 'request.add', 'request.scheduled', 'pipeline.result_ready',
+    'rpc.execute_model.dispatch', 'rpc.pp_push.dispatch', 'rpc.pp_settle.dispatch',
+})
 
 PROTOCOL_KINDS = frozenset({
     'handoff_submit_enter', 'handoff_submitted', 'handoff_barrier_done',
@@ -24,6 +36,12 @@ def keep_event(kind, identity):
     if kind.startswith('startup.') or kind in ('native.boundary_installed', 'native.boundary_unavailable'):
         return True
     pp, pcp = identity[3], identity[4]
+    if TRAINING:
+        if pp in range(4):
+            if kind in ('chunk.inputs', 'chunk.layout', 'stage.config'):
+                return pcp == 0
+            return kind in TRAINING_WORKER_KINDS or (kind.startswith('native.') and kind.endswith('.error'))
+        return pp == -1 and kind in TRAINING_CONTROLLER_KINDS
     if pp in range(4):
         if kind in ('chunk.inputs', 'chunk.layout', 'stage.config'):
             return pcp == 0
