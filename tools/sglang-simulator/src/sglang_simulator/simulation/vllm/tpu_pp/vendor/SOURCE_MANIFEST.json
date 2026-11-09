@@ -1,0 +1,22 @@
+{
+  "pp_wave.py": {
+    "bytes": 22254,
+    "sha256": "14af7b9993c652ae64c50d63d079f77534ad2cdf36f30106c8f4570afb4835a3",
+    "source": "outputs/chunk_stage_research_20261104/site-packages/vllm_torchtpu/distributed/pp_wave.py"
+  },
+  "pp_push.py": {
+    "bytes": 12566,
+    "sha256": "f6f9d25178a51e3d486f8e0d09ac1e1e64e83f876922458a1aace8794ce9dbd2",
+    "source": "outputs/tpu_pp_evidence/site-packages/vllm_torchtpu/distributed/pp_push.py"
+  },
+  "pp_lazy_step.py": {
+    "bytes": 20277,
+    "sha256": "5b2ca518372e4c59d005b7cb035321f81549bac79bcef9e387974d56a260d78c",
+    "source": "outputs/tpu_pp_evidence/site-packages/vllm_torchtpu/core/pp_lazy_step.py"
+  },
+  "multiproc_executor.py": {
+    "bytes": 45225,
+    "sha256": "3ed0149a8a8e1550c4f062af40e645d1b734e70f99981bc5bf15f0360507648a",
+    "source": "outputs/tpu_rank0_baseline/site-packages/vllm/v1/executor/multiproc_executor.py"
+  }
+}

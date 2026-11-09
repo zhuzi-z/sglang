@@ -186,6 +186,23 @@ class ConfigManager:
                 workload_distribution=workload_distribution,
                 enable_oom_check=enable_oom_check,
             )
+        elif predictor_config.get("name") == "tpu_pp_stage":
+            from sglang_simulator.time_predictor.tpu_pp_stage import (
+                TpuPPStageTimePredictor,
+            )
+
+            return TpuPPStageTimePredictor(
+                model, hw, sched_config,
+                stage_model_paths=predictor_config["stage_model_paths"],
+                pcp_size=predictor_config["pcp_size"],
+                interleave_size=predictor_config["interleave_size"],
+                num_tokens_paddings=predictor_config["num_tokens_paddings"],
+                communication_s=predictor_config["communication_s"],
+                host_prep=predictor_config.get("host_prep"),
+                dp_target_bucket=predictor_config.get("dp_target_bucket"),
+                max_num_tokens=predictor_config.get("max_num_tokens"),
+                async_handoff=predictor_config.get("async_handoff", True),
+            )
         elif predictor_config.get("name") == "linear":
             from sglang_simulator.time_predictor.linear import LinearTimePredictor
 

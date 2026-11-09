@@ -407,6 +407,8 @@ class C_VLLMEngineCoreHook(BaseHook):
     HOOK_MODULE_NAME = "vllm.v1.engine.core"
 
     INFERENCE_PREDICTOR: InferTimePredictor = None
+    # 预测器为 tpu_pp_stage 时由 wrapped_init 置位，执行器 hook 据此跳过整步预测
+    TPU_PP_ACTIVE: bool = False
     SIM_MODE: SimulationMode = SimulationMode(Envs.simulation_mode())
 
     # Per-request stats live in the shared request_stats_manager
@@ -459,7 +461,11 @@ class C_VLLMEngineCoreHook(BaseHook):
                 )
                 logger.info("AIConfigurator predictor initialized for vLLM.")
 
-                if sched_config.pp_size > 1:
+                tpu_pp = getattr(cls.INFERENCE_PREDICTOR, "tpu_pp_stage", False)
+                cls.TPU_PP_ACTIVE = tpu_pp
+                if tpu_pp:
+                    _install_tpu_pp(self, cls.INFERENCE_PREDICTOR, sched_config)
+                elif sched_config.pp_size > 1:
                     from sglang_simulator.simulation.vllm.pp_pipeline import (
                         SimulatedPipelineStepper,
                     )
@@ -585,6 +591,17 @@ class C_VLLMEngineCoreHook(BaseHook):
                 output_dir,
             )
 
+            executor = getattr(self, "model_executor", None)
+            if getattr(executor, "step_records", None) is not None:
+                with open(os.path.join(output_dir, "tpu_pp_steps.jsonl"), "w") as f:
+                    for item in executor.step_records.values():
+                        f.write(json.dumps(item, default=str) + "\n")
+                with open(os.path.join(output_dir, "tpu_pp_stage_events.jsonl"), "w") as f:
+                    for item in list(executor.stage_events):
+                        f.write(json.dumps(item, default=str) + "\n")
+                if not self.batch_queue:
+                    executor.reset_stats()
+
             request_stats_manager.reset()
             cls.ITERATION_STATS.clear()
             # Reset the timeline only when no PP work is in flight. Clearing
@@ -598,6 +615,31 @@ class C_VLLMEngineCoreHook(BaseHook):
                     stepper.reset()
 
         target.profile = wrapped_profile
+
+
+def _install_tpu_pp(core, predictor, sched_config) -> None:
+    """按 vllm_torchtpu patch_engine_core_for_lazy_push 安装原生 LazyPushStepper，
+    执行器换成由 stage worker 计时的 VirtualPPExecutor。"""
+    from sglang_simulator.simulation.vllm.tpu_pp.stage_runtime import (
+        VirtualPPExecutor,
+    )
+
+    if C_VLLMEngineCoreHook.SIM_MODE != SimulationMode.BLOCKING:
+        raise ValueError("tpu_pp_stage requires BLOCKING simulation mode")
+    if sched_config.pp_size <= 2:
+        raise ValueError("native lazy push requires pp_size > 2")
+    if core.async_scheduling:
+        raise ValueError("native lazy push is off with async scheduling")
+    executor = VirtualPPExecutor(
+        core.model_executor, predictor, sched_config.pp_size,
+        on_step_done=_finalize_step_stats)
+    core.model_executor = executor
+    stepper = executor.native.LazyPushStepper(core)
+    core.batch_queue = stepper.in_flight
+    core.step_fn = stepper.step
+    core._sim_tpu_pp_stepper = stepper
+    logger.info("[TPU PP] native lazy push installed: stages=%d pcp=%d",
+                sched_config.pp_size, sched_config.pcp_size)
 
 
 def cls_sim_mode() -> SimulationMode:
@@ -791,6 +833,19 @@ class C_VLLMExecutorHook(BaseHook):
             scheduler_output._sim_token_emitted = token_emitted
 
             if simulation_batch.is_empty():
+                return original_execute_model(
+                    self, scheduler_output, *args, **kwargs)
+
+            if C_VLLMEngineCoreHook.TPU_PP_ACTIVE:
+                # 时延由 VirtualPPExecutor 的 stage worker 产生；这里只同步生成
+                # mock 输出，完成统计在末 stage 采样回复到达时发布
+                StateManager.inc_iteration()
+                scheduler_output._sim_iteration_stat = {
+                    "requests": simulation_batch.request_info(),
+                    "total_tokens": sum(num_scheduled_tokens.values()),
+                    "tpu_pp_step_id": getattr(
+                        scheduler_output, "_sim_tpu_pp_step_id", None),
+                }
                 return original_execute_model(
                     self, scheduler_output, *args, **kwargs)
 
