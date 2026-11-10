@@ -376,13 +376,24 @@ class C_VLLMLLMEngineHook(BaseHook):
             # 延迟到构造入口，避免 hook 装配时提前导入 vLLM/真实 TPU 后端。
             _register_tpu_connector_names()
             logger.info(
-                "[vLLM Hijack] LLMEngine frontend connector registry ready (pid=%d)",
-                os.getpid(),
+                "[vLLM Hijack] %s frontend connector registry ready (pid=%d)",
+                target.__name__, os.getpid(),
             )
             original_init(self, *args, **kwargs)
 
         target.__init__ = wrapped_init
         target._sim_frontend_connector_registration = True
+
+
+class C_VLLMAsyncLLMHook(C_VLLMLLMEngineHook):
+    """AsyncLLM 前端（dashllm DS_LLM_USE_VLLM_ASYNC_ENGINE=1）同样要在本进程注册。
+
+    其 output_handler 的 stat logger 会按连接器名称重建 MultiConnector 统计，
+    未注册时首个带 KV 统计的输出即抛 ValueError，前端判定 engine 失效。
+    """
+
+    HOOK_CLASS_NAME = "AsyncLLM"
+    HOOK_MODULE_NAME = "vllm.v1.engine.async_llm"
 
 
 class C_VLLMEngineCoreHook(BaseHook):

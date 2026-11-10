@@ -18,6 +18,7 @@ import os
 import threading
 import time
 
+import numpy as np
 import torch
 
 from sglang_simulator.hook import BaseHook
@@ -117,6 +118,56 @@ class _ModelRunnerStub:
 def _noop(*args, **kwargs):
     """Module-level no-op function (picklable)."""
     return None
+
+
+# Placeholder id emitted for every simulated sampled token.
+_SIM_TOKEN_ID = 1
+
+
+def _grammar_allowed_token(row, preferred=_SIM_TOKEN_ID):
+    """Pick a token the xgrammar bitmask row accepts.
+
+    Keeps ``preferred`` when allowed so unconstrained behavior is unchanged;
+    otherwise returns the lowest allowed id.  Returns None for an all-zero
+    row (nothing acceptable), leaving the scheduler's own handling intact.
+    """
+    words = np.asarray(row).view(np.uint32)
+    word, bit = divmod(preferred, 32)
+    if word < words.size and (int(words[word]) >> bit) & 1:
+        return preferred
+    nonzero = np.flatnonzero(words)
+    if nonzero.size == 0:
+        return None
+    word = int(nonzero[0])
+    value = int(words[word])
+    return word * 32 + (value & -value).bit_length() - 1
+
+
+def _constrain_sampled_tokens(output, grammar_output, spec_tokens):
+    """Rewrite placeholder tokens that a request's grammar would reject.
+
+    Structured-output requests (guided_json etc.) are validated by the
+    scheduler: a token the FSM rejects terminates the request with
+    FINISHED_ERROR, which dashllm reports as STOP_ENGINE_INVALID_OUTPUT and
+    turbo as 500 InternalError.EngineAbort.  The real runner masks logits
+    with ``grammar_bitmask`` before sampling; mirror that on the mock token.
+    Bitmask rows follow ``structured_output_request_ids``, each request
+    taking ``1 + num_spec_tokens`` rows (same layout as vLLM's
+    apply_grammar_bitmask).
+    """
+    if output is None or grammar_output is None:
+        return
+    bitmask = grammar_output.grammar_bitmask
+    index = getattr(output, "req_id_to_index", None) or {}
+    row = 0
+    for req_id in grammar_output.structured_output_request_ids:
+        pos = index.get(req_id)
+        tokens = output.sampled_token_ids[pos] if pos is not None else None
+        if tokens:
+            token = _grammar_allowed_token(bitmask[row])
+            if token is not None:
+                tokens[0] = token
+        row += 1 + len(spec_tokens.get(req_id, ()))
 
 
 def _kv_tensor_layer_names(kv_tensor):
@@ -743,7 +794,11 @@ class C_VLLMWorkerHook(BaseHook):
                         f"scheduled request {req_id!r} is missing from the "
                         "executor hook's _sim_token_emitted annotation"
                     )
-                sampled_token_ids.append([1] if token_emitted[req_id] else [])
+                # Structured-output requests get this placeholder rewritten
+                # against their grammar bitmask in sample_tokens.
+                sampled_token_ids.append(
+                    [_SIM_TOKEN_ID] if token_emitted[req_id] else []
+                )
 
             mro_kwargs = dict(
                 req_ids=req_ids,
@@ -791,6 +846,10 @@ class C_VLLMWorkerHook(BaseHook):
                     )
 
             self._last_model_output = output
+            self._last_spec_tokens = (
+                getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
+                or {}
+            )
             latency = getattr(scheduler_output, "_sim_full_step_latency", None)
             scheduler_config = getattr(
                 getattr(self, "vllm_config", None), "scheduler_config", None
@@ -798,9 +857,23 @@ class C_VLLMWorkerHook(BaseHook):
             async_scheduling = bool(
                 getattr(scheduler_config, "async_scheduling", False)
             )
-            self._last_sim_full_step_latency = (
-                latency if async_scheduling else None
+            # Without async scheduling EngineCore.step only calls
+            # sample_tokens(grammar_output) when execute_model returns None.
+            # Defer structured-output steps there, as the real runner does,
+            # so the mock token is checked against the grammar bitmask.  The
+            # logical PP stepper always calls sample_tokens, so skip it there.
+            defer_sampling = (
+                not async_scheduling
+                and bool(getattr(
+                    scheduler_output, "has_structured_output_requests", False
+                ))
+                and not hasattr(scheduler_output, "_sim_pp_context")
             )
+            self._last_sim_full_step_latency = (
+                latency if async_scheduling or defer_sampling else None
+            )
+            if defer_sampling:
+                return None
             if latency is not None and not async_scheduling:
                 # With no batch queue, UniProcExecutor resolves this async
                 # output synchronously. BLOCKING therefore retains its original
@@ -809,8 +882,15 @@ class C_VLLMWorkerHook(BaseHook):
             return output
 
         def override_sample_tokens(self, grammar_output):
-            """Defer BLOCKING GPU time when async scheduling is enabled."""
+            """Apply grammar constraints and return the deferred step output.
+
+            The step latency lands here under async scheduling or when
+            execute_model deferred a structured-output step.
+            """
             output = self._last_model_output
+            _constrain_sampled_tokens(
+                output, grammar_output, getattr(self, "_last_spec_tokens", {})
+            )
             latency = getattr(self, "_last_sim_full_step_latency", None)
             self._last_sim_full_step_latency = None
             if latency is not None:

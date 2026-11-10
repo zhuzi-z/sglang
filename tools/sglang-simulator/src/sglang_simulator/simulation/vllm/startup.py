@@ -168,6 +168,7 @@ def init_hook():
         worker.C_VLLMWorkerHook,
         # 前端也按连接器名称重建统计，必须在自己的进程中注册。
         engine_core_pipeline.C_VLLMLLMEngineHook,
+        engine_core_pipeline.C_VLLMAsyncLLMHook,
         # Engine-core pipeline hooks: EngineCore (created_time dispatch +
         # profile stats export), scheduler (queue/hit stats) + executor
         # (simulated GPU span at model_executor.execute_model, the engine's
