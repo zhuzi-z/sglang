@@ -207,13 +207,15 @@ def _steps(n):
 
 
 def _run_pipeline(predictor, steps):
-    from sglang_simulator.simulation.vllm.tpu_pp.stage_runtime import VirtualPPExecutor
+    from sglang_simulator.simulation.vllm.tpu_pp.stage_runtime import (
+        VirtualPPExecutor, create_stepper,
+    )
 
     done = []
     ex = VirtualPPExecutor(_Inner(), predictor, 4,
                            on_step_done=lambda so, t: done.append(so.tag))
     sch = _Scheduler(steps)
-    stepper = ex.native.LazyPushStepper(_Core(ex, sch))
+    stepper = create_stepper(_Core(ex, sch), ex)
     deadline = time.monotonic() + 60
     try:
         while sch.pending or stepper.in_flight or stepper.wave.open or ex.futures_queue:
@@ -244,6 +246,23 @@ def test_virtual_pp_pipeline_timing(tmp_path):
     first = ex.step_records[1]
     latency = first["sample_ready_at"] - first["dispatched_at"]
     assert 4 * STAGE_S + 3 * COMM_S <= latency < 4 * STAGE_S + 0.1
+
+
+def test_native_control_with_logging_core(tmp_path, monkeypatch):
+    logged = []
+
+    def log_iteration_details(self, so):
+        logged.append(so.tag)
+        return nullcontext()
+
+    monkeypatch.delattr(_Core, "capture_iteration_details")
+    monkeypatch.delattr(_Core, "_attach_iteration_details")
+    monkeypatch.setattr(_Core, "log_iteration_details", log_iteration_details,
+                        raising=False)
+    ex, done = _run_pipeline(_Predictor(_stage_models(tmp_path, 4)), _steps(2))
+    assert done == [1, 2]
+    assert logged == [1, 2, 3]
+    assert len([e for e in ex.stage_events if e["kind"] == "compute"]) == 8
 
 
 @pytest.mark.parametrize("empty_ms", [None, 20.0])

@@ -102,6 +102,7 @@ class _ModelRunnerStub:
 
     def __init__(self, kv_spec=None):
         self._kv_spec = kv_spec
+        self.model = None
         self.model_memory_usage = 0
 
     def get_kv_cache_spec(self):

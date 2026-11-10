@@ -355,14 +355,12 @@ class VirtualPPExecutor:
         future._tpu_reply_rings = rings
         return future
 
-    def collective_rpc(self, method, *args, non_block=False,
-                       unique_reply_rank=None, **kwargs):
+    def collective_rpc(self, method, *args, non_block=False, **kwargs):
         if method in ("pp_push", "pp_settle"):
             future = self._stage_rpc(method, None, False, None)
             return future if non_block else future.result()
         return self.inner.collective_rpc(
-            method, *args, non_block=non_block,
-            unique_reply_rank=unique_reply_rank, **kwargs)
+            method, *args, non_block=non_block, **kwargs)
 
     def _spans(self, scheduler_output) -> list[StageSpan]:
         new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None) or ()
@@ -453,3 +451,29 @@ class VirtualPPExecutor:
                     proc.terminate()
             self._events.put(None)
             self.inner.shutdown()
+
+
+def create_stepper(core, executor):
+    native_stepper = executor.native.LazyPushStepper
+    if hasattr(core, "capture_iteration_details"):
+        return native_stepper(core)
+
+    # 上游 vLLM 使用日志上下文，torchtpu fork 使用返回给前端的迭代详情。
+    class LoggingStepper(native_stepper):
+        def _process(self, step):
+            with (
+                core.log_error_detail(step.scheduler_output),
+                core.log_iteration_details(step.scheduler_output),
+            ):
+                if not step.future.done():
+                    method = "sample_tokens" if step.slot else "execute_model"
+                    raise TimeoutError(f"RPC call to {method} timed out.")
+                model_output = step.future.result()
+                if model_output is None:
+                    step.exec_future.result()
+                    raise RuntimeError("unexpected error")
+            core._process_aborts_queue()
+            return core.scheduler.update_from_output(
+                step.scheduler_output, model_output)
+
+    return LoggingStepper(core)

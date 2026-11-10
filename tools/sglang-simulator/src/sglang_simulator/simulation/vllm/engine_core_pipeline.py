@@ -592,6 +592,10 @@ class C_VLLMEngineCoreHook(BaseHook):
             )
 
             executor = getattr(self, "model_executor", None)
+            stepper = getattr(self, "_sim_pipeline_stepper", None)
+            work_in_flight = bool(self.batch_queue) or (
+                stepper is not None and bool(stepper.in_flight)
+            )
             if getattr(executor, "step_records", None) is not None:
                 with open(os.path.join(output_dir, "tpu_pp_steps.jsonl"), "w") as f:
                     for item in executor.step_records.values():
@@ -599,16 +603,13 @@ class C_VLLMEngineCoreHook(BaseHook):
                 with open(os.path.join(output_dir, "tpu_pp_stage_events.jsonl"), "w") as f:
                     for item in list(executor.stage_events):
                         f.write(json.dumps(item, default=str) + "\n")
-                if not self.batch_queue:
+                if not work_in_flight:
                     executor.reset_stats()
 
-            request_stats_manager.reset()
-            cls.ITERATION_STATS.clear()
-            # Reset the timeline only when no PP work is in flight. Clearing
-            # finish_at/global_clock while requests are active would strand
-            # them forever after a profile start/stop call.
-            stepper = getattr(self, "_sim_pipeline_stepper", None)
-            if stepper is None or not stepper.in_flight:
+            # 在途 step 的回调仍引用当前统计，快照导出不能清掉它们。
+            if not work_in_flight:
+                request_stats_manager.reset()
+                cls.ITERATION_STATS.clear()
                 StateManager.reset()
                 ReqDispatcher().reset()
                 if stepper is not None:
@@ -621,7 +622,7 @@ def _install_tpu_pp(core, predictor, sched_config) -> None:
     """按 vllm_torchtpu patch_engine_core_for_lazy_push 安装原生 LazyPushStepper，
     执行器换成由 stage worker 计时的 VirtualPPExecutor。"""
     from sglang_simulator.simulation.vllm.tpu_pp.stage_runtime import (
-        VirtualPPExecutor,
+        VirtualPPExecutor, create_stepper,
     )
 
     if C_VLLMEngineCoreHook.SIM_MODE != SimulationMode.BLOCKING:
@@ -634,7 +635,7 @@ def _install_tpu_pp(core, predictor, sched_config) -> None:
         core.model_executor, predictor, sched_config.pp_size,
         on_step_done=_finalize_step_stats)
     core.model_executor = executor
-    stepper = executor.native.LazyPushStepper(core)
+    stepper = create_stepper(core, executor)
     core.batch_queue = stepper.in_flight
     core.step_fn = stepper.step
     core._sim_tpu_pp_stepper = stepper

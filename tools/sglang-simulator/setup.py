@@ -17,6 +17,9 @@ setup(
     description="A High-Fidelity LLM inference simulator for SGLang",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
+    package_data={
+        "sglang_simulator.simulation.vllm.tpu_pp": ["vendor/*.py", "vendor/*.json"],
+    },
     data_files=[
         ("/", ["sglang_simulator.pth"]),
     ],
