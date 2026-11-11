@@ -1,19 +1,21 @@
-from sglang_simulator.hook import install_class_hooks
+from sglang_simulator.hook import install_class_hooks, install_module_hooks
 from sglang_simulator.collector.vllm_hook.worker_hook import (
     C_VLLMEngineArgsHook,
     C_WorkerHook,
     C_SchedulerHook,
     C_EngineCoreHook,
-    C_ModelRunnerSegHook,
+    C_ModelRunnerBatchHook,
+    M_DPBatchCoordinationHook,
 )
 
+install_module_hooks([M_DPBatchCoordinationHook])
 install_class_hooks(
     [
         C_VLLMEngineArgsHook,
         C_WorkerHook,
         C_SchedulerHook,
         C_EngineCoreHook,
-        C_ModelRunnerSegHook,
+        C_ModelRunnerBatchHook,
     ]
 )
 

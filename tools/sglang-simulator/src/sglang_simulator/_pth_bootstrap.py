@@ -6,6 +6,8 @@ if os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "o
     from sglang_simulator.collector.vllm_hook.worker_hook import (
         C_VLLMEngineArgsHook,
         C_WorkerHook,
+        C_ModelRunnerBatchHook,
+        M_DPBatchCoordinationHook,
         C_SchedulerHook,
         C_EngineCoreHook,
         C_V6dWorkerHook,
@@ -20,6 +22,7 @@ if os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "o
     install_module_hooks(
         [
             M_DashservingEntrypointHook,
+            M_DPBatchCoordinationHook,
         ]
     )
 
@@ -27,6 +30,7 @@ if os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "o
         [
             C_VLLMEngineArgsHook,
             C_WorkerHook,
+            C_ModelRunnerBatchHook,
             C_SchedulerHook,
             C_EngineCoreHook,
             C_V6dWorkerHook,

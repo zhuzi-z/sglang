@@ -1,4 +1,5 @@
 import gzip
+import inspect
 import json
 import os
 import sys
@@ -9,6 +10,8 @@ from typing import Optional
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from array import array
+from contextlib import contextmanager
+from functools import wraps
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils.json import CustomJsonEncoder
@@ -22,6 +25,12 @@ _EXPORT_FLAGS = frozenset(
 )
 EXPORT_TOKEN_IDS = "no_ids" not in _EXPORT_FLAGS
 EXPORT_GZIP = "plain" not in _EXPORT_FLAGS
+# DP>1 always collects the complete DP batch. All workers must use the same
+# capacity; numeric tuples ride the existing all-reduce without another collective.
+DP_REQUEST_CAPACITY = int(os.getenv("SIM_COLLECTOR_DP_MAX_REQUESTS", "256"))
+if DP_REQUEST_CAPACITY < 1:
+    raise ValueError("SIM_COLLECTOR_DP_MAX_REQUESTS must be positive")
+_DP_COORD_CONTEXT = threading.local()
 
 
 @dataclass(slots=True)
@@ -47,8 +56,17 @@ class BatchInfos:
     start_timestamp: float = 0.0
     end_timestamp: float = 0.0
     forward_mode: int = 0
-    # List of tuples (req_id, extend_input_len, past_kv_len, output_len)
-    requests: list[tuple[str, int, int, int]] = field(default_factory=list)
+    # Numeric tuples (extend_input_len, past_kv_len, output_len), without IDs.
+    requests: list[tuple[int, int, int]] = field(default_factory=list)
+    # requests is DP-wide when requests_scope == "dp"; latency stays local.
+    requests_local: list[tuple[int, int, int]] = field(default_factory=list)
+    requests_by_dp: list[list[tuple[int, int, int]]] = field(default_factory=list)
+    requests_scope: str = "local"
+    dp_rank: int = 0
+    dp_size: int = 1
+    worker_rank: int = 0
+    dp_step_id: Optional[int] = None
+    local_forward_mode: int = 0
     iter_latency: float = 0.0
     sample_tokens_latency: float = 0.0
     logprobs_req_count: int = 0
@@ -65,6 +83,264 @@ BATCH_INFOS: list[BatchInfos] = []
 REQUEST_INFOS: dict[str, RequestInfos] = defaultdict(RequestInfos)
 
 
+def _collect_model_runner_requests(runner, scheduler_output, num_scheduled_tokens):
+    """Read actual local batch rows after ModelRunner's state/input preparation."""
+    if not scheduler_output.num_scheduled_tokens:
+        return []  # Dummy rows must not reuse a previous real input_batch.
+    batch = runner.input_batch
+    if len(batch.req_ids) != len(num_scheduled_tokens):
+        raise RuntimeError("Collector ModelRunner request/token rows do not align")
+    return [
+        (int(extend), int(batch.num_computed_tokens_cpu[i]),
+         len(runner.requests[rid].output_token_ids))
+        for i, (rid, extend) in enumerate(zip(batch.req_ids, num_scheduled_tokens))
+    ]
+
+
+def _apply_dp_metadata(metadata, batch_info):
+    """Decode ScheduledDPMetaData's collector payload after native synchronization."""
+    payload = getattr(metadata, "_collector_request_payload", None)
+    if payload is None:
+        if batch_info.dp_size > 1:
+            raise RuntimeError("Missing DP request payload; refusing to export an incomplete batch")
+        return  # DP1: the local tuples already describe the complete batch.
+    step_id = metadata._collector_dp_step_id
+    counts, steps = payload[0].tolist(), payload[1].tolist()
+    if any(step != step_id for step in steps):
+        raise RuntimeError("Collector DP step counters are not aligned")
+    if any(count < 0 or count > DP_REQUEST_CAPACITY for count in counts):
+        raise RuntimeError("Collector DP request count exceeds its payload capacity")
+    by_dp = [
+        [tuple(req) for req in payload[2:2 + 3 * count, rank].reshape(count, 3).tolist()]
+        for rank, count in enumerate(counts)
+    ]
+    if by_dp[batch_info.dp_rank] != metadata._collector_local_requests:
+        raise RuntimeError("Collector DP payload does not match the local batch")
+    batch_info.requests_by_dp = by_dp
+    batch_info.requests = [req for requests in by_dp for req in requests]
+    batch_info.requests_scope = "dp"
+    batch_info.dp_step_id = step_id
+    batch_info.forward_mode = 2 if all(req[0] == 1 for req in batch_info.requests) else 1
+
+
+def _install_dp_coordination_hook(dp_utils):
+    """Extend the native 10-row metadata all-reduce, keeping its return schema."""
+    original = getattr(dp_utils, "_run_ar", None)
+    if original is None:
+        raise RuntimeError("Collector DP merging requires vLLM dp_utils._run_ar")
+    if getattr(original, "_collector_dp_merge", False):
+        return
+    signature = inspect.signature(original)
+    native_fields = (
+        "orig_num_tokens_per_ubatch",
+        "padded_num_tokens_per_ubatch",
+        "should_ubatch",
+        "should_dp_pad",
+        "cudagraph_mode",
+        "num_reqs",
+        "num_context_tokens",
+        "is_prompt_batch_local",
+        "is_prefill_only_local",
+        "input_fits_in_drafter",
+    )
+    if set(signature.parameters) != set(native_fields) | {
+        "parallel_config",
+        "device",
+        "group",
+    }:
+        raise RuntimeError(
+            "Unsupported vLLM DP _run_ar signature for collector merging"
+        )
+
+    @wraps(original)
+    def run_ar(*args, **kwargs):
+        context = getattr(_DP_COORD_CONTEXT, "current", None)
+        # Context lasts only for the target ModelRunner's coordination call.
+        if context is None or context.get("host_payload") is not None:
+            return original(*args, **kwargs)
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        values = bound.arguments
+        parallel = values["parallel_config"]
+        if (parallel.data_parallel_size, parallel.data_parallel_rank) != (
+            context["dp_size"], context["dp_rank"]
+        ):
+            raise RuntimeError("Collector DP coordination topology mismatch")
+        rank, requests = context["dp_rank"], context["requests"]
+        tensor = torch.zeros(12 + 3 * DP_REQUEST_CAPACITY, context["dp_size"],
+                             device=values["device"], dtype=torch.int32)
+        for row, name in enumerate(native_fields):
+            tensor[row, rank] = int(values[name])
+        tensor[10, rank] = len(requests)
+        tensor[11, rank] = context["step_id"]
+        if requests:
+            packed = torch.tensor(requests, device=tensor.device, dtype=tensor.dtype)
+            tensor[12:12 + packed.numel(), rank] = packed.reshape(-1)
+        # Same group, operation and collective count as the unmodified _run_ar.
+        torch.distributed.all_reduce(tensor, group=values["group"])
+        payload = tensor[10:]
+        if tensor.device.type == "cuda":
+            host = torch.empty(
+                payload.shape, dtype=payload.dtype, device="cpu", pin_memory=True
+            )
+            # Stream-ordered D2H, no forced synchronization. The forward end
+            # event covers this copy; decoding happens at native get_output().
+            host.copy_(payload, non_blocking=True)
+            context["host_payload"] = host
+        else:
+            context["host_payload"] = payload
+        return tensor[:10]
+
+    run_ar._collector_dp_merge = True
+    dp_utils._run_ar = run_ar
+
+
+@contextmanager
+def _model_runner_forward_scope(runner):
+    """Transient ModelRunner call state; durable metadata travels via outputs."""
+    previous = getattr(runner, "_collector_forward_scope", None)
+    scope = dict(coordinated=False, metadata=None)
+    runner._collector_forward_scope = scope
+    try:
+        yield scope
+    finally:
+        runner._collector_forward_scope = previous
+
+
+def _attach_output_metadata(output, metadata):
+    """Pass batch metadata through normal and asynchronous native outputs."""
+    if output is None or metadata is None:
+        return output
+    if getattr(output, "_collector_batch_metadata", None) is metadata:
+        return output
+    setattr(output, "_collector_batch_metadata", metadata)
+    original_get_output = getattr(output, "get_output", None)
+    if original_get_output is not None:
+        def get_output(*args, **kwargs):
+            result = original_get_output(*args, **kwargs)
+            setattr(result, "_collector_batch_metadata", metadata)
+            return result
+        output.get_output = get_output
+    return output
+
+
+class M_DPBatchCoordinationHook(BaseHook):
+    HOOK_MODULE_NAME = "vllm.v1.worker.dp_utils"
+
+    @classmethod
+    def hook(cls, target):
+        _install_dp_coordination_hook(target)
+
+
+class C_ModelRunnerBatchHook(BaseHook):
+    """Collect DP batches in ModelRunner and propagate them through its outputs."""
+
+    HOOK_MODULE_NAME = "vllm.v1.worker.gpu_model_runner"
+    HOOK_CLASS_NAME = "GPUModelRunner"
+
+    @classmethod
+    def hook(cls, target):
+        # Class-hook dispatch applies only one matching hook; retain RPC-2
+        # segment collection as part of this ModelRunner hook.
+        C_ModelRunnerSegHook.hook(target)
+        original_determine = target._determine_batch_execution_and_padding
+        original_execute = target.execute_model
+        original_sample = getattr(target, "sample_tokens", None)
+        original_dummy = getattr(target, "_dummy_run", None)
+        signature = inspect.signature(original_determine)
+
+        @wraps(original_determine)
+        def determine(self, *args, **kwargs):
+            scope = getattr(self, "_collector_forward_scope", None)
+            if scope is None or scope["coordinated"]:
+                return original_determine(self, *args, **kwargs)
+            scope["coordinated"] = True
+            values = signature.bind(self, *args, **kwargs).arguments
+            output = values["scheduler_output"]
+            requests = _collect_model_runner_requests(
+                self, output, values["num_scheduled_tokens_np"])
+            parallel = self.parallel_config
+            context = None
+            if parallel.data_parallel_size > 1:
+                if output.scheduled_dp_metadata is not None:
+                    raise RuntimeError("Collector requires ModelRunner DP coordination, not precomputed EngineCore metadata")
+                if len(requests) > DP_REQUEST_CAPACITY:
+                    raise ValueError("Batch exceeds SIM_COLLECTOR_DP_MAX_REQUESTS; set the same capacity on every DP worker")
+                if any(value < 0 or value > 2**31 - 1 for req in requests for value in req):
+                    raise ValueError("Collector DP request lengths must fit nonnegative int32")
+                step = getattr(self, "_collector_dp_step_id", 0)
+                self._collector_dp_step_id = step + 1
+                context = dict(requests=requests, dp_rank=parallel.data_parallel_rank,
+                               dp_size=parallel.data_parallel_size, step_id=step)
+            previous = getattr(_DP_COORD_CONTEXT, "current", None)
+            _DP_COORD_CONTEXT.current = context
+            try:
+                result = original_determine(self, *args, **kwargs)
+            finally:
+                _DP_COORD_CONTEXT.current = previous
+            metadata = output.scheduled_dp_metadata
+            if metadata is None:
+                raise RuntimeError("ModelRunner did not produce ScheduledDPMetaData")
+            setattr(metadata, "_collector_local_requests", requests)
+            if context is not None:
+                if context.get("host_payload") is None:
+                    raise RuntimeError("No native DP _run_ar observed; coordination backend unsupported")
+                setattr(metadata, "_collector_request_payload", context["host_payload"])
+                setattr(metadata, "_collector_dp_step_id", context["step_id"])
+            scope["metadata"] = metadata
+            return result
+
+        @wraps(original_execute)
+        def execute_model(self, scheduler_output, *args, **kwargs):
+            with _model_runner_forward_scope(self) as scope:
+                result = original_execute(self, scheduler_output, *args, **kwargs)
+            metadata = scope["metadata"]
+            if scheduler_output.num_scheduled_tokens and metadata is None:
+                raise RuntimeError("Target forward did not reach ModelRunner's batch/DP boundary")
+            if result is None:
+                # Two-RPC vLLM already stores this metadata in ExecuteModelState.
+                if metadata is not None and scheduler_output.num_scheduled_tokens:
+                    state = getattr(self, "execute_model_state", None)
+                    if getattr(state, "scheduled_dp_metadata", None) is not metadata:
+                        raise RuntimeError("Native ExecuteModelState did not retain batch metadata")
+                return result
+            if metadata is not None and metadata._collector_local_requests:
+                return _attach_output_metadata(result, metadata)
+            return result
+
+        target._determine_batch_execution_and_padding = determine
+        target.execute_model = execute_model
+
+        if original_sample is not None:
+            @wraps(original_sample)
+            def sample_tokens(self, *args, **kwargs):
+                state = getattr(self, "execute_model_state", None)
+                metadata = getattr(state, "scheduled_dp_metadata", None)
+                result = original_sample(self, *args, **kwargs)
+                if metadata is not None and hasattr(metadata, "_collector_local_requests"):
+                    return _attach_output_metadata(result, metadata)
+                return result
+            target.sample_tokens = sample_tokens
+
+        if original_dummy is not None:
+            dummy_signature = inspect.signature(original_dummy)
+            @wraps(original_dummy)
+            def dummy_run(self, *args, **kwargs):
+                if getattr(self, "_collector_forward_scope", None) is not None:
+                    return original_dummy(self, *args, **kwargs)
+                values = dummy_signature.bind(self, *args, **kwargs)
+                values.apply_defaults()
+                values = values.arguments
+                # Worker.execute_dummy_batch uses elastic_mask=True. Warmup and
+                # graph capture must not contribute synthetic training requests.
+                if (not values.get("elastic_mask", False) or values.get("is_profile", False)
+                        or values.get("is_graph_capturing", False)):
+                    return original_dummy(self, *args, **kwargs)
+                with _model_runner_forward_scope(self):
+                    return original_dummy(self, *args, **kwargs)
+            target._dummy_run = dummy_run
+
+
 # --- CUDA-event based timing -------------------------------------------------
 # The collector must NOT call torch.cuda.synchronize(): a forced device sync
 # serializes the pipeline, wrecks async-scheduling overlap and skews the very
@@ -72,8 +348,8 @@ REQUEST_INFOS: dict[str, RequestInfos] = defaultdict(RequestInfos)
 # pair of timing cuda events recorded on the main stream (mirroring the
 # async_event_pool pattern in vllm's GPUModelRunner). The elapsed time is read
 # lazily from AsyncModelRunnerOutput.get_output() -- i.e. right after vllm's own
-# synchronize has already drained the stream past our end event -- so the hook
-# never introduces any synchronization of its own.
+# synchronize has already drained the stream past our end event. DP merging
+# extends the native collective and uses stream-ordered D2H, without extra sync.
 
 
 class _EventTimer:
@@ -134,12 +410,12 @@ def _finalize_on_get_output(output, finalize):
     """
     original_get_output = getattr(output, "get_output", None)
     if original_get_output is None:
-        finalize()
+        finalize(output)
         return output
 
     def wrapped_get_output(*args, **kwargs):
         result = original_get_output(*args, **kwargs)
-        finalize()
+        finalize(result)
         return result
 
     output.get_output = wrapped_get_output
@@ -149,14 +425,12 @@ def _finalize_on_get_output(output, finalize):
 def _print_batch_info(batch_info: "BatchInfos") -> None:
     """Print one recorded batch at its finalize point (no request ids).
 
-    The per-request tuples are (rid, extend_input_len, past_kv_len,
-    output_len); the leading rid is dropped so no request id is printed.
+    Numeric request tuples match the JSONL export: (extend, past, output).
 
     Writes directly to stdout's underlying buffer so that vLLM's
     decorate_logs prefix (e.g. [2/4,TP2][pid=...]) is bypassed.
     """
     row = asdict(batch_info)
-    row["requests"] = [tuple(req[1:]) for req in row.get("requests", [])]
     line = "[sim_colletor] " + json.dumps(row, cls=CustomJsonEncoder) + "\n"
     sys.stdout.buffer.write(line.encode())
     sys.stdout.buffer.flush()
@@ -307,23 +581,10 @@ class C_WorkerHook(BaseHook):
 
         def wrapped_execute_model(self, scheduler_output: "SchedulerOutput"):
 
-            batch_req_infos = {}
-            for req_id, sched_token in scheduler_output.num_scheduled_tokens.items():
-                batch_req_infos[req_id] = {"extend_input_len": sched_token}
-            
-            for req_id, completed_token, output_token in zip(
-                scheduler_output.scheduled_cached_reqs.req_ids, 
-                scheduler_output.scheduled_cached_reqs.num_computed_tokens,
-                scheduler_output.scheduled_cached_reqs.num_output_tokens
-            ):
-                batch_req_infos[req_id]["past_kv_len"] = completed_token
-                batch_req_infos[req_id]["output_len"] = output_token
-            
-            for req in scheduler_output.scheduled_new_reqs:
-                batch_req_infos[req.req_id]["past_kv_len"] = req.num_computed_tokens
-                batch_req_infos[req.req_id]["output_len"] = 0
-
-            forward_mode = 2 if all([num_token == 1 for num_token in scheduler_output.num_scheduled_tokens.values()]) else 1
+            # Connector-only calls do not produce a target-model batch.
+            if not scheduler_output.num_scheduled_tokens:
+                return original_execute_model(self, scheduler_output)
+            parallel = self.vllm_config.parallel_config
 
             # Per-step logprobs form (for independent logprobs-compensation
             # training). Only new reqs carry sampling_params in SchedulerOutput;
@@ -351,38 +612,35 @@ class C_WorkerHook(BaseHook):
             ret = original_execute_model(self, scheduler_output)
             exec_timer.record_end()
 
-            batch_info = None
-            if len(batch_req_infos):
+            def _finalize_exec(model_output, sample_latency: Optional[float] = None,
+                               seg: Optional[dict] = None):
+                metadata = getattr(model_output, "_collector_batch_metadata", None)
+                if metadata is None:
+                    raise RuntimeError("ModelRunner output has no collector batch metadata; check class-hook registration")
+                # The collector consumes this private carrier before normal RPC
+                # serialization; do not send its tensor payload to the scheduler.
+                delattr(model_output, "_collector_batch_metadata")
+                iter_latency = exec_timer.elapsed_s()
+                if iter_latency is None:
+                    return
+                local_requests = metadata._collector_local_requests
+                mode = 2 if all(req[0] == 1 for req in local_requests) else 1
                 batch_info = BatchInfos(
                     start_timestamp=_round6(start_wall),
-                    # end_timestamp / iter_latency are filled in once the timing
-                    # events are read after vllm's own synchronize (see below).
-                    forward_mode=forward_mode,
-                    # Keep only the last 12 chars of rid.
-                    requests=[
-                        (
-                            rid[-12:] if len(rid) > 12 else rid,
-                            req_info["extend_input_len"],
-                            req_info["past_kv_len"],
-                            req_info["output_len"],
-                        )
-                        for rid, req_info in batch_req_infos.items()
-                    ],
+                    end_timestamp=_round6(start_wall + iter_latency),
+                    forward_mode=mode,
+                    local_forward_mode=mode,
+                    requests=local_requests,
+                    requests_local=local_requests,
+                    dp_size=parallel.data_parallel_size,
+                    dp_rank=parallel.data_parallel_rank,
+                    worker_rank=self.rank,
+                    iter_latency=_round6(iter_latency),
                     logprobs_req_count=logprobs_req_count,
                     logprobs_tokens=logprobs_tokens,
                     logprobs_n=logprobs_n,
                 )
-                BATCH_INFOS.append(batch_info)
-
-            def _finalize_exec(sample_latency: Optional[float] = None,
-                               seg: Optional[dict] = None):
-                if batch_info is None:
-                    return
-                iter_latency = exec_timer.elapsed_s()
-                if iter_latency is None:
-                    return
-                batch_info.iter_latency = _round6(iter_latency)
-                batch_info.end_timestamp = _round6(start_wall + iter_latency)
+                _apply_dp_metadata(metadata, batch_info)
                 if sample_latency is not None:
                     batch_info.sample_tokens_latency = _round6(sample_latency)
                 if seg is not None:
@@ -391,6 +649,7 @@ class C_WorkerHook(BaseHook):
                         **{k: round(v, 4) for k, v in seg.items()},
                         "other": round(st_ms - sum(seg.values()), 4),
                     }
+                BATCH_INFOS.append(batch_info)
                 # Print the batch info at its recording (finalize) point.
                 _print_batch_info(batch_info)
 
@@ -435,13 +694,11 @@ class C_WorkerHook(BaseHook):
                 pending_exec = _PENDING_EXEC
                 _PENDING_EXEC = None
 
-                def _finalize():
+                def _finalize(model_output):
                     sample_latency = sample_timer.elapsed_s()
-                    # Hand the paired sample latency and the per-segment
-                    # breakdown to the execute_model window, which records
-                    # them on the batch and prints it.
+                    # Metadata arrives through ModelRunner's returned output.
                     if pending_exec is not None:
-                        pending_exec[0](sample_latency, seg)
+                        pending_exec[0](model_output, sample_latency, seg)
 
                 return _finalize_on_get_output(ret, _finalize)
 
