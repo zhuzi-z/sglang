@@ -14,6 +14,7 @@ if os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "o
 
     from sglang_simulator.collector.dashserving import (
         M_DashservingEntrypointHook,
+        C_DashservingControlHandlerHook,
     )
 
     install_module_hooks(
@@ -30,5 +31,6 @@ if os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "o
             C_EngineCoreHook,
             C_V6dWorkerHook,
             C_V6dSwapHook,
+            C_DashservingControlHandlerHook,
         ]
     )
