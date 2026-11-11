@@ -173,7 +173,9 @@ class CollectionRecorder(Recorder):
         self._stream.flush()
         self._stream.close()
         cut = {'schema': 3, 'export_id': job['id'], 'trigger': job['trigger'],
-               'process_id': self.process_id, 'rank': dict(zip(RANK_FIELDS, self.identity)),
+               'process_id': self.process_id, 'pid': self.pid,
+               'collection_id': self.collection_id, 'build_id': self.build_id,
+               'rank': dict(zip(RANK_FIELDS, self.identity)),
                'clock_domain': self._metadata()['clock_domain'],
                'host_clock': self.host_clock,
                'cut_seq': job['cut_seq'], 'cut_mono_ns': job['cut_mono_ns'],

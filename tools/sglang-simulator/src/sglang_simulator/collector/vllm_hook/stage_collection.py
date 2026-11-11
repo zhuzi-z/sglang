@@ -15,7 +15,11 @@ TRAINING_WORKER_KINDS = frozenset({
     'native.local_drain.ready', 'native.output_get.return',
     'native.output_ready_observed', 'native.completion_unresolved',
 })
-TRAINING_CONTROLLER_KINDS = frozenset({
+CONTROLLER_LIFECYCLE_KINDS = frozenset({
+    'request.output_observed', 'request.free', 'request.remote_kv_signal_observed',
+    'request.step_membership', 'request.identity_alias', 'scheduler.output_update',
+})
+TRAINING_CONTROLLER_KINDS = CONTROLLER_LIFECYCLE_KINDS | frozenset({
     'step.inputs', 'request.add', 'request.scheduled', 'pipeline.result_ready',
     'rpc.execute_model.dispatch', 'rpc.pp_push.dispatch', 'rpc.pp_settle.dispatch',
 })
@@ -50,6 +54,10 @@ def keep_event(kind, identity):
     if kind.startswith('startup.') or kind in ('native.boundary_installed', 'native.boundary_unavailable'):
         return True
     pp, pcp = identity[3], identity[4]
+    if kind.startswith(('request.', 'mtp.')):
+        # Worker lifecycle metadata is representative PCP0 only. Existing
+        # all-rank native completion/protocol evidence remains unchanged.
+        return pcp == 0 if pp in range(4) else pp == -1
     if TRAINING:
         if pp in range(4):
             if kind in ('chunk.inputs', 'chunk.layout', 'stage.config'):
@@ -79,9 +87,9 @@ def keep_event(kind, identity):
     if pp == -1:
         if host.ENABLED and kind in ('rpc.execute_model.dispatch', 'rpc.sample_tokens.dispatch'):
             return True
-        return kind in ('step.inputs', 'request.add', 'request.scheduled',
+        return kind in CONTROLLER_LIFECYCLE_KINDS or kind in ('step.inputs', 'request.add', 'request.scheduled',
                         'pipeline.result_ready', 'engine.dispatch.observed',
-                        'rpc.pp_push.dispatch', 'rpc.pp_settle.dispatch')
+                        'rpc.execute_model.dispatch', 'rpc.pp_push.dispatch', 'rpc.pp_settle.dispatch')
     return False
 
 
@@ -106,7 +114,7 @@ def export_tables(window):
                                'chunk.layout':'layouts'}[kind], row)
                     elif kind == 'stage.config':
                         write('stage_configs', row)
-                    elif kind.startswith(('native.', 'worker.', 'pp.', 'runner.', 'wrapper.')):
+                    elif kind.startswith(('native.', 'worker.', 'pp.', 'runner.', 'wrapper.', 'mtp.')):
                         write('stage_points', row)
                         if data.get('launch_id') is not None:
                             write('protocol_points', row)
@@ -120,7 +128,7 @@ def export_tables(window):
                                 'target_service_s': None, 'valid_service_label': False,
                                 'valid_pure_device_timing': False,
                                 'device_elapsed_ns': None, 'device_queue_ns': None})
-                    elif kind.startswith(('engine.', 'rpc.')) or kind == 'pipeline.result_ready':
+                    elif kind.startswith(('engine.', 'rpc.')) or kind in ('pipeline.result_ready', 'scheduler.output_update'):
                         write('controller_points', row)
     finally:
         for stream in streams.values(): stream.close()
