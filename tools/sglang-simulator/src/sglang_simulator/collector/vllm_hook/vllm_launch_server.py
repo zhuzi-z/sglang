@@ -1,5 +1,5 @@
 from sglang_simulator.hook import install_class_hooks
-from worker_hook import (
+from sglang_simulator.collector.vllm_hook.worker_hook import (
     C_VLLMEngineArgsHook,
     C_WorkerHook,
     C_SchedulerHook,
