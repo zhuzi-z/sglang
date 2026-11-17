@@ -7,15 +7,18 @@ IMPORTANT: init_hook() must be called BEFORE any `import vllm.*` statement.
 
 import logging
 import os
+import sys
+import sysconfig
 
 import torch
+
+from sglang_simulator.hook.class_hook_entry import emit_hook_event, report_class_hooks
 
 
 def _sanitize_tpu_environment_for_cpu():
     """Keep TPU plugins/connectors optional without activating TpuPlatform."""
-    # Do not force a device backend. The mock Platform hook installs the
-    # simulated platform before vLLM performs real device detection.
-    os.environ.pop("VLLM_TARGET_DEVICE", None)
+    if os.environ.get("VLLM_TARGET_DEVICE") != "cpu":
+        os.environ.pop("VLLM_TARGET_DEVICE", None)
     plugins = []
     for plugin in os.environ.get("VLLM_PLUGINS", "").split(","):
         plugin = plugin.strip()
@@ -77,6 +80,10 @@ def _patch_torch_cuda_for_cpu():
     if torch.cuda.is_available():
         return  # Real GPU available, no patching needed
 
+    if not torch.accelerator.is_available():
+        torch.accelerator.empty_cache = lambda: None
+        torch.accelerator.empty_host_cache = lambda: None
+
     class _FakeDeviceProperties:
         """Fake CUDA device properties for simulation."""
         major = 9
@@ -128,8 +135,23 @@ def init_hook():
     """
     global _HOOKS_INSTALLED
     if _HOOKS_INSTALLED:
+        emit_hook_event("BOOTSTRAP", stage="init_hook", status="already_registered")
         return True
 
+    emit_hook_event(
+        "BOOTSTRAP", stage="init_hook", status="begin", executable=sys.executable,
+        isolated=sys.flags.isolated, no_site=sys.flags.no_site,
+        ignore_environment=sys.flags.ignore_environment,
+        startup_origin=__file__, simulator_origin=sys.modules["sglang_simulator"].__file__,
+        purelib=sysconfig.get_path("purelib"),
+        enable=os.environ.get("SGLANG_SIMULATOR_ENABLE", ""),
+        scoped_package_path_present="/home/admin/hisim-pp/python" in sys.path,
+        scoped_bootstrap_path_present="/home/admin/hisim-pp/bootstrap" in sys.path,
+        loaded_vllm_modules=[name for name in (
+            "vllm.platforms.interface", "vllm.engine.arg_utils", "vllm.v1.engine.core",
+            "vllm.v1.worker.gpu_worker", "vllm.v1.worker.worker", "vllm.v1.worker.cpu_worker",
+        ) if name in sys.modules],
+    )
     _sanitize_tpu_environment_for_cpu()
 
     # CPU-only v6d IPC: the SRPC engine natively supports
@@ -193,9 +215,14 @@ def init_hook():
     from sglang_simulator.simulation.vllm.dashllm.server_info_hook import C_DashservingControlHandlerHook
     hooks.append(C_DashservingControlHandlerHook)
 
+    from sglang_simulator.request_boundaries import HOOKS as request_boundary_hooks
+    hooks.extend(request_boundary_hooks)
+
     sglang_simulator_hook.install_class_hooks(hooks)
 
     from sglang_simulator.simulation.vllm.dashllm.kv_transfer_hook import _install_dashllm_kv_transfer_hook
     _install_dashllm_kv_transfer_hook()
     _HOOKS_INSTALLED = True
+    emit_hook_event("BOOTSTRAP", stage="init_hook", status="registered", hook_count=len(hooks))
+    report_class_hooks("bootstrap_registered")
     return True

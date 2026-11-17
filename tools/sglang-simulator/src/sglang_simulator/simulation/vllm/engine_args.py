@@ -8,8 +8,11 @@ The actual parallelism is captured in the simulator's scheduler config
 """
 
 import os
+import sys
+from functools import wraps
 
 from sglang_simulator.hook import BaseHook
+from sglang_simulator.hook.class_hook_entry import emit_hook_event
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
@@ -24,8 +27,14 @@ class C_VLLMEngineArgsHook(BaseHook):
     @classmethod
     def hook(cls, target):
         original_post_init = target.__post_init__
+        original_create_engine_config = target.create_engine_config
 
         def wrapped_post_init(self):
+            emit_hook_event(
+                "ENGINE_CONFIG", stage="engine_args_input",
+                backend=getattr(self, "distributed_executor_backend", None),
+                worker_cls=getattr(self, "worker_cls", None),
+            )
             parallel_attrs = [
                 "tensor_parallel_size",
                 "pipeline_parallel_size",
@@ -73,10 +82,7 @@ class C_VLLMEngineArgsHook(BaseHook):
             ):
                 os.environ["TPU_MTP_PREFILL_ONLY"] = "1"
 
-            # Keep the only worker in this process.  A spawned ``mp`` worker
-            # starts a fresh interpreter before the simulator hooks are
-            # installed and therefore tries to construct/load the real GPU
-            # model.  ``uni`` preserves the hooked Worker class.
+            # 逻辑 PP 由本地 stage workers 表达，内层执行器保持单进程。
             if hasattr(self, "distributed_executor_backend"):
                 self.distributed_executor_backend = "uni"
 
@@ -90,6 +96,12 @@ class C_VLLMEngineArgsHook(BaseHook):
                 if profiler_config.profiler is None:
                     profiler_config.profiler = "cuda"
 
+            emit_hook_event(
+                "ENGINE_CONFIG", stage="engine_args",
+                backend=getattr(self, "distributed_executor_backend", None),
+                worker_cls=getattr(self, "worker_cls", None),
+                tp=self.tensor_parallel_size, pp=self.pipeline_parallel_size,
+            )
             logger.info(
                 "[vLLM Hijack] EngineArgs: forced parallelism to 1 "
                 "(tp=%d, pp=%d)",
@@ -97,4 +109,21 @@ class C_VLLMEngineArgsHook(BaseHook):
                 self.pipeline_parallel_size,
             )
 
+        @wraps(original_create_engine_config)
+        def wrapped_create_engine_config(self, *args, **kwargs):
+            config = original_create_engine_config(self, *args, **kwargs)
+            parallel = config.parallel_config
+            platform = getattr(sys.modules.get("vllm.platforms"), "current_platform", None)
+            emit_hook_event(
+                "ENGINE_CONFIG", stage="create_engine_config",
+                platform=type(platform).__module__ + "." + type(platform).__qualname__,
+                backend=parallel.distributed_executor_backend, worker_cls=parallel.worker_cls,
+                tp=parallel.tensor_parallel_size, pp=parallel.pipeline_parallel_size,
+            )
+            return config
+
         target.__post_init__ = wrapped_post_init
+        # DashLLM backports EngineArgs by inspecting its original method source.
+        # Keep __post_init__ hooked, but let its backport see the native method.
+        if os.environ.get("HISIM_TPU_PP_PRESERVE_DASHLLM_ENGINE_ARGS") != "1":
+            target.create_engine_config = wrapped_create_engine_config

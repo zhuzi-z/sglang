@@ -21,6 +21,7 @@ import time
 import torch
 
 from sglang_simulator.hook import BaseHook
+from sglang_simulator.hook.class_hook_entry import emit_hook_event
 from sglang_simulator.simulation.manager import ConfigManager
 from sglang_simulator.simulation.utils import profile_device_available_bytes
 from sglang_simulator.simulation.vllm.utils import (
@@ -504,10 +505,27 @@ class C_VLLMWorkerHook(BaseHook):
             self.init_snapshot = None
             self.requested_memory = 0
             init_workspace_manager(self.device, 1)
+            delegated_worker = vars(self).get("worker")
+            emit_hook_event(
+                "WORKER_READY", receiver_module=type(self).__module__,
+                receiver_class=type(self).__qualname__,
+                receiver_model_runner_stub=isinstance(self.model_runner, _ModelRunnerStub),
+                receiver_init_device_match=getattr(type(self), "init_device", None) is override_init_device,
+                receiver_load_model_match=getattr(type(self), "load_model", None) is override_load_model,
+                receiver_execute_model_match=getattr(type(self), "execute_model", None) is override_execute_model,
+                delegated_worker_module=type(delegated_worker).__module__ if delegated_worker is not None else None,
+                delegated_worker_class=type(delegated_worker).__qualname__ if delegated_worker is not None else None,
+            )
             logger.info("[vLLM Hijack] Worker.init_device: stub initialized")
 
         def override_load_model(self, *args, **kwargs):
             """Skip model loading entirely."""
+            emit_hook_event(
+                "WORKER_LOAD_MODEL", status="skipped", receiver_module=type(self).__module__,
+                receiver_class=type(self).__qualname__,
+                receiver_model_runner_stub=isinstance(self.model_runner, _ModelRunnerStub),
+                receiver_load_model_match=getattr(type(self), "load_model", None) is override_load_model,
+            )
             logger.info("[vLLM Hijack] Worker.load_model: skipped")
 
         def override_determine_available_memory(self):

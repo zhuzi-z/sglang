@@ -27,12 +27,14 @@ on C_VLLMEngineCoreHook, which is why they live in one module.
 import heapq
 import json
 import os
+import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from functools import wraps
 
 from sglang_simulator.hook import BaseHook
+from sglang_simulator.hook.class_hook_entry import emit_hook_event, report_class_hooks
 from sglang_simulator.simulation.manager import ConfigManager
 from sglang_simulator.simulation.manager import StateManager
 from sglang_simulator.simulation.manager.env import Envs
@@ -423,6 +425,7 @@ class C_VLLMEngineCoreHook(BaseHook):
         original_init = target.__init__
         original_add_request = target.add_request
         original_step = target.step
+        original_shutdown = target.shutdown
         original_wait_model_output = getattr(
             target, "_wait_model_output_future", None
         )
@@ -432,6 +435,17 @@ class C_VLLMEngineCoreHook(BaseHook):
         def wrapped_init(self, vllm_config, *args, **kwargs):
             """Reset shared replay state, init the AIConfigurator predictor,
             and instance-patch the Scheduler created by EngineCore."""
+            parallel = vllm_config.parallel_config
+            platform = getattr(sys.modules.get("vllm.platforms"), "current_platform", None)
+            requested_executor = kwargs.get("executor_class", args[0] if args else None)
+            emit_hook_event(
+                "ENGINE_CONFIG", stage="engine_core",
+                platform=type(platform).__module__ + "." + type(platform).__qualname__,
+                backend=parallel.distributed_executor_backend, worker_cls=parallel.worker_cls,
+                executor_requested=(requested_executor.__module__ + "." + requested_executor.__qualname__)
+                if isinstance(requested_executor, type) else None,
+            )
+            report_class_hooks("engine_core_before_init")
             ReqDispatcher().reset()
             request_stats_manager.reset()
             cls.ITERATION_STATS.clear()
@@ -441,10 +455,16 @@ class C_VLLMEngineCoreHook(BaseHook):
             # before EngineCore constructs its Scheduler and connectors.
             _register_tpu_connector_names()
             original_init(self, vllm_config, *args, **kwargs)
+            emit_hook_event(
+                "EXECUTOR_READY", executor_module=type(self.model_executor).__module__,
+                executor_class=type(self.model_executor).__qualname__,
+            )
             from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
                 install_tpu_v6d_completion_guard,
             )
             install_tpu_v6d_completion_guard(self.scheduler)
+            from sglang_simulator.simulation.vllm.lifecycle import install_lifecycle
+            install_lifecycle(self)
 
             try:
                 model_config = vllm_config.model_config
@@ -486,6 +506,7 @@ class C_VLLMEngineCoreHook(BaseHook):
             except Exception as e:
                 logger.error("Failed to initialize inference time predictor: %s", e)
                 raise
+            report_class_hooks("engine_ready")
 
         def wrapped_add_request(self, request, request_wave=0, *args, **kwargs):
             """Park simulation requests in the shared future queue; forward
@@ -497,6 +518,14 @@ class C_VLLMEngineCoreHook(BaseHook):
                     request.sampling_params.ignore_eos = True
                 request.max_tokens = _MAX_DECODE_STEPS
 
+            recorder = getattr(self, "_hisim_lifecycle", None)
+            observer = getattr(self, "_hisim_lifecycle_observer", None)
+            if recorder is not None and observer is not None:
+                from sglang_simulator.simulation.vllm.lifecycle import request_key
+                observer.observe(lambda: recorder.emit(
+                    "request.engine_add", request_id_sha256=request_key(request.request_id),
+                    input_length=request.num_prompt_tokens, max_output_tokens=request.max_tokens,
+                    source="EngineCore.add_request", time_kind="host_entry_observed"))
             created_time = None
             sp = request.sampling_params
             if sp is not None and sp.extra_args:
@@ -552,9 +581,21 @@ class C_VLLMEngineCoreHook(BaseHook):
         def wrapped_wait_model_output(
             self, model_output_future, step_sout, *args, **kwargs
         ):
-            result = original_wait_model_output(
-                self, model_output_future, step_sout, *args, **kwargs
-            )
+            observer = getattr(self, "_hisim_lifecycle_observer", None)
+            started = time.monotonic_ns() if observer is not None else None
+            native_ok = False
+            try:
+                result = original_wait_model_output(
+                    self, model_output_future, step_sout, *args, **kwargs
+                )
+                native_ok = True
+            finally:
+                if observer is not None:
+                    ended = time.monotonic_ns()
+                    observer.observe(lambda: observer.record_call(
+                        "request.engine_output_wait", started, ended,
+                        step_sout.num_scheduled_tokens, native_ok,
+                        "EngineCore._wait_model_output_future", getattr(step_sout, "_hisim_lifecycle_step_id", None)))
             if cls.SIM_MODE == SimulationMode.BLOCKING:
                 # The future returned only after _SimAsyncOutput.get_output()
                 # has consumed the simulated GPU span. Use that real completion
@@ -562,9 +603,26 @@ class C_VLLMEngineCoreHook(BaseHook):
                 _finalize_step_stats(step_sout, time.time())
             return result
 
+        def export_lifecycle(self, wait=False, timeout=5):
+            recorder = getattr(self, "_hisim_lifecycle", None)
+            if recorder is None:
+                return {"enabled": False}
+            flushed = recorder.flush(timeout) if wait else None
+            return dict(recorder.status(), enabled=True, flushed=flushed)
+
+        def wrapped_shutdown(self, *args, **kwargs):
+            try:
+                return original_shutdown(self, *args, **kwargs)
+            finally:
+                recorder = getattr(self, "_hisim_lifecycle", None)
+                if recorder is not None:
+                    recorder.close()
+
         target.__init__ = wrapped_init
         target.add_request = wrapped_add_request
         target.step = wrapped_step
+        target.shutdown = wrapped_shutdown
+        target.export_lifecycle = export_lifecycle
         if original_wait_model_output is not None:
             target._wait_model_output_future = wrapped_wait_model_output
 
@@ -633,12 +691,23 @@ def _install_tpu_pp(core, predictor, sched_config) -> None:
         raise ValueError("native lazy push is off with async scheduling")
     executor = VirtualPPExecutor(
         core.model_executor, predictor, sched_config.pp_size,
-        on_step_done=_finalize_step_stats)
+        on_step_done=_finalize_step_stats,
+        lifecycle=getattr(core, "_hisim_lifecycle", None))
     core.model_executor = executor
     stepper = create_stepper(core, executor)
     core.batch_queue = stepper.in_flight
     core.step_fn = stepper.step
     core._sim_tpu_pp_stepper = stepper
+    emit_hook_event(
+        "ENGINE_READY", executor_module=type(core.model_executor).__module__,
+        executor_class=type(core.model_executor).__qualname__,
+        inner_module=type(executor.inner).__module__, inner_class=type(executor.inner).__qualname__,
+        virtual_pp=isinstance(core.model_executor, VirtualPPExecutor),
+        native_stepper=isinstance(core._sim_tpu_pp_stepper, executor.native.LazyPushStepper),
+        step_fn_bound=core.step_fn.__self__ is core._sim_tpu_pp_stepper,
+        batch_queue_bound=core.batch_queue is stepper.in_flight,
+        stages=sched_config.pp_size, pcp=sched_config.pcp_size,
+    )
     logger.info("[TPU PP] native lazy push installed: stages=%d pcp=%d",
                 sched_config.pp_size, sched_config.pcp_size)
 
