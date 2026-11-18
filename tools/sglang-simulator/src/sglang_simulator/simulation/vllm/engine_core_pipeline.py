@@ -30,7 +30,7 @@ import os
 import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from functools import wraps
 
 from sglang_simulator.hook import BaseHook
@@ -396,6 +396,30 @@ class C_VLLMAsyncLLMHook(C_VLLMLLMEngineHook):
 
     HOOK_CLASS_NAME = "AsyncLLM"
     HOOK_MODULE_NAME = "vllm.v1.engine.async_llm"
+
+
+class C_VLLMMultiConnectorPromMetricsHook(BaseHook):
+    """Match IPC serialization when in-process engines report nested KV stats."""
+
+    HOOK_CLASS_NAME = "MultiKVConnectorPromMetrics"
+    HOOK_MODULE_NAME = "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector"
+
+    @classmethod
+    def hook(cls, target):
+        if target.__dict__.get("_sim_nested_stats_hook", False):
+            return
+        original_observe = target.observe
+
+        @wraps(original_observe)
+        def observe(self, transfer_stats_data, engine_idx=0):
+            serialized = {
+                key: asdict(value) if is_dataclass(value) else value
+                for key, value in transfer_stats_data.items()
+            }
+            return original_observe(self, serialized, engine_idx)
+
+        target.observe = observe
+        target._sim_nested_stats_hook = True
 
 
 class C_VLLMEngineCoreHook(BaseHook):
