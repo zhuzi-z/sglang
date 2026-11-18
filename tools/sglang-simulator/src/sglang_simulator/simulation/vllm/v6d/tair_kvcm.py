@@ -28,6 +28,8 @@ class C_TairKVCMTransferRuntimeHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
+        if target.__dict__.get("_sim_tair_kvcm_transfer_hook", False):
+            return
         def create_transfer_client(self):
             return _NoopTransferClient()
 
@@ -52,6 +54,7 @@ class C_TairKVCMTransferRuntimeHook(BaseHook):
             return [True] * len(uris)
 
         target._create_transfer_client = create_transfer_client
+        target._sim_tair_kvcm_transfer_hook = True
         target.batch_load_to_memory = batch_load_to_memory
         target.batch_save_from_memory = batch_save_from_memory
         logger.info(

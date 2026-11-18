@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextvars
 import os
+import sys
 
 from sglang_simulator.hook import BaseHook, install_class_hooks
 from sglang_simulator.utils import get_logger
@@ -464,4 +465,10 @@ def install_v6d_runtime_hooks():
         C_TieredVineyardPeerHook,
         C_HitRateStatsHook,
     ])
+    # The daemon may import transfer before the .pth bootstrap installs hooks.
+    # Patch that existing class as well as classes defined by later imports.
+    transfer = sys.modules.get(C_TairKVCMTransferRuntimeHook.HOOK_MODULE_NAME)
+    runtime = getattr(transfer, C_TairKVCMTransferRuntimeHook.HOOK_CLASS_NAME, None)
+    if runtime is not None:
+        C_TairKVCMTransferRuntimeHook.hook(runtime)
     _RUNTIME_HOOKS_INSTALLED = True
